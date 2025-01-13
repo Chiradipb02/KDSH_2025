@@ -65,7 +65,7 @@ class CoherenceAgent:
         evaluations = []
         for i, chunk in enumerate(content_chunks):
             print(f"Evaluating chunk {i + 1}/{len(content_chunks)}...")
-            evaluation = self.coherence_agent.invoke({"content": chunk["content"]})
+            evaluation = self.coherence_agent.invoke({"content": chunk})
             evaluations.append(f"Evaluation for {chunk['heading']}:\n{evaluation}\n")
         return "\n".join(evaluations)
 
