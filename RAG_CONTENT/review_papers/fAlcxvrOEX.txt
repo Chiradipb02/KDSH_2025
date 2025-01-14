@@ -1,0 +1,1907 @@
+AdjointDEIS: Efficient Gradients for Diffusion Models
+Zander W. Blasingame
+Clarkson University
+blasinzw@clarkson.eduChen Liu
+Clarkson University
+cliu@clarkson.edu
+Abstract
+The optimization of the latents and parameters of diffusion models with respect to
+some differentiable metric defined on the output of the model is a challenging and
+complex problem. The sampling for diffusion models is done by solving either the
+probability flow ODE or diffusion SDE wherein a neural network approximates
+the score function allowing a numerical ODE/SDE solver to be used. However,
+naïve backpropagation techniques are memory intensive, requiring the storage of
+all intermediate states, and face additional complexity in handling the injected
+noise from the diffusion term of the diffusion SDE. We propose a novel family
+of bespoke ODE solvers to the continuous adjoint equations for diffusion models,
+which we call AdjointDEIS . We exploit the unique construction of diffusion SDEs
+to further simplify the formulation of the continuous adjoint equations using
+exponential integrators . Moreover, we provide convergence order guarantees for
+our bespoke solvers. Significantly, we show that continuous adjoint equations for
+diffusion SDEs actually simplify to a simple ODE. Lastly, we demonstrate the
+effectiveness of AdjointDEIS for guided generation with an adversarial attack in
+the form of the face morphing problem. Our code will be released on our project
+page https://zblasingame.github.io/AdjointDEIS/ .
+1 Introduction
+Diffusion models are a large family of state-of-the-art generative models which learn to map samples
+drawn from white Gaussian noise into the data distribution [ 1,2]. These diffusion models have
+achieved state-of-the-art performance on prominent tasks such as image generation [ 3–5], audio
+generation [ 6,7], or video generation [ 8]. Often, the state-of-the-art models are quite large and
+training them is prohibitively expensive [ 9]. As such, it is fairly common to adapt a pre-trained
+model to a specific task for post-training. This way, the generative model can learn new concepts,
+identities, or tasks without needing to train the whole model [ 10–12]. Additional work has also
+proposed algorithms for guiding the generative process of the diffusion models [13, 14].
+One method to guide or direct the generative process is to solve an optimization problem w.r.t. some
+guidance function Ldefined on the image space Rd. This guidance function works on the output of
+the diffusion model and assesses how “good” the output is. However, the diffusion model works by
+iteratively removing noise until a clean sample is reached. As such, we need to be able to efficiently
+backpropagate gradients through the entire generative process. As Song et al. [15] showed, the
+diffusion SDE can be simplified to an associated ODE, and as such, many efficient ODE/SDE solvers
+have been developed for diffusion models [ 16–18]. However, naïvely applying backpropagation to
+the diffusion model is inflexible and memory intensive; moreover, such an approach is not trivial to
+apply to the diffusion models that used an SDE solver instead of an ODE solver.
+38th Conference on Neural Information Processing Systems (NeurIPS 2024).Diffusion Sampling
+AdjointDEISxtNϵθ
+zϵtNxtN−1ϵθ
+zϵt1xt0. . .
+x˜t0L ϵθ
+x˜t1x˜tNϵθ
+ax(˜t0) ax(˜t1) ax(˜tM). . .
+. . .∂L
+∂xt0Figure 1: A high-level overview of the AdjointDEIS solver to the continuous adjoint equations for
+diffusion models. The sampling schedule consists of {tn}N
+n=0timesteps for the diffusion model and
+{˜tn}M
+n=0timesteps for AdjointDEIS. The gradients ax(T)can be used to optimize xTto find some
+optimal x∗
+T.
+1.1 Contributions
+Inspired by the work of [ 19,20] we study the application of the continuous adjoint equations to
+diffusion models, with a focus on training-free guided generation with diffusion models. We introduce
+several theoretical contributions and technical insights to both improve the ability to perform certain
+guided generation tasks and to gain insight into guided generation with diffusion models.
+First, we introduce AdjointDEIS a bespoke family of ODE solvers which can efficiently solve the
+continuous adjoint equations for both diffusion ODEs and SDEs. To the best of our knowledge, this
+is the first general backpropagation technique designed for diffusion SDEs. Moreover, we show that
+the continuous adjoint equations for diffusion SDEs simplify to a mere ODE.
+Next, we show how to calculate the continuous adjoint equation for conditional information which
+evolves with time (rather than being constant). To the best of our knowledge, we are the first to
+consider conditional information which evolves with time for neural ODEs.
+Overall, multiple theoretical contributions and technical insights are provided to bring a new family
+of techniques for the guided generation of diffusion models, which we evaluate experimentally on the
+task of face morphing.
+2 Diffusion Models
+In this section, we provide a brief overview of diffusion models. Diffusion models learn a generative
+process by first perturbing the data distribution into an isotropic Gaussian by progressively adding
+Gaussian noise to the data distribution. Then, a neural network is trained to perform denoising steps,
+allowing for sampling of the data distribution via sampling of a Gaussian distribution [ 2,9]. Assume
+we have an n-dimensional random variable x∈Rnwith some distribution pdata(x). Then diffusion
+models begin by diffusing pdata(x)according to the diffusion SDE [2], an Itô SDE given as
+dxt=f(t)xtdt+g(t) dwt (2.1)
+where t∈[0, T]denotes time with fixed constant T > 0,f(·)andg(·)denote the drift and
+diffusion coefficients, and wtdenotes the standard Wiener process. The trajectories of xtfollow
+the distributions pt(xt)withp0(x0)≡pdata(x)andpT(xT)≈ N (0,I). Under some regularity
+conditions Song et al. [15] showed that Equation (2.1) has a reverse process as time runs backwards
+2from Tto0with initial marginal distribution pT(xT)governed by
+dxt= [f(t)xt−g2(t)∇xlogpt(xt)] dt+g(t) d¯wt (2.2)
+where ¯wtis the standard Wiener process as time runs backwards. Solving Equation (2.2) is what
+allows diffusion models to draw samples from pdata(x)by sampling pT(xT). The unknown term
+in Equation (2.2) is the score function ∇xlogpt(xt), which in practice is modeled by a neural
+network that estimates the scaled score function, ϵθ(xt, t)≈ −σt∇xlogpt(xt), or some closely
+related quantity like x0-prediction [1, 2, 21].
+2.1 Probability Flow ODE
+The practical choice of a step size when discretizing SDEs is limited by the randomness of the Wiener
+process as a large step size, i.e., a small number of steps, can cause non-convergence, particularly in
+high-dimensional spaces [ 16]. Sampling an equivalent Ordinary Differential Equation (ODE) over
+an SDE would enable faster sampling. Song et al. [15] showed there exists an Ordinary Differential
+Equation (ODE) whose marginal distribution at time tis identical to that of Equation (2.2) given as
+dxt
+dt=f(t)xt−1
+2g2(t)∇xlogpt(xt). (2.3)
+The ODE in Equation (2.3) is known as the probability flow ODE [15]. As the noise prediction
+network, ϵθ(xt, t), is trained to model the scaled score function, Equation (2.3) can be parameterized
+as
+dxt
+dt=f(t)xt+g2(t)
+2σtϵθ(xt, t) (2.4)
+w.r.t. the noise prediction network. For brevity, we refer to this as a diffusion ODE.
+While there exist several popular choices for the drift and diffusion coefficients, we opt to use the de
+facto choice which is known as the Variance Preserving (VP) type diffusion SDE [ 1,15,22]. The
+coefficients for VP-type SDEs are given as
+f(t) =d logαt
+dt, g2(t) =dσ2
+t
+dt−2d logαt
+dtσ2
+t, (2.5)
+which corresponds to sampling xtfrom the distribution q(xt|x0) =N(αtx0, σ2
+tI).
+3 Adjoint Diffusion ODEs
+Problem statement. Given the diffusion ODE in Equation (2.4), we wish to solve the following
+optimization problem:
+arg min
+xT,z,θL
+xT+Z0
+Tf(t)xt+g2(t)
+2σtϵθ(xt,z, t) dt
+. (3.1)
+I.e., we wish to find the optimal xT,z, and θwhich satisfy our guidance function L.
+Unlike GANs which can update the latent representation through GAN inversion [ 23,24], as seen
+in Equation (3.1) diffusion models require more care as they model an ODE or SDE and require
+numerical solvers. Therefore, to update the latent representation, model parameters, and conditional
+information we must backpropagate the gradient of loss defined on the output, ∂L(x0)/∂x0through
+the whole ODE or SDE.
+A key insight of this work is the connection between the adjoint ODE used in neural ODEs by Chen
+et al. [19] and specialized ODE/SDE solvers by [ 16–18] for diffusion models. It has been well
+observed that diffusion models are a type of neural ODE [ 15,25]. Since a diffusion model can be
+thought of as a neural ODE, then we can solve the continuous adjoint equations [ 20] to find useful
+gradients for guided generation. We can then exploit the unique structure of diffusion models to
+develop efficient bespoke ODE solvers for the continuous adjoint equations.
+Letfθdescribe a parameterized neural field of the probability flow ODE, i.e., the R.H.S of Equa-
+tion (2.4), defined as
+fθ(xt,z, t) =f(t)xt+g2(t)
+2σtϵθ(xt,z, t). (3.2)
+3Thenfθ(xt,z, t)describes a neural ODE which admits an adjoint state, ax:=∂L/∂xt(and likewise
+foraz(t)andaθ(t)), which solve the continuous adjoint equations [ 20, Theorem 5.2] in the form of
+the following Initial Value Problem (IVP):
+ax(0) =∂L
+∂x0,dax
+dt(t) =−ax(t)⊤∂fθ(xt,z, t)
+∂xt,
+az(0) = 0,daz
+dt(t) =−ax(t)⊤∂fθ(xt,z, t)
+∂z,
+aθ(0) = 0,daθ
+dt(t) =−ax(t)⊤∂fθ(xt,z, t)
+∂θ. (3.3)
+We refer to this system of equations in Equation (3.3) as the adjoint diffusion ODE1as it describes
+the continuous adjoint equations for the empirical probability flow ODE.
+N.B., in the literature of diffusion models the sampling process is often done in reverse-time, i.e., the
+initial noise is xTand the final sample is x0. Due to this convention solving the adjoint diffusion
+ODE backwards actually means integrating forwards in time. Thus while diffusion models learn to
+compute xtfromxswiths > t , the adjoint diffusion ODE seeks to compute ax(s)fromax(t).
+3.1 Simplified Formulation of the Empirical Adjoint Probability Flow ODE
+We show that rather than treating fθas a black box, the specific structure of the probability flow
+ODE is carried over to the adjoint probability flow ODE, allowing the adjoint probability flow ODE
+to be simplified into a special exact formulation.
+By evaluating the gradient of fθw.r.t.xtfor each term in Equation (3.2) we can rewrite the adjoint
+diffusion ODE for ax(t)in Equation (3.3) as
+dax
+dt(t) =−f(t)ax(t)−g2(t)
+2σtax(t)⊤∂ϵθ(xt,z, t)
+∂xt. (3.4)
+Due to the gradient of the drift term in Equation (3.4), further manipulations are required to put the
+empirical adjoint probability flow ODE into a sufficiently “nice” form. We follow the approach used
+by [16,18] to simplify the empirical probability flow ODE with the use of exponential integrators
+and a change of variables. By applying the integrating factor exp Rt
+0f(τ) dτ
+to Equation (3.4), the
+following ODE is expressed as
+d
+dt
+eRt
+0f(τ) dτax(t)
+=−eRt
+0f(τ) dτg2(t)
+2σtax(t)⊤∂ϵθ(xt,z, t)
+∂xt. (3.5)
+Then, the exact solution at time sgiven time t < s is found to be
+ax(s) =eRt
+sf(τ) dτax(t)
+|{z }
+linear−Zs
+teRu
+sf(τ) dτg2(u)
+2σuax(u)⊤ϵθ(xu,z, u)
+∂xudu
+| {z }
+non-linear. (3.6)
+Like with solvers for diffusion models which leverage exponential integrators, we are able to transform
+the adjoint diffusion ODE into a non-stiff form by separating the linear and non-linear component.
+Moreover, we can compute the linear in closed form, thereby eliminating the discretization error
+in the linear term. However, we still need to approximate the non-linear term which consists of
+a difficult integral about our complex neural network. This is where the insight of Lu et al. [16]
+to integrate in the log-SNR domain becomes invaluable. Let λt:= log( αt/σt)be one half of the
+log-SNR. Then, with using this new variable and computing the drift and diffusion coefficients in
+closed form, we can rewrite Equation (3.6) as
+ax(s) =αt
+αsax(t) +1
+αsZs
+tαuσudλu
+duax(u)⊤ϵθ(xu,z, u)
+∂xudu. (3.7)
+1A more precise and technical name would be the empirical adjoint probability flow ODE ; however, for
+brevity’s sake we prefer the adjoint diffusion ODE and leave the reader to infer from context that this describes
+an empirical model with learned score function.
+4Asλtis a strictly decreasing function w.r.t. tand therefore it has an inverse function tλwhich satisfies
+tλ(λt) =t, and, with abuse of notation, we let xλ:=xtλ(λ),ax(λ):=ax(tλ(λ)), &c and let the
+reader infer from context if the function is mapping the log-SNR back into the time domain or already
+in the time domain. Then by rewriting Equation (3.7) as an exponentially weighted integral and
+performing an analogous derivation for az(t)andaθ(t), we arrive at:
+Proposition 3.1 (Exact solution of adjoint diffusion ODEs) .Given initial values [ax(t),az(t),aθ(t)]
+at time t∈(0, T), the solution [ax(s),az(s),aθ(s)]at time s∈(t, T]of adjoint diffusion ODEs
+in Equation (3.3) is
+ax(s) =αt
+αsax(t) +1
+αsZλs
+λtα2
+λe−λax(λ)⊤ϵθ(xλ,z, λ)
+∂xλdλ, (3.8)
+az(s) =az(t) +Zλs
+λtαλe−λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂zdλ, (3.9)
+aθ(s) =aθ(t) +Zλs
+λtαλe−λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂θdλ. (3.10)
+The full derivations of Proposition 3.1 can be found in Appendix A.1.
+There is a nice symmetry between Equations (3.8) to (3.10), while the adjoint of the solution
+trajectories evolves with a weighting of αt/αsin the linear term and the integral term is weighted by
+α2
+t/α2
+sreflecting the double partial ∂xtin the adjoint and Jacobian terms. Conversely, the adjoint state
+for the conditional information and model parameters evolves with no weighting on the linear term
+and the integral is only weighted by αt/αs. This follows from the vector fields being independent of
+azandaθ. These equations while reflecting the special nature of this formulation of diffusion models
+also have an appealing parallel with the exact solution for diffusion ODEs Lu et al. [16, Proposition
+3.1].
+3.2 Numerical Solvers for AdjointDEIS
+The numerical solver for the adjoint empirical probability flow ODE, now in light of Equation (3.8),
+only needs to focus on approximating the exponentially weighted integral of ϵθfrom λttoλs, a
+well-studied problem in the literature on exponential integrators [ 26,27]. To approximate this integral,
+we evaluate the Taylor expansion of the vector Jacobian product to further simplify the ODE. For
+k≥1, the(k−1)-th Taylor expansion at λtis
+ax(λ)⊤∂ϵθ(xλ,z, λ)
+∂xλ=k−1X
+n=0(λ−λt)n
+n!dn
+dλn
+α2
+λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂xλ
+λ=λt+O((λ−λt)k).
+(3.11)
+Plugging this expansion into Equation (3.8) and letting h=λs−λtyield
+ax(s) =αt
+αsax(t) +1
+αsk−1X
+n=0dn
+dλn
+α2
+λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂xλ
+λ=λt| {z }
+estimatedZλs
+λt(λ−λt)n
+n!e−λdλ
+| {z }
+analytically computed
++O(hk+1)|{z}
+omitted. (3.12)
+With this expansion, the number of terms which need to be estimated is further reduced as the
+exponentially weighted integralRλs
+λt(λ−λt)n
+n!e−λdλcan be solved analytically by applying n
+times integration-by-parts [ 16,28]. Therefore, the only errors in solving this ODE occur in the
+approximation of the n-th order total derivatives of the vector-Jacobian product and the higher-order
+error terms O(hk+1). By dropping the O(hk+1)error term and approximating the first (k−1)-th
+derivatives of the vector-Jacobian product, we can derive k-th order solvers for adjoint diffusion ODEs.
+We decide to name such solvers as Adjoint Diffusion Exponential Integrator Sampler (AdjointDEIS)
+reflecting our use of the exponential integrator to simplify the ODEs and pay homage to DEIS
+from [ 18] that explored the use of exponential integrators for diffusion ODEs. Consider the case of
+5k= 1, by dropping the error term O(h2)we construct the AdjointDEIS-1 solver with the following
+algorithm.
+AdjointDEIS-1. Given an initial augmented adjoint state [ax(t),az(t),aθ(t)]at time t∈(0, T), the
+solution [ax(s),az(s),aθ(s)]at time s∈(t, T]is approximated by
+ax(s) =αt
+αsax(t) +σs(eh−1)α2
+t
+α2sax(t)⊤∂ϵ(xt,z, t)
+∂xt,
+az(s) =az(t) +σs(eh−1)αt
+αsax(t)⊤∂ϵ(xt,z, t)
+∂z,
+aθ(s) =aθ(t) +σs(eh−1)αt
+αsax(t)⊤∂ϵ(xt,z, t)
+∂θ. (3.13)
+higher-order expansions of Equation (3.11) require estimations of the n-th order derivatives of the
+vector Jacobian product which can be approximated via multi-step methods, such as Adams-Bashforth
+methods [ 29]. This has the added benefit of reduced computational overhead, as the multi-step
+method just reuses previous values to approximate the higher-order derivatives. Moreover, multi-steps
+are empirically more efficient than single-step methods [ 29]. Combining the Taylor expansions
+in Equation (3.11) with techniques for designing multi-step solvers, we propose a novel multi-step
+second-order solver for the adjoint empirical probability flow ODE which we call AdjointDEIS-2M .
+This algorithm combines the previous values of the vector Jacobian product at time tand time rto
+predict aswithout any additional intermediate values.
+AdjointDEIS-2M. We assume having a previous solution ax(r)and model output ϵθ(xr,z, r)at
+timer < t < s , letρdenote ρ=λt−λr
+h. Then the solution asat time sto Equation (3.4) is estimated
+to be
+ax(s) =αt
+αsax(t) +σs(eh−1)α2
+t
+α2sax(t)⊤∂ϵ(xt,z, t)
+∂xt
++σseh−1
+2ρα2
+t
+α2sax(t)⊤∂ϵ(xt,z, t)
+∂xt−α2
+r
+α2sax(r)⊤∂ϵ(xr,z, r)
+∂xr
+. (3.14)
+For brevity, we omit the details of the AdjointDEIS-2M solver for az(t)andaθ(t); rather, we
+provide the full derivation and details in Appendix A. Likewise, the full algorithm can be found
+in Appendix F.1. The advantage of a higher-order solver is that it is generally more efficient, requiring
+fewer steps due to its higher convergence order. We show that AdjointDEIS- kis ak-th order solver,
+as stated in the following theorem. The proof is in Appendix B.
+Theorem 3.1 (AdjointDEIS- kas ak-th order solver) .Assume the function ϵθ(xt,z, t)and its
+associated vector-Jacobian products follow the regularity conditions detailed in Appendix B, then
+fork= 1,2, AdjointDEIS- kis ak-th order solver for adjoint diffusion ODEs, i.e., for the sequence
+{˜ax(ti)}M
+i=1computed by AdjointDEIS- k, the global truncation error at time Tsatisfies ˜ax(tM)−
+ax(T) =O(h2
+max), where hmax= max 1≤j≤M(λti−λti−1). Likewise, AdjointDEIS- kis ak-th
+order solver for the estimated gradients w.r.t. zandθ.
+As previous work has shown that higher-order solvers may be unsuitable for large guidance scales [ 16–
+18] we do explicitly construct or analyze any solvers for k >2and leave such explorations for future
+study.
+3.3 Scheduled Conditional Information
+Thus far, we have held the conditional information constant across time, i.e., the same text conditioning
+like a prompt “fire dragon” can be fed to the noise prediction network. In guided generation tasks
+it is not uncommon to take advantage of the iterative nature of diffusion models by scheduling the
+conditional information to exhibit different values at different timesteps. E.g., blending concepts by
+alternating between the prompt for “fire dragon” and the prompt for “ice dragon” at each timestep
+to create a picture of a dragon with both the qualities of ice and fire—a technique which has been
+popularized by Stable Diffusion [3].
+We show that converting a constant zinto a scheduled ztdoes not actually change the continuous
+adjoint equation for zt, meaning we can still apply the AdjointDEIS- ksolvers derived above to
+6findaz(t)by simply replacing zwithzt. We state this observation more formally in the following
+theorem. The proof is in Appendix C.
+Theorem 3.2 (Continuous adjoint equations for time-dependent conditional information) .Suppose
+there exists a function z:R→Rzwhich is continuously differentiable in tand is the conditional
+input into a parameterized vector field fθ:Rd×Rz×R→Rdbe continuous in t, uniformly
+Lipschitz in x, and continuously differentiable in x. Letx:R→Rdbe the unique solution for the
+ODE
+dxt
+dt=fθ(xt,zt, t)
+with initial condition x0. Then there exists a unique solution az:R→Rzto the following IVP:
+az(0) = 0,daz
+dt(t) =−ax(t)⊤∂fθ(xt,zt, t)
+∂zt.
+While motivated by the case of scheduled conditional information in guided generation with diffu-
+sion models, this result applies to neural ODEs more generally, which could open future research
+directions.
+4 Adjoint Diffusion SDEs
+As recent work [ 30,31] has shown, diffusion SDEs have useful properties over probability flow
+ODEs for image manipulation and editing. In particular, it has been shown that probability flow
+ODEs are invariant in Nie et al. [31, Theorem 3.2 ]and that diffusion SDEs are contractive in Nie
+et al. [31, Theorem 3.1 ],i.e., any gap in the mismatched prior distributions pt(xt)and˜pt(xt)for the
+true distribution ptand edited distribution ˜ptwill remain between p0(x0)and˜p0(x0), whereas for
+diffusion SDEs the gap can be reduced between ˜pt(xt)andpt(xt)asttends towards 0. Motivated
+by this reasoning, we present a framework for solving the adjoint diffusion SDE using exponential
+integrators.
+The diffusion SDE with noise prediction model is given by
+dxt=h
+f(t)xt+g2(t)
+σtϵθ(xt,z, t)i
+dt+g(t) d¯wt, (4.1)
+where ‘ dt’ is an infinitesimal negative timestep. Note how the drift term of the SDE looks remarkably
+similar to the probability flow ODE sans a missing factor of 1/2in front of the noise prediction model.
+This is due to differing manipulations of the forward Kolomogorov equations—which describe the
+evolution of pt(xt)—used by Anderson [32] to derive the reverse-time SDE and later by Song et al.
+[15] to derive the probability-flow ODE. This connection is very important as it enables one to
+simplify the AdjointDEIS solvers for the adjoint diffusion SDE.
+We show that for the special case of Stratonovich SDEs2with a diffusion coefficient g(t)which does
+not depend on the process state xt, then the adjoint process has a unique strong solution that evolves
+with what is essentially an ODE. Intuitively, this tracks as the stochastic term g(t)◦dwthas nothing
+to do with xt. We state this observation somewhat informally in the following theorem. The proof
+can be found in Appendix D.
+Theorem 4.1. Letf:Rd×R→Rdbe inC∞,1
+bandg:R→Rd×wbe inC1
+b. LetL:Rd→Rbe a
+scalar-valued differentiable function. Let wt: [0, T]→Rwbe aw-dimensional Wiener process. Let
+x: [0, T]→Rdsolve the Stratonovich SDE
+dxt=f(xt, t) dt+g(t)◦dwt,
+with initial condition x0. Then the adjoint process ax(t):=∂L(xT)/∂xtis a strong solution to the
+backwards-in-time ODE
+dax(t) =−ax(t)⊤∂f
+∂xt(xt, t) dt. (4.2)
+2The notation ‘ ◦dwt’ denotes Stratonovich integration which is different from Itô. More details on this are
+found in Appendix D.
+7This is a boon for us as diffusion models model use only a mere scalar diffusion coefficient, g(t).
+Therefore, the continuous adjoint equations for the diffusion SDE just simplify to an ODE. Not only
+that, but as mentioned before, the drift term of the diffusion SDE and probability flow ODE differ
+only by a factor of 2 in the term with the noise prediction network. As only the drift term of the
+diffusion SDE is used when constructing the continuous adjoint equations, it follows that the only
+difference between the continuous adjoint equations for the probability flow ODE and diffusion SDE
+is a factor of 2. Therefore, the exact solutions are given by:
+Proposition 4.1 (Exact solution of adjoint diffusion SDEs) .Given initial values [ax(t),az(t),aθ(t)]
+at time t∈(0, T), the solution [ax(s),az(s),aθ(s)]at time s∈(t, T]of adjoint diffusion SDEs is
+ax(s) =αt
+αsax(t) +2
+αsZλs
+λtα2
+λe−λax(λ)⊤ϵθ(xλ,z, λ)
+∂xλdλ, (4.3)
+az(s) =az(t) + 2Zλs
+λtαλe−λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂zdλ, (4.4)
+aθ(s) =aθ(t) + 2Zλs
+λtαλe−λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂θdλ. (4.5)
+Remark 4.1. While the adjoint diffusion SDEs evolve with an ODE the same cannot be said for the
+underlying state, xt. Rather this evolves with a backwards SDE (more details in Appendix D) which
+requires the same realization of the Wiener process used to sample the image as the one used in the
+backwards SDE.
+4.1 Solving Backwards Diffusion SDEs
+Lu et al. [17] propose the following first-order solver for diffusion SDEs
+xt=αt
+αsxs−2σt(eh−1)ϵθ(xs, s) +σtp
+e2h−1ϵs, (4.6)
+where ϵs∼ N(0,I). To solve the SDE backwards in time we follow the approach initially proposed
+by Wu and la Torre [33] and used by later works [ 31]. Given a particular realization of the Wiener
+process that admits xt∼ N (αtx0|σ2
+tI), then for two samples xtandxsthe noise ϵscan be
+calculated by rearranging Equation (4.6) to find
+ϵs=xt−αt
+αsxs+ 2σt(eh−1)ϵθ(xs,z, s)
+σt√
+e2h−1(4.7)
+With this the sequence {ϵti}N
+i=1of added noises can be calculated which will exactly reconstruct
+the original input from the initial realization of the Wiener process. This technique is referred to as
+Cycle-SDE after the CycleDiffusion paper [33].
+5 Experiments
+To illustrate the efficacy of our technique, we examine the application of guided generation for the
+face morphing attack. The face morphing attack is a new emerging attack on Face Recognition (FR)
+systems. This attack works by creating a singular morphed face image x(ab)
+0that shares biometric
+information with the two contributing faces x(a)
+0andx(b)
+0[34–36]. A successfully created morphed
+face image can trigger a false accept with either of the two contributing identities in the targeted Face
+Recognition (FR) system, see Figure 2 for an illustration. Recent work in this space has explored the
+use of diffusion models to generate these powerful attacks [ 34,37,38]. All prior work on diffusion-
+based face morphing used a pre-trained diffusion autoencoder [ 39] trained on the FFHQ [ 40] dataset
+at a256×256resolution. We illustrate the use of the AdjointDEIS solvers by modifying the Diffusion
+Morph (DiM) architecture proposed by Blasingame and Liu [34] to use the AdjointDEIS solvers to
+find the optimal initial noise x(ab)
+Tand conditional zab. The AdjointDEIS solvers are used to calculate
+the gradients with respect to the identity loss [38] defined as
+LID=d(vab, va) +d(vab, vb),Ldiff=d(vab, va)−d(vab, vb)),
+L∗
+ID=LID+Ldiff, (5.1)
+8(a) Identity a
+ (b) Face morphing with AdjointDEIS
+ (c) Identity b
+Figure 2: Example of guided morphed face generation with AdjointDEIS on the FRLL dataset.
+Figure 3: Comparison of DiM morphs on the FRLL dataset. From left to right, identity a, DiM-A,
+Fast-DiM, Morph-PIPE, AdjointDEIS (ODE), AdjointDEIS (SDE), and identity b.
+where va=F(x(a)
+0), vb=F(x(b)
+0), vab=F(x(ab)
+0), and F:X → Vis an FR system which
+embeds images into a vector space Vwhich is equipped with a measure of distance, d. We used the
+ArcFace [41] FR system for the identity loss.
+We compare against three preexisting DiM methods, the original DiM algorithm [ 34], Fast-DiM [ 37],
+and Morph-PIPE [ 38] as well as a GAN-inversion based face morphing attack, MIPGAN-I and
+MIPGAN-II [ 42] based on the StyleGAN [ 40] and StyleGAN2 [ 43] architectures respectively. Fast-
+DiM improves DiM by using high-order ODE solvers to decrease the number of sampling steps
+required to create a morph. Morph-PIPE performs a very simple version of guided generation by
+generating a large batch of morphed images derived from a discrete set of interpolations between
+x(a)
+Tandx(b)
+T, andzaandzb. For reference purposes, we compare against a reference GAN-based
+method [ 42] which uses GAN-inversion w.r.t.to the identity loss to find the optimal morphed face,
+and we include prior state-of-the-art Webmorph, a commercial off-the-shelf system [44].
+We run our experiments on the SYN-MAD 2022 [ 44] morphed pairs which are constructed from the
+Face Research Lab London dataset [ 45], more details in Appendix G.4. The morphed images are
+evaluated against three FR systems, the ArcFace [ 41], ElasticFace [ 46], and AdaFace [ 47] models,
+further details are found in Appendix G.5. To measure the efficacy of a morphing attack, the Mated
+Morph Presentation Match Rate (MMPMR) metric [ 48] is used. The MMPMR metric as proposed
+by Scherhag et al. [48] is defined as
+M(δ) =1
+MMX
+m=1
+min
+n∈{1,...,N m}Sn
+m
+> δ
+(5.2)
+where δis the verification threshold, Sn
+mis the similarity score of the n-th subject of morph m,Nmis
+the total number of contributing subjects to morph m, andMis the total number of morphed images.
+In our experiments, we used a learning rate of 0.01,N= 20 sampling steps, M= 20 steps for
+AdjointDEIS, and 50 optimization steps for gradient descent.
+9Table 1: Vulnerability of different FR systems across different morphing attacks on the SYN-MAD
+2022 dataset. FMR = 0.1%.
+MMPMR (↑)
+Morphing Attack NFE( ↓) AdaFace ArcFace ElasticFace
+Webmorph [44] - 97.96 96.93 98.36
+MIPGAN-I [42] - 72.19 77.51 66.46
+MIPGAN-II [42] - 70.55 72.19 65.24
+DiM-A [34] 350 92.23 90.18 93.05
+Fast-DiM [37] 300 92.02 90.18 93.05
+Morph-PIPE [38] 2350 95.91 92.84 95.5
+DiM + AdjointDEIS-1 (ODE) 2250 99.8 98.77 99.39
+DiM + AdjointDEIS-1 (SDE) 2250 98.57 97.96 97.75
+In Table 1 we present the effectiveness of the morphing attacks against the three FR systems. Guided
+generation with AdjointDEIS massively increases the performance of DiM, supplanting the old
+state-of-the-art for face morphing. Interestingly, the SDE variant did not fare as well as the ODE
+variant. This is likely due to the difficulty in discretizing SDEs with large step sizes [ 15–17]. We
+present further results in Appendix E which explore the impact of the choice of learning rate and
+number of discretization steps for AdjointDEIS.
+6 Conclusion
+We present a unified view on guided generation by updating latent, conditional, and model information
+of diffusion models with a guidance function using the continuous adjoint equations. We propose
+AdjointDEIS, a family of solvers for the continuous adjoint equations of diffusion models. We exploit
+the unique construction of diffusion models to create efficient numerical solvers by using exponential
+integrators. We prove the convergence order of solvers and show that the continuous adjoint equations
+for diffusion SDEs evolve with an ODE. Furthermore, we show how to handle conditional information
+that is scheduled in time, further expanding the generalizability of the proposed technique. Our
+results in face morphing show that the gradients produced by AdjointDEIS can be used for guided
+generation tasks.
+Limitations. There are several limitations. Empirically, we only explored a small subset of the true
+potential AdjointDEIS by evaluating on a single scenario, i.e., face morphing. Likewise, we only
+explored a few different hyperparameter options. In particular, we did not explore much the impact of
+the number of optimization steps and the number of sampling steps for diffusion SDEs on the visual
+quality of the generated face morphs.
+Broader Impact. Guided generation techniques can be misused for a variety of harmful purposes. In
+particular, our approach provides a powerful tool for adversarial attacks. However, better knowledge
+of such techniques should hopefully help direct research in hardening systems against such kinds of
+attacks.
+References
+[1]Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic mod-
+els. In H. Larochelle, M. Ranzato, R. Hadsell, M.F. Balcan, and H. Lin, editors, Ad-
+vances in Neural Information Processing Systems , volume 33, pages 6840–6851. Curran
+Associates, Inc., 2020. URL https://proceedings.neurips.cc/paper/2020/file/
+4c5bcfec8584af0d967f1ab10179ca4b-Paper.pdf . 1, 3, 30
+[2]Jiaming Song, Chenlin Meng, and Stefano Ermon. Denoising diffusion implicit models. In
+International Conference on Learning Representations , 2021. URL https://openreview.
+net/forum?id=St1giarCHLP . 1, 2, 3
+[3]Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Björn Ommer. High-
+resolution image synthesis with latent diffusion models. In Proceedings of the IEEE/CVF
+10Conference on Computer Vision and Pattern Recognition (CVPR) , pages 10684–10695, June
+2022. 1, 6
+[4]Aditya Ramesh, Prafulla Dhariwal, Alex Nichol, Casey Chu, and Mark Chen. Hierarchical
+Text-Conditional Image Generation with CLIP Latents. arXiv e-prints , art. arXiv:2204.06125,
+April 2022. doi: 10.48550/arXiv.2204.06125.
+[5]Chitwan Saharia, William Chan, Saurabh Saxena, Lala Li, Jay Whang, Emily L Den-
+ton, Kamyar Ghasemipour, Raphael Gontijo Lopes, Burcu Karagol Ayan, Tim Sali-
+mans, Jonathan Ho, David J Fleet, and Mohammad Norouzi. Photorealistic text-to-
+image diffusion models with deep language understanding. In S. Koyejo, S. Mo-
+hamed, A. Agarwal, D. Belgrave, K. Cho, and A. Oh, editors, Advances in Neu-
+ral Information Processing Systems , volume 35, pages 36479–36494. Curran Associates,
+Inc., 2022. URL https://proceedings.neurips.cc/paper_files/paper/2022/file/
+ec795aeadae0b7d230fa35cbaf04c041-Paper-Conference.pdf . 1
+[6] Haohe Liu, Zehua Chen, Yi Yuan, Xinhao Mei, Xubo Liu, Danilo Mandic, Wenwu Wang, and
+Mark D. Plumbley. AudioLDM: Text-to-Audio Generation with Latent Diffusion Models. arXiv
+e-prints , art. arXiv:2301.12503, January 2023. doi: 10.48550/arXiv.2301.12503. 1
+[7]Scott H. Hawley. Pictures of midi: Controlled music generation via graphical prompts for
+image-based diffusion inpainting, 2024. URL https://arxiv.org/abs/2407.01499 . 1
+[8]Andreas Blattmann, Robin Rombach, Huan Ling, Tim Dockhorn, Seung Wook Kim, Sanja
+Fidler, and Karsten Kreis. Align your Latents: High-Resolution Video Synthesis with Latent
+Diffusion Models. arXiv e-prints , art. arXiv:2304.08818, April 2023. doi: 10.48550/arXiv.2304.
+08818. 1
+[9]Tero Karras, Miika Aittala, Timo Aila, and Samuli Laine. Elucidating the design space of
+diffusion-based generative models. In Proc. NeurIPS , 2022. 1, 2
+[10] Nataniel Ruiz, Yuanzhen Li, Varun Jampani, Yael Pritch, Michael Rubinstein, and Kfir Aberman.
+Dreambooth: Fine tuning text-to-image diffusion models for subject-driven generation. arXiv
+preprint arXiv:2208.12242 , 2022. 1
+[11] Rinon Gal, Yuval Alaluf, Yuval Atzmon, Or Patashnik, Amit H. Bermano, Gal Chechik, and
+Daniel Cohen-Or. An Image is Worth One Word: Personalizing Text-to-Image Generation
+using Textual Inversion. arXiv e-prints , art. arXiv:2208.01618, August 2022. doi: 10.48550/
+arXiv.2208.01618.
+[12] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang,
+Lu Wang, and Weizhu Chen. Lora: Low-rank adaptation of large language models. arXiv
+preprint arXiv:2106.09685 , 2021. 1
+[13] Jonathan Ho and Tim Salimans. Classifier-free diffusion guidance. In NeurIPS 2021 Workshop
+on Deep Generative Models and Downstream Applications , 2021. URL https://openreview.
+net/forum?id=qw8AKxfYbI . 1
+[14] Arpit Bansal, Hong-Min Chu, Avi Schwarzschild, Soumyadip Sengupta, Micah Goldblum,
+Jonas Geiping, and Tom Goldstein. Universal Guidance for Diffusion Models. arXiv e-prints ,
+art. arXiv:2302.07121, February 2023. doi: 10.48550/arXiv.2302.07121. 1
+[15] Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and
+Ben Poole. Score-based generative modeling through stochastic differential equations. In
+International Conference on Learning Representations , 2021. URL https://openreview.
+net/forum?id=PxTIG12RRHS . 1, 2, 3, 7, 10, 30
+[16] Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan LI, and Jun Zhu. Dpm-
+solver: A fast ode solver for diffusion probabilistic model sampling in around 10 steps. In
+S. Koyejo, S. Mohamed, A. Agarwal, D. Belgrave, K. Cho, and A. Oh, editors, Advances
+in Neural Information Processing Systems , volume 35, pages 5775–5787. Curran Associates,
+Inc., 2022. URL https://proceedings.neurips.cc/paper_files/paper/2022/file/
+260a14acce2a89dad36adc8eefe7c59e-Paper-Conference.pdf . 1, 3, 4, 5, 6, 17, 18, 19
+11[17] Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver++:
+Fast solver for guided sampling of diffusion probabilistic models, 2023. 8, 10, 19
+[18] Qinsheng Zhang and Yongxin Chen. Fast sampling of diffusion models with exponential
+integrator. In International Conference on Learning Representations , 2023. 1, 3, 4, 5, 6
+[19] Ricky T. Q. Chen, Yulia Rubanova, Jesse Bettencourt, and David K Duvenaud. Neural ordinary
+differential equations. In S. Bengio, H. Wallach, H. Larochelle, K. Grauman, N. Cesa-Bianchi,
+and R. Garnett, editors, Advances in Neural Information Processing Systems , volume 31. Curran
+Associates, Inc., 2018. URL https://proceedings.neurips.cc/paper_files/paper/
+2018/file/69386f6bb1dfed68692a24c8686939b9-Paper.pdf . 2, 3
+[20] Patrick Kidger. On Neural Differential Equations . PhD thesis, Oxford University, 2022. 2, 3, 4
+[21] Tim Salimans and Jonathan Ho. Progressive distillation for fast sampling of diffusion models.
+InInternational Conference on Learning Representations , 2022. URL https://openreview.
+net/forum?id=TIdIXIpzhoI . 3
+[22] Yang Song and Stefano Ermon. Generative modeling by estimating gradients of the data
+distribution . Curran Associates Inc., Red Hook, NY , USA, 2019. 3
+[23] R. Abdal, Y . Qin, and P. Wonka. Image2stylegan: How to embed images into the stylegan
+latent space? In IEEE/CVF Int’l Conf. on Comp. Vision (ICCV) , pages 4431–4440, 2019. doi:
+10.1109/ICCV .2019.00453. 3
+[24] Rameen Abdal, Yipeng Qin, and Peter Wonka. Image2stylegan++: How to edit the embed-
+ded images? In Proceedings of the IEEE/CVF conference on computer vision and pattern
+recognition , pages 8296–8305, 2020. 3
+[25] Yaron Lipman, Ricky T. Q. Chen, Heli Ben-Hamu, Maximilian Nickel, and Matthew Le. Flow
+matching for generative modeling. In The Eleventh International Conference on Learning
+Representations , 2023. URL https://openreview.net/forum?id=PqvMRDCJT9t . 3
+[26] Marlis Hochbruck and Alexander Ostermann. Exponential integrators. Acta Numerica , 19:
+209–286, 2010. doi: 10.1017/S0962492910000048. 5, 17
+[27] Iyabo Ann Adamu. Numerical approximation of SDEs & the stochastic Swift-Hohenberg
+equation . PhD thesis, Heriot-Watt University, 2011. 5
+[28] Martin Gonzalez, Nelson Fernandez Pinto, Thuy Tran, elies Gherbi, Hatem Hajri, and Nader
+Masmoudi. Seeds: Exponential sde solvers for fast high-quality sampling from diffusion models.
+In A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine, editors, Advances in
+Neural Information Processing Systems , volume 36, pages 68061–68120. Curran Associates,
+Inc., 2023. URL https://proceedings.neurips.cc/paper_files/paper/2023/file/
+d6f764aae383d9ff28a0f89f71defbd9-Paper-Conference.pdf . 5, 17
+[29] K. Atkinson, W. Han, and D.E. Stewart. Numerical Solution of Ordinary Differential Equations .
+Pure and Applied Mathematics: A Wiley Series of Texts, Monographs and Tracts. Wiley, 2011.
+ISBN 9781118164525. URL https://books.google.com/books?id=QzjGgLlKCYQC . 6
+[30] Chenlin Meng, Yutong He, Yang Song, Jiaming Song, Jiajun Wu, Jun-Yan Zhu, and Stefano
+Ermon. SDEdit: Guided image synthesis and editing with stochastic differential equations. In
+International Conference on Learning Representations , 2022. 7
+[31] Shen Nie, Hanzhong Allan Guo, Cheng Lu, Yuhao Zhou, Chenyu Zheng, and Chongxuan
+Li. The blessing of randomness: SDE beats ODE in general diffusion-based image editing.
+InThe Twelfth International Conference on Learning Representations , 2024. URL https:
+//openreview.net/forum?id=DesYwmUG00 . 7, 8
+[32] Brian D.O. Anderson. Reverse-time diffusion equation models. Stochastic Processes and
+their Applications , 12(3):313–326, 1982. ISSN 0304-4149. doi: https://doi.org/10.1016/
+0304-4149(82)90051-5. URL https://www.sciencedirect.com/science/article/
+pii/0304414982900515 . 7
+12[33] Chen Henry Wu and Fernando De la Torre. A latent space of stochastic diffusion models for
+zero-shot image editing and guidance. In ICCV , 2023. 8
+[34] Zander W. Blasingame and Chen Liu. Leveraging diffusion for strong and high quality face
+morphing attacks. IEEE Transactions on Biometrics, Behavior, and Identity Science , 6(1):
+118–131, 2024. doi: 10.1109/TBIOM.2024.3349857. 8, 9, 10, 27, 28
+[35] R. Raghavendra, K. B. Raja, and C. Busch. Detecting morphed face images. In IEEE 8th
+Int’l Conf. on Biometrics Theory, Applications and Systems (BTAS) , pages 1–7, 2016. doi:
+10.1109/BTAS.2016.7791169.
+[36] Eklavya Sarkar, Pavel Korshunov, Laurent Colbois, and Sébastien Marcel. Are gan-based
+morphs threatening face recognition? In ICASSP 2022 - 2022 IEEE International Conference
+on Acoustics, Speech and Signal Processing (ICASSP) , pages 2959–2963, 2022. doi: 10.1109/
+ICASSP43922.2022.9746477. 8, 28
+[37] Zander W. Blasingame and Chen Liu. Fast-dim: Towards fast diffusion morphs. IEEE Security
+& Privacy , 22(4):103–114, June 2024. doi: 10.1109/MSEC.2024.3410112. 8, 9, 10
+[38] Haoyu Zhang, Raghavendra Ramachandra, Kiran Raja, and Busch Christoph. Morph-pipe:
+Plugging in identity prior to enhance face morphing attack based on diffusion model. In
+Norwegian Information Security Conference (NISK) , 2023. 8, 9, 10, 28
+[39] Konpat Preechakul, Nattanat Chatthee, Suttisak Wizadwongsa, and Supasorn Suwajanakorn.
+Diffusion autoencoders: Toward a meaningful and decodable representation. In Proceedings
+of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) , pages
+10619–10629, June 2022. 8
+[40] T. Karras, S. Laine, and T. Aila. A style-based generator architecture for generative adversarial
+networks. In 2019 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) ,
+pages 4396–4405, 2019. doi: 10.1109/CVPR.2019.00453. 8, 9
+[41] Jiankang Deng, Jia Guo, Niannan Xue, and Stefanos Zafeiriou. Arcface: Additive angular
+margin loss for deep face recognition. In Proceedings of the IEEE Conference on Computer
+Vision and Pattern Recognition , pages 4690–4699, 2019. 9, 28
+[42] Haoyu Zhang, Sushma Venkatesh, Raghavendra Ramachandra, Kiran Raja, Naser Damer, and
+Christoph Busch. Mipgan—generating strong and high quality morphing attacks using identity
+prior driven gan. IEEE Transactions on Biometrics, Behavior, and Identity Science , 3(3):
+365–383, 2021. doi: 10.1109/TBIOM.2021.3072349. 9, 10, 28
+[43] T. Karras, S. Laine, M. Aittala, J. Hellsten, J. Lehtinen, and T. Aila. Analyzing and improving
+the image quality of stylegan. In 2020 IEEE/CVF Conference on Computer Vision and Pattern
+Recognition (CVPR) , pages 8107–8116, 2020. doi: 10.1109/CVPR42600.2020.00813. 9
+[44] Marco Huber, Fadi Boutros, Anh Thi Luu, Kiran Raja, Raghavendra Ramachandra, Naser
+Damer, Pedro C. Neto, Tiago Gonçalves, Ana F. Sequeira, Jaime S. Cardoso, João Tremoço,
+Miguel Lourenço, Sergio Serra, Eduardo Cermeño, Marija Ivanovska, Borut Batagelj, Andrej
+Kronovšek, Peter Peer, and Vitomir Štruc. Syn-mad 2022: Competition on face morphing attack
+detection based on privacy-aware synthetic training data. In 2022 IEEE International Joint
+Conference on Biometrics (IJCB) , pages 1–10, 2022. doi: 10.1109/IJCB54206.2022.10007950.
+9, 10, 28
+[45] Lisa DeBruine and Benedict Jones. Face Research Lab London Set. 5 2017. doi: 10.
+6084/m9.figshare.5047666.v5. URL https://figshare.com/articles/dataset/Face_
+Research_Lab_London_Set/5047666 . 9, 28
+[46] Fadi Boutros, Naser Damer, Florian Kirchbuchner, and Arjan Kuijper. Elasticface: Elastic
+margin loss for deep face recognition. In Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition (CVPR) Workshops , pages 1578–1587, June 2022. 9, 28
+[47] Minchul Kim, Anil K Jain, and Xiaoming Liu. Adaface: Quality adaptive margin for face
+recognition. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition , 2022. 9, 28
+13[48] Ulrich Scherhag, Andreas Nautsch, Christian Rathgeb, Marta Gomez-Barrero, Raymond N. J.
+Veldhuis, Luuk Spreeuwers, Maikel Schils, Davide Maltoni, Patrick Grother, Sebastien Marcel,
+Ralph Breithaupt, Raghavendra Ramachandra, and Christoph Busch. Biometric systems under
+morphing attacks: Assessment of morphing techniques and vulnerability reporting. In 2017
+International Conference of the Biometrics Special Interest Group (BIOSIG) , pages 1–7, 2017.
+doi: 10.23919/BIOSIG.2017.8053499. 9
+[49] John Charles Butcher. Numerical methods for ordinary differential equations . John Wiley &
+Sons, 2016. 22
+[50] Xuechen Li, Ting-Kam Leonard Wong, Ricky T. Q. Chen, and David Duvenaud. Scalable
+gradients for stochastic differential equations. In Silvia Chiappa and Roberto Calandra, editors,
+Proceedings of the Twenty Third International Conference on Artificial Intelligence and Statis-
+tics, volume 108 of Proceedings of Machine Learning Research , pages 3870–3882. PMLR,
+26–28 Aug 2020. URL https://proceedings.mlr.press/v108/li20i.html . 22, 23
+[51] Hiroshi Kunita. Stochastic differential equations and stochastic flows. Stochastic Flows and
+Jump-Diffusions , pages 77–124, 2019. 22, 23
+[52] Zander W. Blasingame and Chen Liu. Greedy-dim: Greedy algorithms for unreasonably
+effective face morphs. In 2024 IEEE International Joint Conference on Biometrics (IJCB) ,
+pages 1–10, September 2024. 27, 28, 29
+[53] Ionut Cosmin Duta, Li Liu, Fan Zhu, and Ling Shao. Improved residual networks for image
+and video recognition. In 2020 25th International Conference on Pattern Recognition (ICPR) ,
+pages 9415–9422, 2021. doi: 10.1109/ICPR48806.2021.9412193. 28
+[54] Xiang An, Xuhan Zhu, Yuan Gao, Yang Xiao, Yongle Zhao, Ziyong Feng, Lan Wu, Bin Qin,
+Ming Zhang, Debing Zhang, and Ying Fu. Partial fc: Training 10 million identities on a
+single machine. In 2021 IEEE/CVF International Conference on Computer Vision Workshops
+(ICCVW) , pages 1445–1449, 2021. doi: 10.1109/ICCVW54120.2021.00166. 28
+[55] Jiwen Yu, Yinhuai Wang, Chen Zhao, Bernard Ghanem, and Jian Zhang. Freedom: Training-
+free energy-guided conditional diffusion model. Proceedings of the IEEE/CVF International
+Conference on Computer Vision (ICCV) , 2023. 28, 29
+[56] Xingchao Liu, Lemeng Wu, Shujian Zhang, Chengyue Gong, Wei Ping, and Qiang Liu. Flow-
+grad: Controlling the output of generative odes with gradients. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition , pages 24335–24344, 2023. 28, 29
+[57] Bram Wallace, Akash Gokul, Stefano Ermon, and Nikhil Naik. End-to-end diffusion latent
+optimization improves classifier guidance, 2023. 28, 29
+[58] Jiachun Pan, Jun Hao Liew, Vincent Tan, Jiashi Feng, and Hanshu Yan. AdjointDPM: Adjoint
+sensitivity method for gradient backpropagation of diffusion probabilistic models. In The Twelfth
+International Conference on Learning Representations , 2024. URL https://openreview.
+net/forum?id=y33lDRBgWI . 28, 29
+[59] Pierre Marion, Anna Korba, Peter Bartlett, Mathieu Blondel, Valentin De Bortoli, Arnaud
+Doucet, Felipe Llinares-López, Courtney Paquette, and Quentin Berthet. Implicit diffusion:
+Efficient optimization through stochastic sampling. arXiv preprint arXiv:2402.05468 , 2024. 28,
+30
+[60] Bram Wallace, Akash Gokul, and Nikhil Naik. Edict: Exact diffusion inversion via coupled
+transformations. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition , pages 22532–22541, 2023. 29
+14A Derivation of AdjointDEIS
+In this section we provide the full derivations for the family of AdjointDEIS solvers. First recall the
+full definition of the continuous adjoint equations for the empirical probability flow ODE:
+ax(0) =∂L
+∂x0,dax
+dt(t) =−ax(t)⊤∂fθ(xt,z, t)
+∂xt,
+az(0) = 0,daz
+dt(t) =−ax(t)⊤∂fθ(xt,z, t)
+∂z,
+aθ(0) = 0,daθ
+dt(t) =−ax(t)⊤∂fθ(xt,z, t)
+∂θ. (A.1)
+We can simplify the equations by explicitly solving gradients of the neural vector field fθfor the
+drift term to obtain
+dax
+dt(t) =−f(t)ax(t)−g2(t)
+2σtax(t)⊤∂ϵθ(xt,z, t)
+∂xt,
+daz
+dt(t) = 0−g2(t)
+2σtax(t)⊤∂ϵθ(xt,z, t)
+∂z,
+daθ
+dt(t) = 0−g2(t)
+2σtax(t)⊤∂ϵθ(xt,z, t)
+∂θ. (A.2)
+Remark A.1. The last two equations in Equations (A.2) the vector fields are independent of (az,aθ),
+reducing these equations to mere integrals; however, it is often useful to compute the whole system
+aaug= (ax,az,aθ)as an augmented ODE.
+Remark A.2. Likewise, the last two equations in Equations (A.2) are functionally identical with a
+simple swap of zforθor vice versa.
+As such, for the sake of brevity, the derivations for the AdjointDEIS solvers for (az,aθ)will only
+explicitly include the derivations for az.
+A.1 Simplified Formulation of the Continuous Adjoint Equations
+Focusing first on the continuous adjoint equation for axwe apply the integrating factor
+exp Rt
+0f(τ) dτ
+to Equation (A.2) to find
+d
+dt
+eRt
+0f(τ) dτax(t)
+=−eRt
+0f(τ) dτg2(t)
+2σtax(t)⊤∂ϵθ(xt,z, t)
+∂xt. (A.3)
+Then, the exact solution at time sgiven time t < s is found to be
+eRs
+0f(τ) dτax(s) =eRt
+0f(τ) dτax(t)−Zs
+teRu
+0f(τ) dτg2(u)
+2σuax(u)⊤ϵθ(xu,z, u)
+∂xudu
+ax(s) =eRt
+sf(τ) dτax(t)−Zs
+teRu
+sf(τ) dτg2(u)
+2σuax(u)⊤ϵθ(xu,z, u)
+∂xudu (A.4)
+To simplify Equation (A.4), recall that f(t)is defined as
+f(t) =d logαt
+dt, (A.5)
+for VP type SDEs. Furthermore, let λt:= log( αt/σt)be one half of the log-SNR. Then the diffusion
+coefficient can be simplified using the log-derivative trick such that
+g2(t) =dσ2
+t
+dt−2d logαt
+dtσ2
+t= 2σ2
+td logσt
+dt−d logαt
+dt
+=−2σ2
+tdλt
+dt. (A.6)
+Using this updated expression of g2(t)along with computing the integrating factor in closed form
+enables us to express Equation (A.4) as
+ax(s) =αt
+αsax(t) +1
+αsZs
+tαuσudλu
+duax(u)⊤ϵθ(xu,z, u)
+∂xudu. (A.7)
+15Lastly, by rewriting the integral in terms of an exponentially weighted integral αuσu=α2
+uσu/αu=
+α2
+ue−λuwe find
+ax(s) =αt
+αsax(t) +1
+αsZλs
+λtα2
+λe−λax(λ)⊤ϵθ(xλ,z, λ)
+∂xλdλ. (A.8)
+This change of variables is possible as λtis a strictly decreasing function w.r.t. tand therefore it has
+an inverse function tλwhich satisfies tλ(λt) =t, and, with abuse of notation, we let xλ:=xtλ(λ),
+ax(λ):=ax(tλ(λ)), &c and let the reader infer from context if the function is mapping the log-SNR
+back into the time domain or already in the time domain.
+Now we will show the derivations to find a simplified form of the continuous adjoint equation for the
+conditional information. Using the continuous adjoint equation from Equations (A.2) for az(t)along
+with the log-SNR, we can express the evolution of az(t)as
+daz
+dt(t) =σtdλt
+dtax(t)⊤∂ϵθ(xt,z, t)
+∂z. (A.9)
+As we would like to express this as an exponential integrator, we simply multiply σtbyαt/αtto
+obtain αt·σt/αt=αte−λt, as such we can rewrite Equation (A.9) as
+daz
+dt(t) =αte−λtdλt
+dtax(t)⊤∂ϵθ(xt,z, t)
+∂z. (A.10)
+Using Equations (A.8) and (A.10), we arrive at Proposition 3.1 from the main paper.
+Proposition A.1. Given initial values [ax(t),az(t),aθ(t)]at time t∈(0, T), the solution
+[ax(s),az(s),aθ(s)]at time s∈(t, T]of the adjoint empirical probability flow ODE in Equa-
+tion(A.4) is
+ax(s) =αt
+αsax(t) +1
+αsZλs
+λtα2
+λe−λax(λ)⊤ϵθ(xλ,z, λ)
+∂xλdλ, (A.11)
+az(s) =az(t) +Zλs
+λtαλe−λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂zdλ, (A.12)
+aθ(s) =aθ(t) +Zλs
+λtαλe−λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂θdλ. (A.13)
+Then to find the AdjointDEIS solvers we take a k-th order Taylor expansion about λtand integrate in
+the log-SNR domain.
+A.2 Taylor Expansion
+Fork≥1, the(k−1)-th Taylor expansion at λtof the inner term of the exponentially weighted
+integral in Equation (A.11) is
+ax(λ)⊤∂ϵθ(xλ,z, λ)
+∂xλ=k−1X
+n=0(λ−λt)n
+n!dn
+dλn
+α2
+λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂xλ
+λ=λt+O((λ−λt)k).
+(A.14)
+Then plugging this into Equation (A.11) yields
+ax(s) =αt
+αsax(t) +1
+αsZλs
+λte−λk−1X
+n=0(λ−λt)n
+n!dn
+dλn
+α2
+λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂xλ
+λ=λtdλ
++O(hk+1)
+=αt
+αsax(t) +1
+αsk−1X
+n=0dn
+dλn
+α2
+λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂xλ
+λ=λt| {z }
+estimatedZλs
+λt(λ−λt)n
+n!e−λdλ
+| {z }
+analytically computed
++O(hk+1)|{z}
+omitted, (A.15)
+16where h=λs−λt.
+The exponentially weighted integralRλs
+λt(λ−λt)n
+n!e−λdλcan be solved analytically by applying n
+times integration by parts [16, 28] such that
+Zλs
+λte−λ(λ−λt)n
+n!dλ=σs
+αshn+1φn+1(h), (A.16)
+with the special φ-functions [26]. These functions are defined as
+φn+1(h):=Z1
+0e(1−u)hun
+n!du, φ 0(h) =eh, (A.17)
+which satisfy the recurrence relation φk+1(h) = ( φn(h)−φn(0))/hand have closed forms for
+k= 1,2:
+φ1(h) =eh−1
+h, (A.18)
+φ2(h) =eh−h−1
+h2. (A.19)
+Likewise, the Taylor expansion of the exponentially weighted integral in Equation (A.12) yields
+az(s) =az(t) +Zλs
+λte−λk−1X
+n=0(λ−λt)n
+n!dn
+dλn
+αλax(λ)⊤∂ϵθ(xλ,z, λ)
+∂z
+λ=λtdλ+O(hk+1)
+=az(t) +k−1X
+n=0dn
+dλn
+αλax(λ)⊤∂ϵθ(xλ,z, λ)
+∂z
+λ=λt| {z }
+estimatedZλs
+λt(λ−λt)n
+n!e−λdλ
+| {z }
+analytically computed+O(hk+1)
+|{z}
+omitted.
+(A.20)
+A.3 AdjointDEIS-1
+Fork= 1and omitting the higher-order error term, Equation (A.15) becomes:
+ax(s) =αt
+αsax(t) +1
+αsα2
+tax(t)⊤∂ϵθ(xt,z, t)
+∂xtZλs
+λt(λ−λt)0
+0!e−λdλ
+=αt
+αsax(t) +σs(eh−1)α2
+t
+α2sax(t)⊤∂ϵθ(xt,z, t)
+∂xtBy Equation (A.16). (A.21)
+Likewise, the continuous adjoint equation for z, Equation (A.20), becomes when k= 1by omitting
+the higher-order error term:
+az(s) =az(t) +αtax(t)⊤∂ϵθ(xt,z, t)
+∂zZλs
+λt(λ−λt)0
+0!e−λdλ
+=az(t) +σs(eh−1)αt
+αsax(t)⊤∂ϵθ(xt,z, t)
+∂zBy Equation (A.16). (A.22)
+And the first-order solver for aθ(t)can be found in a similar fashion, thus we have derived the
+AdjointDEIS-1 solvers.
+A.4 AdjointDEIS-2M
+For notational convenience let V(x;t)denote the scaled vector-Jacobian product of the adjoint state
+ax(t)and the gradient of the model w.r.t. xt,i.e.,
+V(x;t) =α2
+tax(t)⊤∂ϵθ(xt,z, t)
+∂xt. (A.23)
+17Consider the following definition of the limit in the log-SNR domain
+d
+dλ
+α2
+λax(λ)⊤∂ϵθ(xλ,z, λ)
+∂xλ
+= lim
+λr→λtV(x;λt)−V(x;λr)
+ρh, (A.24)
+where ρ=λt−λr
+hwithh=λs−λtand where ris some previous step r < t < s . Again V(x;λt)
+is overloaded to mean V(x;tλ(λt)). Then by omitting higher-order error O(hk+1), Equation (A.15)
+becomes:
+ax(s) =αt
+αsax(t) +1
+αs
+V(x;λt)Zλs
+λt(λ−λt)0
+0!dλ+V(1)(x;λt)Zλs
+λt(λ−λt)1
+1!dλ
+=αt
+αsax(t) +1
+αsσs
+αs(eh−1)V(x;λt) +σs
+αs(eh−h−1)V(1)(x;λt)
+. (A.25)
+By applying the same approximation used in Lu et al. [16] of
+eh−h−1
+h≈eh−1
+2, (A.26)
+then we can rewrite the second term of the Taylor expansion as
+σs
+αs(eh−h−1)V(1)(x;λt)≈σs
+αs(eh−h−1)V(x;λt)−V(x;λr)
+ρhBy Equation (A.24)
+≈σs
+αseh−1
+2ρ 
+V(x;λt)−V(x;λr)
+By Equation (A.26)
+=σs
+αseh−1
+2ρ
+α2
+tax(t)⊤∂ϵθ(xt,z, t)
+∂xt−α2
+rax(r)⊤∂ϵθ(xr,z, r)
+∂xr
+.
+(A.27)
+Then Equation (A.25) becomes
+ax(s) =αt
+αsax(t) +σs(eh−1)α2
+t
+α2sax(t)⊤∂ϵθ(xt,z, t)
+∂xt
++σseh−1
+2ρα2
+t
+α2sax(t)⊤∂ϵθ(xt,z, t)
+∂xt−α2
+r
+α2sax(r)⊤∂ϵθ(xr,z, r)
+∂xr
+.(A.28)
+Likewise, consider the scaled vector-Jacobian product of the adjoint state ax(t)and the gradient of
+the model w.r.t. z,i.e.,
+V(z;t) =αtax(t)⊤∂ϵθ(xt,z, t)
+∂z, (A.29)
+along with a corresponding definition of first-derivative w.r.t. λas defined in Equation (A.24). As
+such Equation (A.20), when k= 2, becomes the following when omitting the higher-order error
+term:
+az(s) =az(t) +V(z;λt)Zλs
+λt(λ−λt)0
+0!dλ+V(1)(z;λt)Zλs
+λt(λ−λt)1
+1!dλ
+=az(t) +σs
+αs(eh−1)V(z;λt) +σs
+αs(eh−h−1)V(1)(z;λt). (A.30)
+The second term of the Taylor expansion can be rewritten as
+σs
+αs(eh−h−1)V(1)(z;λt)≈σs
+αs(eh−h−1)V(z;λt)−V(z;λr)
+ρh
+≈σs
+αseh−1
+2ρ 
+V(z;λt)−V(z;λr)
+By Equation (A.26)
+=σs
+αseh−1
+2ρ
+αtax(t)⊤∂ϵθ(xt,z, t)
+∂z−αrax(r)⊤∂ϵθ(xr,z, r)
+∂z
+.
+(A.31)
+18Then Equation (A.30) becomes
+az(s) =az(t) +σs(eh−1)αt
+αsax(t)⊤∂ϵθ(xt,z, t)
+∂z
++σseh−1
+2ραt
+αsax(t)⊤∂ϵθ(xt,z, t)
+∂z−αr
+αsax(r)⊤∂ϵθ(xr,z, r)
+∂z
+, (A.32)
+and the corresponding second-order solver for aθ(t)can be found in a similar manner.
+B Proof of Theorem 3.1
+For notational brevity we denote the scaled vector-Jacobian products of the solution trajectory of
+AdjointDEIS as
+˜V(x;t) =α2
+t˜ax(t)⊤∂ϵθ(˜xt,z, t)
+∂˜xt, (B.1)
+˜V(z;t) =αt˜ax(t)⊤∂ϵθ(˜xt,z, t)
+∂z. (B.2)
+B.1 Assumptions
+For the AdjointDEIS solvers, we make similar assumptions to Lu et al. [16].
+Assumption B.1. The total derivatives of the vector-Jacobian products V(k)({xλ,z, θ}, λ)as a
+function of λexist and are continuous for 0≤j≤k+ 1(and hence bounded).
+Assumption B.2. The function ϵθ(x,z, t)is continuous in tand uniformly Lipschitz and continuously
+differentiable w.r.t. its first parameter x.
+Assumption B.3. hmax:= max 1≤j≤Mhj=O(1/M).
+Assumption B.4. ρi> c > 0for all i= 1, . . . M and some constant c.
+The first assumption is required by Taylor’s theorem. The second assumption is a mild assumption
+to ensure Theorem B.1 holds, which is used to replace ˜V({xt,z, θ}, t)withV({xt,z, θ}, t) +
+O(˜ax(t)−ax(t))so the Taylor expansion w.r.t. λsis applicable. The third assumption is a technical
+assumption to exclude a significantly large step size. The last assumption is necessary for the case
+when k= 2. For our proofs we follow a similar outline to that taken by Lu et al. [17, Appendix A].
+B.2 The Vector-Jacobian Product is Lipschitz
+Lemma B.1 (Vector-Jacobian Product is Lipschitz.) .Letfθ:Rd×Rz×[0, T]→Rdbe continuous
+intand uniformly Lipschitz and continuously differentiable in x. Letx: [0, T]→Rdbe the unique
+solution to
+dxt
+dt=fθ(xt,z, t)
+with initial condition x0. Then the following map
+(a, t)7→ −a⊤∂fθ(xt,z, t)
+∂[xt,z, θ]
+is Lipschitz in a. Moreover, the Lipschitz constant L >0is given by
+L= sup
+t∈[0,T]∂fθ(xt,z, t)
+∂xt. (B.3)
+Proof. Now as xtis continuous and fθis continuously differentiable in x, sot7→∂fθ
+∂[xt,z,θ](xt,z, t)
+is a continuous function on the compact set [0, T], so it is bounded by some L > 0. Likewise,
+fora∈Rdthe map (a, t)7→ −a⊤∂fθ(xt,z,t)
+∂[xt,z,θ]is Lipschitz in awith Lipschitz constant Land this
+constant is independent of t.
+19B.3 Proof of Theorem 3.1 when k= 1
+Proof. First we consider the case of the adjoint state ax(t). Recall that the AdjointDEIS-1 solver for
+axwith higher-order error terms is given by
+ax(ti+1) =αti
+αti+1ax(ti) +σti+1(ehi−1)α2
+ti
+α2
+ti+1ax(ti)⊤∂ϵθ(xti,z, t)
+∂xti+O(h2
+i), (B.4)
+where we let ti=t,ti+1=s,hi=λti+1−λtifrom Equation (A.21). By Theorem B.1 and Equa-
+tion (A.21) it holds that
+˜ax(ti+1) =αti
+αti+1˜ax(ti) +σti+1(ehi−1)α2
+ti
+α2
+ti+1˜ax(ti)⊤∂ϵθ(˜xti,z, t)
+∂˜xti
+=αti
+αti+1˜ax(ti) +σti+1(ehi−1)α2
+ti
+α2
+ti+1
+ax(ti)⊤∂ϵθ(xti,z, t)
+∂xti+O(˜ax(ti)−ax(ti))
+=αti
+αti+1ax(ti) +σti+1(ehi−1)α2
+ti
+α2
+ti+1ax(ti)⊤∂ϵθ(xti,z, t)
+∂xti+O(˜ax(ti)−ax(ti))
+=ax(ti+1) +O(h2
+max) +O(˜ax(ti)−ax(ti)). (B.5)
+Repeat, this argument, from ˜ax(t0) =ax(0)then we find
+˜ax(tM) =ax(T) +O(Mh2
+max) =ax(T) +O(hmax). (B.6)
+Although the argument for the adjoint state az(t)follows an analogous form to the one above we
+explicitly state it for completeness. Recall that the AdjointDEIS-1 solver for azwith higher-order
+error terms is given by
+az(ti+1) =az(ti) +σti+1(ehi−1)αti
+αti+1ax(ti)⊤∂ϵθ(xti,z, t)
+∂z+O(h2
+i). (B.7)
+By Theorem B.1 and Equation (A.22) it holds that
+˜az(ti+1) =˜az(ti) +σti+1(ehi−1)αti
+αti+1˜ax(ti)⊤∂ϵθ(˜xti,z, t)
+∂z
+=˜az(ti) +σti+1(ehi−1)αti
+αti+1
+ax(ti)⊤∂ϵθ(xti,z, t)
+∂z+O(˜ax(ti)−ax(ti))
+=az(ti) +σti+1(ehi−1)αti
+αti+1ax(ti)⊤∂ϵθ(xti,z, t)
+∂z+O(˜ax(ti)−ax(ti)
+=az(ti+1) +O(h2
+max) +O(˜ax(ti)−ax(ti). (B.8)
+Repeat, this argument, from ˜az(t0) =0then we find
+˜az(tM) =az(T) +O(Mh2
+max) =az(T) +O(hmax). (B.9)
+An identical argument can be constructed for aθthereby finishing the proof.
+B.4 Proof of Theorem 3.1 when k= 2
+We prove the discretization error of the AdjointDEIS-2M solver. Note for the AdjointDEIS-2M solver
+we have hi=λti+1−λti−1andρi=λti−λti−1
+hi. Furthermore, let ∆i=∥˜ax(ti)−ax(ti)∥. Without
+loss of generality, we will prove this only for ax; the derivation for azandaθis analogous.
+Proof. First we consider the case of the adjoint state ax(t). Recall that the AdjointDEIS-2, see Equa-
+tion (A.25), solver for axwith higher-order error terms is given by
+ax(ti+1) =αti
+αti+1ax(ti)+1
+αti+1σti+1
+αti+1(ehi−1)V(x;ti)+σti+1
+αti+1(ehi−hi−1)V(1)(x;ti)
++O(h3
+i).
+(B.10)
+20Taylor’s expansion yields
+ax(ti+1)−αti
+αti+1ax(ti)+1
+αti+1hσti+1
+αti+1(ehi−1)V(x;ti)+σti+1
+αti+1(ehi−hi−1)V(1)(x;ti)i≤Ch3
+i,
+(B.11)
+where Cis a constant that depends on V(2)(xt, t). Also note that
+V(1)(x;ti)−1
+ρihi 
+V(x;ti)−V(x;ti−1)≤Chi. (B.12)
+Since ρiis bounded away from zero, and e−hi= 1−hi+h2
+i/2 +O(h3
+i), we know
+(ehi−hi+ 1)V(1)(x;ti)−ehi−1
+2ρi ˜V(x;ti)−˜V(x;ti−1)
+≤CLh i(∆i+ ∆ i−1) +Ch3
+i+1
+ρiehi−1
+2−ehi−hi−1
+hi∥V(x;ti)−V(x;ti−1)∥
+≤CLh i(∆i+ ∆ i−1) +Ch3
+i+Ch2
+i∥V(x;ti)−V(x;ti−1)∥
+≤CLh i(∆i+ ∆ i−1) +CMih3
+i, (B.13)
+where Mi= 1 + supti≤t≤ti+1∥V(1)(x;t)∥andLare the Lipschitz constants of V(x;t)by Theo-
+rem B.1. Then, ∆i+1can be estimated as
+∆i+1≤αti
+αti+1∆i+σti+1
+α2
+ti+1L∆i+σti+1
+α2
+ti+1(CMih3
+i+CLh i(∆i+ ∆ i+1)) +Ch3
+i
+≤αti
+αti+1∆i+˜Chi(∆i+ ∆ i+1+h2
+i). (B.14)
+Thus, ∆i+1=O(h2
+max)as long as hmax is sufficiently small and ∆0+ ∆ 1=O(h2
+max), which can
+be verified via Taylor expansion, thereby finishing the proof.
+C Proof of Theorem 3.2
+For additional clarity, we let x(t)≡xtand likewise, z(t)≡zt.
+Proof. Asz(t)is continuously differentiable w.r.t. tthere exists some function z′(t)such that
+dz
+dt(t) =z′(t). (C.1)
+Consider the augmented state defined by
+d
+dt
+x
+z
+(t) =faug=
+fθ(xt,zt, t)
+z′(t)
+, (C.2)
+and the associated augmented adjoint state
+aaug(t):=
+ax
+az
+(t). (C.3)
+The Jacobian of faughas the form
+∂faug
+∂[x,z]=∂fθ(x,z,t)
+∂x∂fθ(x,z,t)
+∂z0 0
+. (C.4)
+Recall that ax(t)evolves with
+dax
+dt(t) =−ax(t)⊤∂fθ(x(t),z(t), t)
+∂x(t). (C.5)
+Using Equations (C.3) and (C.4) we can define the evolution of the adjoint augmented state as
+daaug
+dt(t) =−[axaz] (t)∂faug
+∂[x,z](t) =−h
+ax∂fθ(x,z,t)
+∂xax∂fθ(x,z,t)
+∂zi
+(t). (C.6)
+21Therefore, az(t)evolves with the ODE
+az(0) = 0 ,daz
+dt(t) =−ax(t)⊤∂fθ(x(t),z(t), t)
+∂z(t). (C.7)
+We have thus shown the evolution of az(t)for some continuously differentiable function z(t).
+Now we prove the solution is unique and exists. As x(t)is continuous and fθis continuously
+differentiable in x, it follows that the map t7→∂fθ
+∂x(x(t),z(t), t)is a continuous function on the
+compact set [0, T], and therefore it is bounded by some L > 0. Correspondingly, for a∈Rdit
+follows that the map (a, t)7→ −a⊤∂fθ
+∂[x,z](x(t),z(t), t)is Lipschitz in awith Lipschitz constant L
+and this constant is independent of t. Therefore, by the Picard-Lindelölf theorem [ 49, Theorem 110C]
+the solution az(t)exists and is unique.
+D Details on Adjoints for SDEs
+In this section, we provide further details on the continuous adjoint equations for diffusion SDEs that
+we omitted from the main paper due to their technical nature and for the purpose of brevity.
+Consider the Itô integral given by
+xT=ZT
+0xtdwt, (D.1)
+where xtis a continuous semi-martingale adapted to the filtration generated by the Wiener process
+{wt}t∈[0,T],{Ft}t∈[0,T]. The following quantity, however, is not defined
+Z0
+Txtdwt. (D.2)
+This is because xtandwtare adapted to {Ft}t∈[0,T]which is defined in forwards time. This means
+xtdoes not anticipate future events only depends on past events. While this is generally sufficient
+when we wish to integrate backwards in time we want future events to inform past events.
+D.1 Stratonovich Symmetric Integrals and Two-sided Filtration
+Clearly, we need a different tool to model this backwards SDE. As such, taking inspiration from the
+work on neural SDEs [ 50], we follow the treatment of Kunita [51] for the forward and backward
+Fisk-Stratonovich integrals using two-sided filtration . Let{Fs,t}s≤t;s,t∈[0,T]be a two-sided filtration,
+where Fs,tis the σ-algebra generated by {wv−wu:s≤u≤v≤t}fors, t∈[0, T]such that
+s≤t.
+Forward time. For a continuous semi-martingale {xt}t∈[0,T]adapted to the forward filtration
+{F0,t}t∈[0,t], the Stratonovich stochastic integral is given as
+ZT
+0xt◦dwt= lim
+|Π|→0NX
+k=1xtk+xtk−1
+2(wtk−wtk−1) (D.3)
+where Π ={0 =t0<···< tN=T}is a partition of the interval [0, T]and|Π|= max ktk−tk−1.
+The forward filtration {F0,t}t∈[0,t]is analogous to the filtration defined in the prior section; therefore,
+any continuous semi-martingale adapted to it only considers past events and does not anticipate future
+events.
+Reverse time. Consider the backwards Wiener process qwt=wt−wTthat is adapted to the
+backward filtration {Fs,T}s∈[0,T], then for a continuous semi-martingale {qxt}t∈[0,T]adapted to the
+backward filtration, the backward Stratonovich integral is
+ZT
+0qxt◦dqwt= lim
+|Π|→0NX
+k=1qxtk+qxtk−1
+2(qwtk−1−qwtk) (D.4)
+The backward filtration {Fs,T}s∈[0,T]is the opposite of the forward filtration in the sense that
+continuous semi-martingales adapted to it only depend on future events and do not anticipate past
+events. As such, time is effectively reversed.
+22Remark D.1. While the Stratonovich symmetric integrals give us a powerful tool for integrating
+forwards and backwards in time with stochastic integrals, it is important that we use the same
+realization of the Wiener process.
+D.2 Stochastic Flow of Diffeomorphisms
+Consider the Stratonovich SDE defined as
+xT=x0+ZT
+0f(xt, t) dt+ZT
+0g(xt, t)◦dwt, (D.5)
+where f,g∈ C∞,1
+b,i.e., they belong to the class of functions with infinitely many bounded deriva-
+tives w.r.t. the state and bounded first derivatives w.r.t. time. Thus, the SDE has a unique strong
+solution. Given a realization of the Wiener process, there exists a smooth mapping Φcalled the
+stochastic flow such that Φs,t(xs)is the solution at time tof the process described in Equation (D.5)
+started at xsat time s≤t. This then defines a collection of continuous maps S={Φs,t}s≤t;s,t∈[0,T]
+fromRdto itself.
+Kunita [51, Theorem 3.7.1 ]shows that with probability 1 this collection Ssatisfies the flow property
+Φs,t(xs) = Φ u,t(Φs,u(xs))s≤u≤t,xs∈Rd, (D.6)
+and that each Φs,tis a smooth diffeomorphism from Rdto itself. Hence, Sis the stochastic flow of
+diffeomorphisms generated by Equation (D.5). Moreover, the backward flow qΨs,t:= Φ−1
+s,tsatisfies
+the backwards SDE:
+qΨs,t(xt) =xt−Zt
+sf(qΨu,t(xt), u) du−Zt
+sg(qΨu,t(xt), u)◦dqwu, (D.7)
+for all s, t∈[0, T]such that s≤t. This formulation makes intuitive sense as the backwards SDE
+differs only from the forwards SDE by a negative sign.
+D.3 Continuous Adjoint Equations
+Now consider the adjoint flow As,t(xs) =∂L(Φs,t(xs))/∂xs, then qAs,t(xt) =As,t(qΨs,t(xt)). Li
+et al. [50] show that qAs,t(xt)satisfies the backward SDE:
+qAs,t(xt) =∂L
+∂xt+Zt
+sqAu,t(xt)∂f
+∂xu(qΨu,t(xt), u) du+Zt
+sqAu,t(xt)∂g
+∂xu(qΨu,t(xt), u)◦dqwu.
+(D.8)
+As the drift and diffusion coefficient of this SDE are in C∞,1
+b, the system has a unique strong solution.
+D.4 Proof of Theorem 4.1
+We are now ready to put all of this together to prove the result from the main paper.
+Proof.
+dxt=f(xt, t) dt+g(t)◦dwt. (D.9)
+By Equation (D.8) the adjoint state admitted by the flow of diffeomorphisms generated by Equa-
+tion (D.9) evolves with the SDE
+qAs,t(xt) =∂L
+∂xt+Zt
+sqAu,t(xt)∂f
+∂xu(qΨu,t(xt), u) du+Zt
+sqAu,t(xt)∂g
+∂xu(u)◦dqwu
+| {z }
+=0
+=∂L
+∂xt+Zt
+sqAu,t(xt)∂f
+∂xu(qΨu,t(xt), u) du. (D.10)
+Clearly, the adjoint state evolves with an ODE revolving around only the drift coefficient, i.e.,f.
+Therefore, we can rewrite the evolution of the adjoint state as
+dax(t) =−ax(t)⊤∂f
+∂xt(xt, t) dt. (D.11)
+23D.5 Converting the Itô SDE to Stratonovich
+The diffusion SDE in Equation (4.1) is defined as an Itô SDE. However, Theorem 4.1 is defined as
+Stratonovich SDEs. However, an Itô SDE can be easily converted into the Stratonovich form, i.e., for
+some Itô SDE of the form
+dxt=f(xt, t) dt+g(xt, t) dwt (D.12)
+with a differentiable function σ, there exists a corresponding Stratonovich SDE of the form
+dxt= [f(xt, t) +1
+2∂g
+∂x(xt, t)·g(xt, t)] dt+g(xt, t)◦dwt. (D.13)
+As Equation (4.1) is defined such that g(xt, t) =g(t)and is independent of the state xt, then the
+SDE may be written in Stratonovich form as
+dxt=h
+f(t)xt+g2(t)
+σtϵθ(xt,z, t)i
+dt+g(t)◦d¯wt. (D.14)
+E Additional Experiments
+In this section, we include some additional experiments that did not fit within the main paper.
+(a)M= 5
+ (b)M= 10
+ (c)M= 15
+ (d)M= 20
+Figure 4: Morphed faces created by guided generation with AdjointDEIS with differing number of
+discretization steps.
+E.1 Impact of Discretization Steps
+One of the advantages of AdjointDEIS is that the solver for the diffusion ODE and continuous adjoint
+equations are distinct. This means that we don’t have to force N=Menabling greater flexibility
+when using AdjointDEIS. As such we explore the impact of using fewer steps to estimate the gradient
+while keeping the number of sampling steps N= 20 fixed. In Figure 4 we illustrate the impact of the
+change in the number of discretization steps when estimating the gradients. Unsurprisingly, the fewer
+steps we take the less accurate the gradients are. This matches the empirical data presented in Table 2
+which measures the impact of face morphing performance measured in MMPMR.
+Table 2: Impact of number of discretization steps, M, on face morphing with AdjointDEIS. FMR =
+0.1%.
+MMPMR (↑)
+M(↓) AdaFace ArcFace ElasticFace
+20 99.8 98.77 99.39
+15 94.89 90.59 94.07
+10 94.27 91.21 92.84
+05 69.94 60.74 64.21
+24(a)η= 0.01
+ (b)η= 0.1
+ (c)η= 1
+Figure 5: Morphed faces created by guided generation with AdjointDEIS with different learning
+rates. All used M= 20 the ODE variant.
+E.2 Impact of Learning Rate
+We measure the impact of the learning rate on guided generation with AdjointDEIS in Table 2.
+Unsurprisingly, large learning rates lower performance, especially for less accurate gradients. I.e.,
+when Mis small. We illustrate an example of the impact in Figure 5. Clearly, the learning rate of
+η= 1starts to distort the images even if it still fools the FR system.
+Table 3: Impact of learning rate, η, on face morphing with AdjointDEIS. FMR = 0.1%.
+MMPMR (↑)
+SDE η M (↓) AdaFace ArcFace ElasticFace
+✗ 1 20 98.77 98.98 98.77
+✗ 0.1 20 99.8 98.77 99.39
+✗ 0.01 20 95.5 92.64 95.91
+✗ 1 10 50.92 49.69 50.92
+✗ 0.1 10 94.27 91.21 92.84
+✗ 1 05 2.66 2.04 1.84
+✗ 0.1 05 69.94 60.74 64.21
+✓ 1 20 98.57 99.59 98.98
+✓ 0.1 20 98.57 97.96 97.75
+E.3 Number of Steps
+(a)N= 20
+ (b)N= 50
+Figure 6: Morphed faces created by guided generation with AdjointDEIS with different number of
+sampling steps. SDE solver, M=N.
+25As alluded to in the main paper, one of the drawbacks of diffusion SDEs is that they require small
+step sizes to work properly. We observe that the missing high frequency content is added back in
+when the step size is increased, see Figure 6.
+F Implementation Details
+F.1 AdjointDEIS-2M Algorithm
+For completeness we have the full AdjointDEIS-2M solver implemented in Algorithm 1.
+Algorithm 1 AdjointDEIS-2M.
+Require: Initial values ax(0), monotonically increasing time steps {ti}M
+i=0, and noise prediction
+model ϵθ(xt,z, t).
+1:Denote hi:=λti+1−λti, fori= 0, . . . , M −1.
+2:˜ax(t0)←ax(0) ▷Initialize an empty buffer Q.
+3:˜az(t0)←0,˜aθ(t0)←0.
+4:Qbuffer←−˜aaug(t0)
+5:˜ax(t1)←αti
+αt1˜ax(t0) +σt1(eh0−1)α2
+t0
+α2
+t1˜ax(t0)⊤∂ϵθ(˜xt0,z,t)
+∂˜xt0
+6:˜az(t1)←˜az(t0) +σt1(eh0−1)αt0
+αt1˜ax(t0)⊤∂ϵθ(˜xt0,z,t)
+∂z
+7:˜aθ(t1)←˜aθ(t0) +σt1(eh0−1)αt0
+αt1˜ax(t0)⊤∂ϵθ(˜xt0,z,t)
+∂θ
+8:Qbuffer←−˜aaug(t1)
+9:fori←1,2, . . . , M −1do
+10: ρi←hi−1
+hi
+11: Di←
+1 +1
+2ρi
+˜V(x;ti)−1
+2ρi˜V(x;ti−1)
+12: Ei←
+1 +1
+2ρi
+˜V(z;ti)−1
+2ρi˜V(z;ti−1)
+13: Fi←
+1 +1
+2ρi
+˜V(θ;ti)−1
+2ρi˜V(θ;ti−1)
+14: ˜ax(ti+1)←αti
+αti+1˜ax(ti) +σti+1
+α2
+ti+1(ehi−1)Di
+15: ˜az(ti+1)←˜az(ti) +σti+1
+αti+1(ehi−1)Ei
+16: ˜aθ(ti+1)←˜aθ(ti) +σti+1
+αti+1(ehi−1)Fi
+17: ifi < M −1then
+18: Qbuffer←−˜aaug(ti+1)
+19: end if
+20:end for
+21:return ˜ax(tM),˜az(tM),˜aθ(tM).
+F.2 Code
+Our code for AdjointDEIS will soon be available here at https://github.com/zblasingame/
+AdjointDEIS .
+F.3 Repositories Used
+For reproducibility purposes, we provide a list of links to the official repositories of other works used
+in this paper.
+1.The SYN-MAD 2022 dataset used in this paper can be found at https://github.com/
+marcohuber/SYN-MAD-2022 .
+2.The ArcFace models, MS1M-RetinaFace dataset, and MS1M-ArcFace dataset can be found
+athttps://github.com/deepinsight/insightface .
+263. The ElasticFace model can be found at https://github.com/fdbtrs/ElasticFace .
+4. The AdaFace model can be found at https://github.com/mk-minchul/AdaFace .
+5.The official Diffusion Autoencoders repository can be found at https://github.com/
+phizaz/diffae .
+6.The official MIPGAN repository can be found at https://github.com/
+ZHYYYYYYYYYYYY/MIPGAN-face-morphing-algorithm .
+G Experimental Details
+In this section, we outline the details for the experiments run in Section 5.
+G.1 DiM Algorithm
+For completeness, we provide the DiM algorithm from [ 34] following the notation used in [ 52]. The
+original bona fide images are denoted x(a)
+0andx(b)
+0. The conditional encoder is E:X → Z ,Φis the
+numerical diffusion ODE solver, Φ+is the numerical diffusion ODE solver as time runs forwards
+from 0toT. The algorithm is presented in Algorithm 2.
+Algorithm 2 DiM Framework.
+Require: Blend parameter w= 0.5. Time schedule {ti}N
+i=1⊆[0, T], ti< ti+1.
+1:za← E(x(a)
+0) ▷Encoding bona fides into conditionals.
+2:zb← E(x(b)
+0)
+3:fori←1,2, . . . , N −1do
+4: x(a)
+ti+1←Φ+(x(a)
+ti,ϵθ(x(a)
+ti,za, ti), ti)▷Solving the probability flow ODE as time runs from
+0toT.
+5: x(b)
+ti+1←Φ+(x(b)
+ti,ϵθ(x(b)
+ti,zb, ti), ti)
+6:end for
+7:x(ab)
+T←slerp(x(a)
+T,x(b)
+T;w) ▷Morph initial noise.
+8:zab←lerp(za,zb;w) ▷Morph conditionals.
+9:fori←N, N−1, . . . , 2do
+10: x(ab)
+ti−1←Φ(x(ab)
+ti,ϵθ(x(ab)
+ti,zab, ti), ti)▷Solving the probability flow ODE as time runs
+from Tto0.
+11:end for
+12:return x(ab)
+0
+G.2 NFE
+In our reporting of the NFE we record the number of times the diffusion noise prediction U-Net is
+evaluated both during the encoding phase, NE, and solving of the PF-ODE or diffusion SDE, N. We
+chose to report N+NEoverN+ 2NEas even though two bona fide images are encoded resulting
+in2NENFE during encoding, this process can simply be batched together, reducing the NFE down
+toNE. When reporting the NFE for the Morph-PIPE model, we report NE+BN where Bis the
+number of blends. While a similar argument can be made that the morphed candidates could be
+generated in a large batch of size B, reducing the NFE of the sampling process down to N, we chose
+to report BN as the number of blends, B= 21 , used in the Morph-PIPE is quite large, potentially
+resulting in Out Of Memory (OOM) errors, especially if trying to process a mini-batch of morphs.
+Using NE+Nreporting over NE+BN, the NFE of Morph-PIPE is 350, which is comparable to
+DiM. The reporting of NFE for AdjointDEIS was calculated as NE+nopt(N+M)where nopt
+is the number of optimization steps and Mis the number of discretization steps for the continuous
+adjoint equations.
+G.3 Hardware
+All of the main experiments were done on a single NVIDIA Tesla V100 32GB GPU. On average the
+guided generation experiments for our approach took between 6 - 8 hours for the whole dataset of
+27face morphs with a batch size of 8. Some additional follow-up work for the camera-ready version
+used an NVIDIA H100 Tensor Core 80GB GPU with a batch size of 16.
+G.4 Datasets
+The SYN-MAD 2022 dataset is derived from the Face Research Lab London (FRLL) dataset [ 45].
+FRLL is a dataset of high-quality captures of 102 different individuals with frontal images and neutral
+lighting. There are two images per subject, an image of a “neutral” expression and one of a “smiling”
+expression. The ElasticFace [ 46] FR system was used to select the top 250 most similar pairs, in
+terms of cosine similarity, of bona fide images for both genders, resulting in a total of 489 bona fide
+image pairs for face morphing [ 44], as some pairs did not generate good morphs on the reference set;
+we follow this minimal subset.
+G.5 FR Systems
+All three FR systems use the Improved ResNet (IResNet-100) architecture [ 53] as the neural net
+backbone for the FR system. The ArcFace model is a widely used FR system [ 34,36,38,42]. It
+employs an additive angular margin loss to enforce intra-class compactness and inter-class distance,
+which can enhance the discriminative ability of the feature embeddings [ 41]. ElasticFace builds
+upon the ArcFace model by using an elastic penalty margin over the fixed penalty margin used by
+ArcFace. This change results in an FR system with state-of-the-art performance [ 46]. Lastly, the
+AdaFace model employs an adaptive margin loss by weighting the loss relative to an approximation
+of the image quality [ 47]. The image quality is approximated via feature norms and is used to give
+less weight to misclassified images, reducing the impact of “low” quality images on training. This
+improvement allows the AdaFace model to achieve state-of-the-art performance in FR tasks.
+The AdaFace and ElasticFace models are trained on the MS1M-ArcFace dataset, whereas the ArcFace
+model is trained on the MS1M-RetinaFace dataset. N.B., the ArcFace model used in the identity
+loss is not the same ArcFace model used during evaluation. The model used in the identity loss
+is an IResNet-100 trained on the Glint360k dataset [ 54] with the ArcFace loss. We use the cosine
+distance to measure the distance between embeddings from the FR models. All three FR systems
+require images of 112×112pixels. We resize every image, post alignment from dlib which ensures
+the images are square, to 112×112using bilinear down-sampling. The image tensors are then
+normalized such that they take values in [−1,1]. Lastly, the AdaFace FR system was trained on BGR
+images so the image tensor is shuffled from the RGB format to the BGR format.
+H Additional Related Work
+In this section we compare several recent methods for training-free guided generation. We broadly
+classify these techniques into two categories:
+1. Techniques which directly optimize the solution trajectory during sampling [52, 55, 56]
+2.Techniques which search for the optimal latents xTand or z(this can include optimizing
+the solution trajectory as well) [57, 58].
+In Table 4 we compare several different techniques for training-free guided diffusion along this
+category along with whether the formulation is for diffusion ODEs, SDEs, or both.
+Table 4: Comparison of different guidance methods for diffusion models.
+Method ODE SDE Optimize xTOptimize (z, θ)
+FlowGrad [56] ✓ ✗ ✗ ✗
+FreeDoM [55] ✗ ✓ ✗ ✗
+Greedy [52] ✓ ✓ ✗ ✗
+DOODL [57] ✗ ✓ ✓ ✗
+AdjointDPM [58] ✓ ✗ ✓ ✓
+Implicit Diffusion [59] ✓ ✓ ✓ ✓
+AdjointDEIS ✓ ✓ ✓ ✓
+28FlowGrad [56] controls the generative process by solving the following optimal control problem
+min
+uL(x0) +λZ0
+T∥u(t)∥2dt, (H.1)
+s.t.x0=xT+Z0
+Tfθ(xt,z, t) +u(t) dt (H.2)
+where uis the control function. This optimization objective learns to alter the flow, fθ, byu. In
+practice, this amounts to injecting a control step governed by u(t)for a discretized schedule. This
+technique does not allow for learning an optimal xT,z, orθ.
+FreeDoM [ 55] looks at gradient guided generation of images by calculating the gradient w.r.t. xtby
+using the approximated clean image
+x0≈xt−σtϵθ(xt,z, t)
+αt(H.3)
+at each timestep. Let hi=λti−λti−1. The strategy can be described as
+xti−1=αti−1
+αtixti−2σti−1(ehi−1)ϵθ(xti,z, ti) +σti−1p
+e2hi−1ϵti, (H.4)
+ˆx0=xti−σtiϵθ(xti,z, ti)
+αti, (H.5)
+gti=∂L(ˆx0)
+∂xt, (H.6)
+xti−1=xti−1−ηtigti, (H.7)
+where ηtiis a learning rate defined per timestep. Importantly, FreeDoM operates on diffusion SDEs.
+They have an addition algorithm in which the add noise back to the image, in essence going back one
+timestep, and applying the guidance step again.
+Similar to FreeDoM, greedy guided generation [ 52] looks to alter the generative trajectory by injecting
+the gradient defined on the approximated clean image; however, this technique does so w.r.t. the
+prediction noise, i.e.,
+ϵ′
+ti= stopgrad( ϵθ(xti,z, ti)) (H.8)
+ˆx0=xti−σtiϵ′
+ti
+αti, (H.9)
+gti=∂L(ˆx0)
+∂ϵti, (H.10)
+ϵ′
+ti=ϵ′
+ti−ηtigti. (H.11)
+The technique would work for either diffusion ODEs or SDEs.
+DOODL [ 57] looks at gradient calculation based on the invertibility of EDICT [ 60]. This method
+can find the gradient w.r.t. xT; however, it cannot for the other quantities. DOODL additionally has
+further overhead due to the dual diffusion process of EDICT. Further analysis of DOODL compared
+to continuous adjoint equations for diffusion models can be found in [58].
+Table 5: Comparison of adjoint sensitivity algorithms for diffusion models.
+AdjointDPM [58] AdjointDEIS
+Discretization domain ϵθoverρ ϵθoverλ
+Solver type Black box ODE solver Custom solver
+Closed form SDE coefficients ✗ ✓
+Interoperability with existing samplers ✗ ✓
+Decoupled ODE schedule ✗ ✓
+Supports SDEs ✗ ✓
+More closely related to our work is the recent AdjointDPM [ 58] who also explores the use of adjoint
+sensitivity methods for backpropagation through the probability flow ODE. While they also propose
+29to use the continuous adjoint equations to find gradients for diffusion models, our work differs in
+several ways which we enumerate in Table 5. For clarity, we use orange to denote their notation.
+They reparameterize Equation (2.4) as
+dy
+dρ=˜ϵθ(eRγ−1(ρ)
+0f(τ) dτy, γ−1(ρ), c) (H.12)
+where cdenotes the conditional information, ρ=γ(t), anddγ
+dt=e−Rt
+0f(τ) dτg2(t)
+2σt. which gives
+them the following ODE for calculating the adjoint.
+d
+dρ∂L
+∂yρ
+=−∂L
+∂yρ⊤∂ϵθ(eRγ−1(ρ)
+0f(τ) dτyρ,z, γ−1(ρ))
+∂yρ(H.13)
+In our approach we integrate over λtwhereas they integrate over ρ. Moreover, we provide custom
+solvers designed specifically for diffusion ODEs instead of using a black box ODE solver. Our
+approach is also interoperable with other forward ODE solvers meaning our AdjointDEIS solver is
+agnostic to the ODE solver used to generate the output; however, the AdjointDPM model is tightly
+coupled to its forward solver. Lastly and most importantly our method is more general and supports
+diffusion SDEs, not just ODEs.
+Although the original paper omitted a closed form expression for γ−1(ρ), we provide to give a
+comparison between both methods, and to ensure AdjointDPM can be fully implemented. In the VP
+SDE scheme with a linear noise schedule logαtis found to be
+logαt=−β1−β0
+4t2−β0
+2t (H.14)
+ont∈[0,1]withβ0= 0.1, β1= 20 , following Song et al. [15]. Then γ−1(ρ)is found to be
+γ−1(ρ) =β0−s
+β2
+0+ 4 log1r
+1
+α2
+0(ρ+σ0)2+1(β0−β1)
+β0−β1(H.15)
+Concurrent work to ours by Marion et al. [59] has also explored the method of adjoint sensitivity for
+guidance of diffusion models. They, however, focus on an efficient scheme to parallelize the solution
+to the adjoint ODE from the perspective of bi-level optimization rather than the adjoint technique
+itself. So while we focused on the details of the continuous adjoint equations, they focused on an
+efficient implementation of the optimization problem from the perspective of bi-level optimization.
+I Analytic Formulations of Drift and Diffusion Coefficients
+For completeness, we show how to analytically compute the drift and diffusion coefficients for a
+linear noise schedule Ho et al. [1]in the VP scenario Song et al. [15]. With a linear noise schedule
+logαtis found to be
+logαt=−β1−β0
+4t2−β0
+2t (I.1)
+ont∈[0,1]withβ0= 0.1, β1= 20 , following Song et al. [15]. The drift coefficient becomes
+f(t) =−β1−β0
+2t−β0
+2(I.2)
+and as σt=p
+1−α2
+twe find
+dσ2
+t
+dt=d
+dt
+1−exp
+−β1−β0
+4t2−β0
+2t2
+= ((β1−β0)t+β0) exp
+−β1−β0
+2t2−2β0t
+(I.3)
+30Therefore, the diffusion coefficient g2(t)is
+g2(t) = (( β1−β0)t+β0) exp
+−β1−β0
+2t2−2β0t
+| {z }
+dσ2
+t
+dt
++ 
+(β1−β0)t+β0
+1−exp
+−β1−β0
+4t2−β0
+2t2
+| {z }
+−2d logαt
+dtσ2
+t(I.4)
+Importantly,dσt
+dtdoes not exist at time t= 0, asσtis discontinuous at that point, and so an
+approximation is needed when starting from this initial step. In practice, adding a small ϵ≪1to
+t= 0should suffice.
+31NeurIPS Paper Checklist
+1.Claims
+Question: Do the main claims made in the abstract and introduction accurately reflect the
+paper’s contributions and scope?
+Answer: [Yes]
+Justification: The main claims made in the abstract and introduction accurately reflect the
+paper’s contributions and scope.
+2.Limitations
+Question: Does the paper discuss the limitations of the work performed by the authors?
+Answer: [Yes]
+Justification: We discussed the limitations of this work in Section 6.
+3.Theory Assumptions and Proofs
+Question: For each theoretical result, does the paper provide the full set of assumptions and
+a complete (and correct) proof?
+Answer: [Yes]
+Justification: The full set of assumptions, derivations, and proofs are found in Appendices A
+to D.
+4.Experimental Result Reproducibility
+Question: Does the paper fully disclose all the information needed to reproduce the main ex-
+perimental results of the paper to the extent that it affects the main claims and/or conclusions
+of the paper (regardless of whether the code and data are provided or not)?
+Answer: [Yes]
+Justification: We presented the implementation details in Appendix F, including the algo-
+rithm as well as the repositories used.
+5.Open access to data and code
+Question: Does the paper provide open access to the data and code, with sufficient instruc-
+tions to faithfully reproduce the main experimental results, as described in supplemental
+material?
+Answer: [Yes]
+Justification: The dataset we use are all public dataset, we have provided links to all the repos-
+itories used in the experiments in Appendix F. We provide detailed derivations of the Ad-
+jointDEIS solvers Appendix A. Interested readers can implement the algorithms themselves.
+We intend to release our code at https://github.com/zblasingame/AdjointDEIS .
+6.Experimental Setting/Details
+Question: Does the paper specify all the training and test details (e.g., data splits, hyper-
+parameters, how they were chosen, type of optimizer, etc.) necessary to understand the
+results?
+Answer: [Yes]
+Justification: The experimental details are presented in Appendix G.
+7.Experiment Statistical Significance
+Question: Does the paper report error bars suitably and correctly defined or other appropriate
+information about the statistical significance of the experiments?
+Answer: [No]
+Justification: Due the computationally demanding nature of the guided generation we do not
+report error bars.
+8.Experiments Compute Resources
+Question: For each experiment, does the paper provide sufficient information on the com-
+puter resources (type of compute workers, memory, time of execution) needed to reproduce
+the experiments?
+32Answer: [Yes]
+Justification: The hardware used in this paper is explained in Appendix G.3.
+9.Code Of Ethics
+Question: Does the research conducted in the paper conform, in every respect, with the
+NeurIPS Code of Ethics https://neurips.cc/public/EthicsGuidelines ?
+Answer: [Yes]
+Justification: We conducted the research conforming in every aspect with the NeurIPS Code
+of Ethics.
+10.Broader Impacts
+Question: Does the paper discuss both potential positive societal impacts and negative
+societal impacts of the work performed?
+Answer: [Yes]
+Justification: We address the broader impacts in Section 6.
+11.Safeguards
+Question: Does the paper describe safeguards that have been put in place for responsible
+release of data or models that have a high risk for misuse (e.g., pretrained language models,
+image generators, or scraped datasets)?
+Answer: [NA]
+Justification: The dataset used in the experiments are public datasets.
+12.Licenses for existing assets
+Question: Are the creators or original owners of assets (e.g., code, data, models), used in
+the paper, properly credited and are the license and terms of use explicitly mentioned and
+properly respected?
+Answer: [Yes]
+Justification: The details of the datasets and models used from other researchers are decsribed
+in Appendices F and G.
+13.New Assets
+Question: Are new assets introduced in the paper well documented and is the documentation
+provided alongside the assets?
+Answer: [No]
+Justification: No new assets were created at the time of submission.
+14.Crowdsourcing and Research with Human Subjects
+Question: For crowdsourcing experiments and research with human subjects, does the paper
+include the full text of instructions given to participants and screenshots, if applicable, as
+well as details about compensation (if any)?
+Answer: [NA]
+Justification: We did not perform crowdsourcing. Human faces are used in the experiments,
+but the datasest we used are all public dataset.
+15.Institutional Review Board (IRB) Approvals or Equivalent for Research with Human
+Subjects
+Question: Does the paper describe potential risks incurred by study participants, whether
+such risks were disclosed to the subjects, and whether Institutional Review Board (IRB)
+approvals (or an equivalent approval/review based on the requirements of your country or
+institution) were obtained?
+Answer: [NA]
+Justification: Used public datasets, as such no IRB approvals were needed.
+33

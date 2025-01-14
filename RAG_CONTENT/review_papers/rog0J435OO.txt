@@ -1,0 +1,1277 @@
+FlashMask: Reducing the Complexity of Attention
+Computation through Sparse Mask Representation
+Anonymous Author(s)
+Affiliation
+Address
+email
+Abstract
+Recent advancements in Larger-Scale Transformers have significantly benefited 1
+from sophisticated attention mechanisms, which are critical for modeling long- 2
+context sequences. However, the computational and memory demands of conven- 3
+tional attention mask computations, typically scaling with an O(𝑁2)complexity 4
+where𝑁is the sequence length, pose significant challenges. This paper intro- 5
+duces FlashMask, a simple yet effective Exact attention algorithm designed to 6
+substantially reduce both the computational complexity and memory requirements 7
+of attention computations. By adopting a novel column-wise sparse representation 8
+of attention masks, FlashMask achieves a linear memory complexity of O(𝑁)and 9
+computational complexity of O(𝑁)∼O(𝑁2). We assess the performance of Flash- 10
+Mask in a variety of masking scenarios, including causal and customized attention 11
+masks, demonstrating its versatility and robustness across a wide range of attention 12
+patterns and models. Our empirical analysis encompasses a variety of downstream 13
+training modalities, including Supervised Fine-Tuning (SFT), Direct Preference 14
+Optimization (DPO), and Reward Model (RM). We compare FlashMask against 15
+state-of-the-art techniques, including notably FlashAttention [ 1]. In kernel-level 16
+assessments, FlashMask achieves substantial computational speedups, up to 6.7x 17
+(SFT), 6.9x (DPO), and 8.3x (RM). Furthermore, in end-to-end training, FlashMask 18
+consistently enhances training speed significantly, with accelerations up to 2.4x 19
+(SFT), 4.2x (LoRA), 2.5x (DPO), and 2.6x (RM) across these varied scenarios 20
+without sacrificing model accuracy. Additionally, when implemented in the LoRA 21
+scenario, FlashMask enables the LLaMA2-7B to process sequence lengths of up to 22
+544k, significantly enhancing its capability for long-context input. 23
+1 Introduction 24
+Transformers [ 2] , equipped with self-attention mechanisms, have revolutionized natural language 25
+processing (NLP) by efficiently modeling data dependencies without the limitations of sequential 26
+processing. This makes them ideal for handling long sequences. Large Language Models (LLMs), 27
+which utilize training paradigms such as Supervised Fine-Tuning (SFT) [ 3,4] and Reinforcement 28
+Learning from Human Feedback (RLHF) [ 5,6], critically rely on selective attention management 29
+through masks. Effective mask management is essential to focus selectively on pertinent data 30
+segments, optimizing both performance and computational efficiency. 31
+However, the conventional attention mechanism in Transformers entails a quadratic increase in 32
+computational and memory demands O(𝑁2), where𝑁denotes the sequence length. This exponential 33
+growth presents substantial challenges as models scale to sequence lengths ranging from 128K to 34
+1M in advanced systems like GPT-4 [ 7], Claude [ 8], and Gemini [ 9], necessitating more efficient 35
+computational approaches. As sequence lengths extend, the memory load for masked attention 36
+Submitted to 38th Conference on Neural Information Processing Systems (NeurIPS 2024). Do not distribute.computations also grows quadratically, adversely affecting computational speed and the ability to 37
+manage various mask configurations across different tasks. Current methodologies often resort to 38
+approximate sparse attention strategies [ 10,11,12], which unfortunately trade off precision for 39
+computational efficiency, underscoring an essential gap in achieving high precision with reduced 40
+computational costs. 41
+This paper introduces FlashMask, a novel approach utilizing a sparse mask representation to accelerate 42
+attention computations in transformers, effectively addressing both computational and memory scala- 43
+bility issues. Unlike previous methods that compromise accuracy for efficiency, FlashMask provides 44
+precise computations without sacrificing accuracy, ensuring high fidelity in attention mechanisms. 45
+The contributions of this work include: 46
+•Exact Computation. FlashMask uniquely ensures precise attention computations across varying 47
+sequence lengths and tasks. It employs a unique column-wise sparse mask representation, denoted 48
+by FlashMaskStart (FMS) and FlashMaskEnd (FME), to precisely mask specific rows within 49
+columns, ensuring computational efficiency and accuracy. 50
+•Long Context Modeling. FlashMask significantly reduces computational and memory demands, 51
+enabling efficient processing of extended sequences critical for deploying LLMs in resource-limited 52
+settings. 53
+•Efficient Mask Computation. FlashMask leverages strategic sparse masking to increase compu- 54
+tational throughput, thereby improving processing speeds and broadening the practical utility of 55
+LLMs in diverse real-world scenarios. 56
+•Extensive Empirical Validation. Empirical studies validate FlashMask’s efficiency in computation 57
+and storage. Its practical application in real-world scenarios and integration with existing frame- 58
+works underscore its potential impact. Moreover, a comprehensive comparison with state-of-the-art 59
+methods like FlashAttention-DenseMask, FlashAttention-Varlen highlights FlashMask’s efficiency 60
+and versatility. 61
+2 Background 62
+The attention mechanism has revolutionized data handling in NLP by mimicking human selective 63
+focus, allowing neural networks to prioritize parts of the input data. This addresses limitations 64
+of traditional sequence-to-sequence models, enhancing context awareness in long sequences. The 65
+Transformer model by Vaswani et al. [ 2] implements this mechanism centrally, using multiple parallel 66
+attention heads instead of recurrent layers, thus improving efficiency and performance. 67
+2.1 Attention Computation 68
+Central to the Transformer architecture is the attention mechanism, which computes relevance 69
+scores between elements in a sequence to focus more on important aspects and less on others. This 70
+mechanism can be expressed as: 71
+Attention𝑚𝑎𝑠𝑘(𝑄,𝐾,𝑉)=softmax𝑄𝐾𝑇
+√𝑑𝑘+𝑀
+𝑉, (1)
+where𝑄,𝐾,𝑉, and𝑀represent the query, key, value, and mask matrices respectively, derived 72
+from the input data, and 𝑑𝑘is the dimension of keys. The term 𝑀incorporates constraints to 73
+selectively consider certain parts of the input sequence during attention computation, enabling 74
+functionality like masking future tokens in sequence-to-sequence modeling. One inherent challenge 75
+with attention is its computational and memory complexity, both of which scale quadratically with 76
+the length of the input sequence. Processing long sequences presents significant challenges, which 77
+are exacerbated in the downstream pipeline of training large language models (LLMs). Different 78
+training stages, such as Supervised Fine-Tuning (SFT/LoRA [ 3,4,13,14,15]), Direct Preference 79
+Optimization (DPO) [ 16,17,18,19,20], Reward Model (RM) [ 5,21,22,23,24], and Proximal 80
+Policy Optimization (PPO) [25, 6], place diverse demands on the attention mask. 81
+2.2 Masking Variable-Length Sequences 82
+The advent of large transformer-based models has marked substantial progression in handling 83
+increased sequence lengths in natural language processing. Previously, models like BERT [ 26] and 84
+2GPT-2 [ 27] were limited to sequences of approximately 512 tokens, whereas more recent adaptations 85
+such as the LLaMA [ 28,29,30], GPT-4 [ 7] and Claude series [ 8] stretched these limits to encompass 86
+2K to 200K tokens, respectively. Innovations from Google’s Gemini [ 9] have further shifted this 87
+boundary, managing up to 1M tokens. Enhanced sequence management within these models employs 88
+various masking techniques in the attention matrix, adapting to the length and diversity of input 89
+sequences. Techniques such as the use of padding operations are illustrated in Figure 1(a), which help 90
+maintain efficiency by allowing uniform processing of diverse input lengths through padding masks. 91
+However, conventional padding can lead to inefficiencies due to the diverse sequence lengths typically 92
+found in training data, often following a long-tail distribution. This issue is adeptly addressed by 93
+dynamic token allocation technologies like InToken [ 31,3,32,33,34], which optimize computational 94
+resources by adjusting the token count based on actual data needs, significantly improving the training 95
+efficiency for datasets with various sequence lengths in Figure 1(b)(c). 96
+(a)
+ (b)
+ (c)
+ (d)
+Figure 1: Common patterns of attention masks. (a) Padded masks from single-sequence inputs in
+unidirectional (uni-) attention. (b) InToken masks from grouping several masks with different lengths
+in uni-attention. (c) InToken masks in bidirectional (bidi-) attention. (d) Question and Answering
+Masks in uni-attention.
+Despite having extensive text-handling capabilities, the meticulous design of masking configurations 97
+remains crucial for specific training scenarios. The illustrated scenarios in Figure 1(d) and Figure 2 98
+depict various specialized masking mechanisms employed to enhance model training efficiency and 99
+applicability. Figure 1(d) illustrates a scenario involving DPO/RM with two or more answers, where 100
+each answer’s tokens have visibility to the tokens of the question, and tokens from different answers 101
+are not visible to each other. Multi-shot and in-context learning scenarios facilitated by extended 102
+attention spans in configurations like Figure 2(a) are becoming prevalent, which allows the final 103
+question in a series to receive comprehensive attention, enhancing contextual understanding [ 35, 104
+36]. Furthermore, hybrid masking forms combining features from different methodologies are 105
+demonstrated in Figure 2(b). These incorporate sink tokens [ 37] and a sliding window mask from the 106
+Big Bird [ 38], facilitating a localized yet extensive context capture. Figure 2(c) is also derived from 107
+Big Bird, showing a bi-directional global attention mask, which allows for a comprehensive global 108
+context capture. Such innovative approaches in masking not only bolster the efficiency of training 109
+large transformer models but also pave the way for advanced explorations into the capabilities of 110
+attention mechanisms, such as simulating token eviction during inference as depicted in Figure 2(d). 111
+These advancements underscore the dynamic and adaptable nature of transformer technology in 112
+accommodating varying training needs and enhancing the overall performance of LLMs. 113
+2.3 Attention Optimization Techniques 114
+As aforementioned in Equation 1, the computational and memory demands of this mechanism, 115
+particularly the computation of 𝑄𝐾𝑇, become significant as the sequence length 𝑁increases. This 116
+is due to the size of the resultant attention scores matrix, which scales quadratically with the 117
+sequence length, leading to a complexity of O(𝑁2). Several related works has been proposed to 118
+alleviate the issue. In the realm of model training optimizations, Memory Efficient Attention [ 39] 119
+(MEA) and FlashAttention [ 1] have been pivotal. MEA focuses on reducing the model’s memory 120
+demands by altering the self-attention mechanisms. This allows either for the use of larger models 121
+or for the extension of maximum sequence lengths within existing hardware constraints. On the 122
+3(a)
+ (b)
+ (c)
+ (d)
+Figure 2: Extended patterns of attention masks. (a) In-context learning formatted multi-shot masks in
+uni-attention. (b) Sink + Slidewindow masks in uni-attention. (c) Global masks in bidi-attention. (d)
+Customized masks in uni-attention.
+other hand, FlashAttention enhances the efficiency of attention mechanisms with IO-Awareness to 123
+better utilize contemporary GPU architectures, resulting in faster computations and reduced energy 124
+consumption. This method reduces memory overhead to O(𝑁)utilizing tiling techniques during 125
+the computation process, making it particularly effective in scenarios without the need for a custom 126
+mask. However, for specific training contexts requiring custom masking, the memory overhead 127
+with FlashAttention remains O(𝑁2). Note that, in typical training setups like unidirectional causal 128
+attention or bidirectional full-context attention, the default mode of operation with FlashAttention 129
+does not involve passing a custom mask. 130
+During the inference stage, optimizations such as FlashDecoding [ 40] and FlashDecoding++ [ 41] 131
+play crucial roles. FlashDecoding enhances the decoder in transformers to expedite the generation of 132
+sequences by optimizing state management and employing techniques that minimize computational 133
+waste. FlashDecoding++ further advances these improvements, incorporating sophisticated dynamic 134
+batching and more refined state management to significantly boost throughput and reduce latency. 135
+Concerning long sequence training, RingAttention [ 42] is notable for its efficiency in distributed 136
+training contexts, managing communication overhead and memory utilization effectively across 137
+multiple nodes. 138
+Another class of study targets on the sparsity/low-rank of attention computation. The Sparse Trans- 139
+former [ 10] revolutionizes sequence processing with log-linear complexity. Similarly, Reformer [ 43] 140
+optimizes memory via locality-sensitive hashing, while Big Bird [ 38] introduces a hybrid attention 141
+method to manage longer sequences efficiently. Linformer [ 44] reduces complexity using low-rank 142
+approximations, significantly economizing computation and storage requirements. Both of the pre- 143
+viously discussed solutions either compromise precision or yield only marginal enhancements in 144
+efficiency. Conversely, our proposed FlashMask is capable of delivering an exact computations. 145
+3 FlashMask: Algorithm and Analysis 146
+In this section, we present the critical design of the column-wise sparse mask representation, imple- 147
+mentation of the mask computation kernel, and a complexity analysis of the proposed FlashMask. 148
+3.1 Column-wise Sparse Mask Representation 149
+We introduce FlashMask, a column-wise sparse masking technique, represented using FMS,FME∈ 150
+R𝑁(the row index of Flash MaskStart and Flash MaskEnd), where FMS𝑐,FME𝑐denote that 151
+elements in the 𝑐-th column of the attention score matrix S=QK𝑇within the interval[FMS𝑐,FME𝑐) 152
+are masked (set to −∞). As shown in Fig. 2(a), FMS =[4,4,4,4,10,10,10,10,10,10],FME = 153
+[7,7,7,7,10,10,10,10,10,10]indicates that, for the first column, the 4-th to 6-th rows are masked. 154
+3.2 Integration with FlashAttention 155
+Unidirectional (causal) attention, commonly utilized in large language models, incorporates Flash- 156
+Mask within the FlashAttention-2 algorithm, as detailed in Algorithm 1. This paper elaborates the 157
+implementation of FlashMask using the lower triangular section of the mask for illustration, where 158
+the blue section represents the computation by the dense mask method (for comparison and not 159
+4Algorithm 1 Optimized Forward Pass with FlashMask
+Require: Matrices Q,K,V∈R𝑁×𝑑in HBM, block sizes 𝐵𝑐,𝐵𝑟, dense mask D∈R𝑁×𝑁, column-wise sparse
+mask starting rows FMS∈R𝑁, ending rows FME∈R𝑁.
+1:Divide Qinto𝑇𝑟=l
+𝑁
+𝐵𝑟m
+blocks Q1,..., Q𝑇𝑟of size𝐵𝑟×𝑑each, and divide K,Vin to𝑇𝑐=l
+𝑁
+𝐵𝑐m
+blocks
+K1,..., K𝑇𝑐andV1,..., V𝑇𝑐, of size𝐵𝑐×𝑑each.
+2:Divide the output O∈R𝑁×𝑑into𝑇𝑟blocks O𝑖,..., O𝑇𝑟of size𝐵𝑟×𝑑each, and divide the logsumexp 𝐿
+into𝑇𝑟blocks𝐿𝑖,...,𝐿𝑇𝑟of size𝐵𝑟each.
+3: Divide Dinto𝑇𝑟×𝑇𝑐blocks D1,1,...,D𝑇𝑟,𝑇𝑐.
+4: Divide FMS into𝑇𝑐blocks FMS 1,...,FMS𝑇𝑐, and divide FME intoFME 1,...,FME𝑇𝑐.
+5: Precompute the max value maxFMS 1,...,maxFMS𝑇𝑐for each FMS 1,...,FMS𝑇𝑐, write to HBM.
+6: Precompute the max value maxFME 1,...,maxFME𝑇𝑐for each FME 1,...,FME𝑇𝑐, write to HBM.
+7: Precompute the min value minFMS 1,...,minFMS𝑇𝑐for each FMS 1,...,FMS𝑇𝑐, write to HBM.
+8: Precompute the min value minFME 1,...,minFME𝑇𝑐for each FME 1,...,FME𝑇𝑐, write to HBM.
+9:for1≤𝑖≤𝑇𝑟do
+10: Load Q𝑖from HBM to on-chip SRAM.
+11: On chip, initialize O(0)
+𝑖=(0)𝐵𝑟×𝑑∈R𝐵𝑟×𝑑,ℓ(0)
+𝑖=(0)𝐵𝑟∈R𝐵𝑟,𝑚(0)
+𝑖=(−∞)𝐵𝑟∈R𝐵𝑟.
+12: for1≤𝑗≤𝑇𝑐do
+13: if𝑖×𝐵𝑟≥maxFMS𝑗and(𝑖+1)×𝐵𝑟≤minFME𝑗then
+14: Continue
+15: end if
+16: Load K𝑗,V𝑗from HBM to on-chip SRAM.
+17: Load FMS𝑗from HBM to on-chip SRAM.
+18: Load FME𝑗from HBM to on-chip SRAM.
+19: On chip, compute S(𝑗)
+𝑖=Q𝑖K𝑇
+𝑗∈R𝐵𝑟×𝐵𝑐.
+20: On chip, set S(𝑗)
+𝑖=S(𝑗)
+𝑖+D𝑖,𝑗
+21: if(𝑖+1)×𝐵𝑟≥minFMS𝑗and𝑖×𝐵𝑟≤maxFME𝑗then
+22: On chip, set S(𝑗)
+𝑖[𝑥][𝑦]=−∞,∀𝑥,𝑦, such that FMS𝑗[𝑦]≤𝑖×𝐵𝑟+𝑥≤FME𝑗[𝑦]
+23: end if
+24: On chip, compute 𝑚(𝑗)
+𝑖=max(𝑚(𝑗−1)
+𝑖,rowmax(S(𝑗)
+𝑖)) ∈R𝐵𝑟,˜P(𝑗)
+𝑖=exp(S(𝑗)
+𝑖−𝑚(𝑗)
+𝑖) ∈
+R𝐵𝑟×𝐵𝑐(pointwise), ℓ(𝑗)
+𝑖=𝑒𝑚𝑗−1
+𝑖−𝑚(𝑗)
+𝑖ℓ(𝑗−1)
+𝑖+rowsum(˜P(𝑗)
+𝑖)∈R𝐵𝑟.
+25: On chip, compute O(𝑗)
+𝑖=diag(𝑒𝑚(𝑗−1)
+𝑖−𝑚(𝑗)
+𝑖)−1O(𝑗−1)
+𝑖+˜P(𝑗)
+𝑖V𝑗.
+26: end for
+27: On chip, compute O𝑖=diag(ℓ(𝑇𝑐)
+𝑖)−1O(𝑇𝑐)
+𝑖.
+28: On chip, compute 𝐿𝑖=𝑚(𝑇𝑐)
+𝑖+log(ℓ(𝑇𝑐)
+𝑖).
+29: Write O𝑖to HBM as the 𝑖-th block of O.
+30: Write 𝐿𝑖to HBM as the 𝑖-th block of𝐿.
+31:end for
+32: Return the output Oand the logsumexp 𝐿.
+present in FlashMask) and the red section indicates the FlashMask computation. FlashAttention 160
+Forward involves two nested loops; the outer loop iterates over each block Q𝑖ofQ, and the inner 161
+loop iterates over all blocks K𝑗ofKandV𝑗ofV. In the inner loop, S(𝑗)
+𝑖=QK𝑇is computed on 162
+SRAM. Once S(𝑗)
+𝑖is generated, the corresponding dense mask is added as a bias (shown in line 20 of 163
+Algorithm 1), whereas FlashMask applies the column-wise sparse mask by setting elements beyond 164
+FMS𝑐but not exceeding FME𝑐to−∞(as shown in lines 21 to 23 of Algorithm 1). 165
+FlashMask further exploits the block computation feature of FlashAttention-2 to reduce computation. 166
+If all elements within a block are masked, the block’s computation, including matrix multiplication 167
+and softmax operations, can be skipped. A block defined by rows [𝑟0,𝑟1)and columns[𝑐0,𝑐1)is 168
+skipped if𝑟0≥max(FMS𝑐0:𝑐1)and𝑟1≤min(FME𝑐0:𝑐1). Considering that mask regions often 169
+exhibit continuity, most blocks are either completely masked or not at all, with only boundary blocks 170
+requiring fine-grained masking. A block is completely unmasked if every coordinate (𝑟,𝑐)satisfies 171
+𝑟 <FMS𝑐or𝑟≥FME𝑐, thus skipping fine-grained masking and avoiding extra masking overhead. 172
+To avoid redundant computations in the FlashAttention-2 compute loop, we precompute 173
+max(FME𝑐0:𝑐1)andmin(FME𝑐0:𝑐1)for each block before the execution loop using a kernel. This 174
+computation has a complexity of O(𝑁)and can be easily distributed over 𝑇𝑐=l
+𝑁
+𝐵𝑐m
+thread blocks. A 175
+5parallel reduction operation within each thread block then computes the maximum and minimum 176
+values, yielding 𝑇𝑐values. The additional space complexity introduced here is O(𝑇𝑐). Similar 177
+computations are made for max(FMS𝑐0:𝑐1),min(FMS𝑐0:𝑐1),. 178
+The backward computation in FlashAttention-2, which is typically column-parallel, benefits more 179
+from the column sparse mask approach. Blocks for whichjmax(FMS𝑐0:𝑐1)
+𝐵𝑟k
+<𝑖 <jmin(FME𝑐0:𝑐1)
+𝐵𝑟k
+are 180
+fully masked, allowing skipping of these intervals directly. Only blocks satisfyingjmin(FMS𝑐0:𝑐1)
+𝐵𝑟k
+≤ 181
+𝑖≤jmax(FME𝑐0:𝑐1)
+𝐵𝑟k
+require fine-grained masking. 182
+It is important to note that unlike various approximate attention algorithms, our method ensures 183
+that each effective element of the attention score matrix is computed identically to FlashAttention-2, 184
+with masked elements explicitly set to −∞, thus maintaining the accuracy of the algorithm’s results. 185
+Futhermore, FlashMask is easily extendable to bidirectional attention computations. 186
+3.3 Complexity Analysis 187
+We define sparsity as 𝜌=𝑝
+𝑁2, where𝑝is the number of masked elements in the attention score matrix, 188
+and𝑁is the maximum sequence length of Q and K, 𝑁2being the total number of elements in the 189
+attention score matrix. For a causal mask, 𝜌=2×𝑝
+𝑁2since half of the elements in the attention score 190
+matrix are already masked by the causal mask. The block sparsity 𝛼is defined as 𝛼=𝑎l
+𝑁
+𝐵𝑟m
+×l
+𝑁
+𝐵𝑐m, 191
+where𝐵𝑟,𝐵𝑐are block sizes, and 𝑎is the number of completely masked blocks. For a causal mask, 192
+𝛼=2×𝑎l
+𝑁
+𝐵𝑟m
+×l
+𝑁
+𝐵𝑐m. 193
+Space complexity. The dense mask is represented as D∈R𝑁×𝑁, with a space complexity of O(𝑁2). 194
+FlashMask denotes as FMS,FME∈R𝑁, occupyingO(𝑁)space, along with four precomputed 195
+arrays maxFMS,minFMS,maxFME,minFME∈Rl
+𝑁
+𝐵𝑐m
+, also occupyingO(𝑁)space. Thus, the 196
+total space complexity for FlashMask is O(𝑁), significantly reducing memory usage and supporting 197
+training on longer sequences. 198
+Memory access complexity. The dense mask accesses the entire D∈R𝑁×𝑁matrix in line 20 of 199
+Algorithm 1, totaling 𝑁2memory accesses on HBM. FlashMask reads the FMS,FME∈R𝑁vectors 200
+from HBM as shown in lines 17 and 18 of Algorithm 1, with each Q𝑖reading the entire FMS,FME , 201
+totaling 2×𝑇𝑟×𝑁memory accesses. This reduces the memory access to approximately2×𝑇𝑟×𝑁
+𝑁2≈2
+𝐵𝑟, 202
+significantly boosting performance. Due to FlashMask’s smaller space usage, it is possible to preload 203
+FMS,FME into SRAM using only 2×𝐵𝑐SRAM, enhancing memory access efficiency. For the 204
+backward process, which uses a column-parallel approach, SRAM-stored FMS,FME can be well 205
+reused, further reducing the total memory access on HBM to 2×𝑁. 206
+Computational complexity. The attention computation process normally iterates over the entire 207
+attention score matrix, with a computational complexity of O(𝑁2). By skipping entirely masked 208
+blocks, FlashMask leverages block sparsity to reduce computational complexity to O((1−𝛼)𝑁2). 209
+4 Experiments 210
+4.1 Setup 211
+Experiments were conducted using GPU A800-SXM 80G, Intel(R) Xeon(R) Platinum 8350C CPUs, 212
+CUDA 12.0, and driver version 525.125.06. We evaluated FlashMask against various methods 213
+including Vanilla Attention, FlashAttention with dense mask (FA-DenseMask), variable length (FA- 214
+Varlen), and sliding window (FA-Window) across different scenarios and sequence lengths. Both 215
+kernel-level and end-to-end performance demonstrated the effectiveness of our method. 216
+4.2 Data Construction 217
+As mentioned in the Background section, commercial large models now support sequences up to 218
+128K in length. FlashMask, with its lower memory overhead, can facilitate training with even longer 219
+62 4 8 16 32 64 128
+Sequence Length(K)100101102103104Latency(ms)SFT
+FA-Varlen
+FA-DenseMask
+VanillaAttention
+FlashMask
+2 4 8 16 32 64 128
+Sequence Length(K)100101102103104Latency(ms)DPO
+FA-DenseMask
+VanillaAttention
+FlashMask
+2 4 8 16 32 64 128
+Sequence Length(K)100101102103104Latency(ms)RM
+FA-DenseMask
+VanillaAttention
+FlashMaskFigure 3: Comparison of Kernel Latency Based on Varying Sequence Lengths. FlashMask achieves
+substantial computational speedups, up to 6.7x (SFT), 6.9x (DPO), and 8.3x (RM).
+contexts. However, currently available public datasets do not contain training data for scenarios 220
+exceeding 128K. For comprehensive testing of FlashMask, we constructed synthetic data to simulate 221
+long-sequence training. 222
+For a given sequence length 𝐿, sequences were generated by mimicking InToken method with several 223
+sub-sequences. Randomly selecting 𝑠∈[1,10]split points uniformly within the range (0,𝐿), the 224
+sequence was divided into 𝑠sub-sequences. The segment from the last split point to the end of the 225
+sequence was considered as Padding. For the RM scenario, shorter sequence lengths used a smaller 226
+upper limit on the number of splits: 𝑠∈[1,3]for𝐿∈(0,4096]and𝑠∈[1,4]for𝐿∈(4096,8192]. 227
+By discarding samples not meeting size requirements, we ensure each sub-sequence length was 228
+at least 128 (SFT, LoRA, DPO) or 512 (RM) and padding not exceeding 128 (SFT, LoRA, DPO) 229
+or 512 (RM). Suppose one sub-sequence with length 𝐿′was further divided into a query and 𝑘 230
+answers based on the scenario. The length of each answer was randomly determined from the 231
+range[0.1𝐿′
+1+0.1×𝑘,0.2𝐿′
+1+0.2×𝑘], making the answer lengths approximately [0.1,0.2]of the query length. 232
+Therefore, the query length was equal to 𝐿′minus the total answer lengths. A total of 240 valid 233
+samples per given sequence length 𝐿were collected and binned into 10 categories by sparsity 𝜌, as 234
+shown in Appendix A.2. 235
+256 512 1024 2048 4096 8192
+WindowSize024681012Latency(ms)Sequence Length 8K
+FA-Window
+FlashMask
+256 512 1024 2048 4096 8192
+WindowSize051015202530Latency(ms)Sequence Length 16K
+FA-Window
+FlashMask
+256 512 1024 2048 4096 8192
+WindowSize010203040506070Latency(ms)Sequence Length 32K
+FA-Window
+FlashMask
+0 20 40 60 80 100
+Sparsity(%)020406080100120140160180Latency(ms)
+SFT
+FA-Varlen
+FlashMask
+0 20 40 60 80 100
+Sparsity(%)020406080100120140160180Latency(ms)
+DPO
+FlashMask
+0 20 40 60 80 100
+Sparsity(%)020406080100120140160180Latency(ms)
+RM
+FlashMask
+Figure 4: Top: Comparison of Kernel Latency while Varying Window Size. Bottom: Comparison of
+Kernel Latency while Varying Input Sparsity.
+4.3 Kernel Experiments 236
+We conducted tests with batch sizes of 1, 2, and 4 using Vanilla Attention, FA-DenseMask, and 237
+FlashMask. Each experiment began with 5 warm-up runs followed by 50 measurements, totaling 55 238
+runs with kernel latency as the performance metric. Additional comparisons were made with FA- 239
+Varlen in the SFT scenario. Results for batch size 1 are shown in Figure 3 (results for batch sizes 2 and 240
+74 8 16 32 64 128 256
+Sequence Length(K)60080010001200140016001800T okens/Sec/GPU
+Speed Up 2.46xLLaMA-7B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask
+4 8 16 32 64 128 196
+Sequence Length(K)3004005006007008009001000T okens/Sec/GPU
+Speed Up 2.35xLLaMA-13B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask
+4 8 16 32 64 96
+Sequence Length(K)100120140160180200T okens/Sec/GPU
+Speed Up 1.96xLLaMA-70B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask(a) SFT
+4 8 16 32 64 128 256 512 544
+Sequence Length(K)2000300040005000600070008000T okens/Sec/GPU
+Speed Up 4.16xLLaMA-7B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask
+4 8 16 32 64 128 224
+Sequence Length(K)40060080010001200T okens/Sec/GPU
+Speed Up 2.59xLLaMA-13B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask
+4 8 16 32 64 128
+Sequence Length(K)100120140160180200220240T okens/Sec/GPU
+Speed Up 2.10xLLaMA-70B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask (b) LoRA
+4 8 16 32 64 96
+Sequence Length(K)600800100012001400T okens/Sec/GPU
+Speed Up 2.49xLLaMA-7B
+VanillaAttention
+FA-DenseMask
+FlashMask
+4 8 16 32 64 128 180
+Sequence Length(K)300400500600700800T okens/Sec/GPU
+Speed Up 2.46xLLaMA-13B
+VanillaAttention
+FA-DenseMask
+FlashMask
+4 8 16 32 64 80
+Sequence Length(K)80100120140160T okens/Sec/GPU
+Speed Up 2.02xLLaMA-70B
+VanillaAttention
+FA-DenseMask
+FlashMask (c) DPO
+4 8 16 32 64 128 256
+Sequence Length(K)600800100012001400160018002000T okens/Sec/GPU
+Speed Up 2.60xLLaMA-7B
+VanillaAttention
+FA-DenseMask
+FlashMask
+4 8 16 32 64 128 196
+Sequence Length(K)3004005006007008009001000T okens/Sec/GPU
+Speed Up 2.51xLLaMA-13B
+VanillaAttention
+FA-DenseMask
+FlashMask
+4 8 16 32 64 96
+Sequence Length(K)100120140160180200220T okens/Sec/GPU
+Speed Up 2.04xLLaMA-70B
+VanillaAttention
+FA-DenseMask
+FlashMask (d) RM
+Figure 5: Comparison of End-to-End Training Throughput on Synthetic Dataset.
+4 can be found in Appendix A.3). FlashMask demonstrated significant latency advantages across all 241
+lengths, up to 8.3-fold time saving compared to FA-DenseMask. Vanilla Attention was significantly 242
+more time-consuming and exceeded memory limits at lengths greater than 32K. The closest competitor 243
+to FlashMask, FA-Varlen, exhibited higher latencies as sequence lengths increased. Similar trends 244
+were observed in the DPO and RM scenarios, with FlashMask significantly outperforming FA- 245
+DenseMask and Vanilla Attention, especially in the RM scenario where higher sparsity levels 246
+further enhanced FlashMask’s effectiveness. Performance benefits from varying sparsity levels 247
+were also quantified, with FlashMask showing linear negative correlation with increasing sparsity, 248
+demonstrating efficient utilization of sample sparsity for acceleration. FlashMask’s capability to 249
+perform sliding window attention was further tested against FA-Window with window sizes of 256, 250
+512, 1024, 2048, 4096, and 8192, as shown in Figure 4 Top. FlashMask matched FA-Window in 251
+latency across sequence lengths of 8K, 16K, and 32K, showing comparable delay performances at 252
+increasing window sizes. 253
+4.4 End-to-End Experiments 254
+The end-to-end performance1of the model was tested using synthetic datasets across three scales of the 255
+LLaMA2 model and four downstream scenarios (SFT, LoRA, DPO, RM) at various sequence lengths, 256
+measuring throughput in average Tokens/Sec/GPU. Each sequence length of 240 valid samples was 257
+trained for one epoch, with results presented in Figure 5. In the SFT scenario, FlashMask showed a 258
+clear throughput advantage over FA-DenseMask and Vanilla Attention, performing comparably to FA- 259
+Varlen. As sequence lengths increased, the throughput advantage of FlashMask over FA-DenseMask 260
+and Vanilla Attention also enhanced, even enabling the completion of longer sequence tasks within the 261
+same computational resources. In LoRA, DPO, and RM scenarios, FlashMask consistently showed 262
+significant advantages. Notably, in the LoRA scenario at the LLaMA2-7B, FlashMask achieved a 263
+4.16x throughput improvement over FA-DenseMask, supporting sequence lengths up to 544K. It’s 264
+important to note that FA-Varlen was unable to support the DPO and RM scenarios with the answers 265
+sharing one question, whereas FlashMask was capable of handling various scenarios including DPO 266
+and RM. 267
+Additional experiments were conducted on the open-source dataset LongBench [ 45], comparing the 268
+end-to-end performance of FA-DenseMask, FA-Varlen, and FlashMask at sequence lengths of 16K, 269
+32K, and 64K. The performance improvements were consistent with those observed in the synthetic 270
+dataset. The detailed results are presented in Appendix A.3. Memory usage during the experiments 271
+was also recorded, showing significant reductions for FlashMask compared to FA-DenseMask, with 272
+detailed results presented in Appendix A.3. 273
+1To simplify the tuning of hyperparameters, we standardize the global batch size to 16, with a batch size of 1
+per device. Additional training hyperparameters are detailed in Table 1
+85 Discussion 274
+Several key topics emerge that are crucial for comprehending the full scope and implications of 275
+FlashMask. These include the rationale behind the design choices, adaptations for supporting 276
+bidirectional and other custom masks, and the necessity as well as limits of the current approach. 277
+Necessity and Scope of the Study. The substantial advancement rendered by FlashMask in improving 278
+attention mask computation is a significant evolution over the current FlashAttention framework. 279
+Notably, FlashMask addresses and significantly mitigates the limitations observed with FlashAttention 280
+in handling conventional and custom mask computations. This enhancement not only broadens the 281
+applicative reach of FlashAttention but also signifies a key shift in efficiency metrics critical for 282
+Transformer architectures. More importantly, the flexibility of FlashMask extends beyond the 283
+proprietary boundaries of FlashAttention, offering potential benefits to a wider range of Transformer- 284
+based models. By facilitating more efficient computation of the attention mechanism, FlashMask 285
+enables innovations in processing vast datasets and complex models, thereby improving performances 286
+across varied applications in the LLM field. This cross-model adaptability confirms the robustness 287
+and utility of FlashMask as a universally applicable enhancement tool within and potentially outside 288
+the Transformer architecture spectrum, promising substantial gains in computational efficiency and 289
+model scalability. 290
+Bidirectional and Custom Masks. In the exploration of attention mechanisms, the introduction of 291
+FlashMask as discussed in this study offers a significant leap in computational efficiency, particularly 292
+for masking processes in unidirectional attention mechanisms. By extending this approach to 293
+bidirectional networks through the simple addition of vectors indicating the start and end indices 294
+of the mask, FlashMask transcends conventional computational bounds, casting itself not just as 295
+a sparse attention methodology, but as a versatile computational paradigm. Its adaptability across 296
+various custom masking tasks and ability to effectively manage diverse types of mask combinations 297
+underscores its potential to greatly enhance the efficiency of attention computations. Moreover, the 298
+inherent sparsity of the attention mask during inference provides a robust justification for employing 299
+FlashMask, indicating its utility and effectiveness in practical applications. This paradigm shift 300
+highlights the importance of developing scalable and efficient computational strategies in the evolving 301
+landscape of transformer architectures, suggesting that future research should continue to leverage 302
+these innovations to tackle increasing computational demands. 303
+Limitations and Future Directions. While FlashMask demonstrates impressive performance in 304
+handling long-context sequences, it is observed that the computational cost of training Transformers 305
+increases more than linearly as the sequence length grows—not only due to the computation of 306
+masked attention but also because of the extensive use of other operators. This scenario highlights the 307
+inevitable need for leveraging or integrating distributed computing strategies or further algorithmic 308
+enhancements to elevate training efficiency. Such advancements could be practical in managing 309
+the computationally intensive tasks involved in processing extended contexts efficiently. As a part 310
+of future research directions, exploring synergistic solutions that combine the strengths of both 311
+algorithmic innovation (like FlashMask) and distributed system designs stands as a promising venture. 312
+This approach is anticipated to address scalability challenges and could set the stage for breakthroughs 313
+in handling unprecedentedly large data sets and complex model architectures. 314
+6 Conclusion 315
+In this paper, we introduced FlashMask, a groundbreaking attention computation paradigm designed 316
+to tackle the high computational and memory demands inherent in conventional attention mechanisms 317
+in large-scale transformers. By implementing a novel column-wise sparse representation of attention 318
+masks, FlashMask substantially reduces the memory and computational complexity from quadratic to 319
+linear with the sequence length, thereby enhancing processing speeds and efficiency. Our algorithm 320
+demonstrates versatility across various masking scenarios and retains robust performance in different 321
+training pipelines. Extensive empirical analysis confirms that FlashMask accelerates computational 322
+speed significantly, achieving up to 8.3x speedup in common modalities comparable to state-of-the-art 323
+methods like FlashAttention. This advancement marks a significant leap forward in the design of 324
+attention computation, offering the potential for broader applications and setting a new benchmark in 325
+the efficiency of processing long-context sequences. 326
+9References 327
+[1]Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-efficient 328
+exact attention with io-awareness. Advances in Neural Information Processing Systems , 35:16344–16359, 329
+2022. 330
+[2]Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz 331
+Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing systems , 332
+30, 2017. 333
+[3]Srinivasan Iyer, Xi Victoria Lin, Ramakanth Pasunuru, Todor Mihaylov, Daniel Simig, Ping Yu, Kurt 334
+Shuster, Tianlu Wang, Qing Liu, Punit Singh Koura, et al. Opt-iml: Scaling language model instruction 335
+meta learning through the lens of generalization. arXiv preprint arXiv:2212.12017 , 2022. 336
+[4]Hyung Won Chung, Le Hou, Shayne Longpre, Barret Zoph, Yi Tay, William Fedus, Yunxuan Li, Xuezhi 337
+Wang, Mostafa Dehghani, Siddhartha Brahma, et al. Scaling instruction-finetuned language models. 338
+Journal of Machine Learning Research , 25(70):1–53, 2024. 339
+[5]Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela Mishkin, Chong Zhang, 340
+Sandhini Agarwal, Katarina Slama, Alex Ray, et al. Training language models to follow instructions with 341
+human feedback. Advances in neural information processing systems , 35:27730–27744, 2022. 342
+[6]Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Mingchuan Zhang, YK Li, Y Wu, and 343
+Daya Guo. Deepseekmath: Pushing the limits of mathematical reasoning in open language models. arXiv 344
+preprint arXiv:2402.03300 , 2024. 345
+[7]Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman, 346
+Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report. arXiv 347
+preprint arXiv:2303.08774 , 2023. 348
+[8]Anthropic. Introducing claude. https://www.anthropic.com/news/introducing-claude , 2024. 349
+Accessed: May 20, 2024. 350
+[9]Machel Reid, Nikolay Savinov, Denis Teplyashin, Dmitry Lepikhin, Timothy Lillicrap, Jean-baptiste 351
+Alayrac, Radu Soricut, Angeliki Lazaridou, Orhan Firat, Julian Schrittwieser, et al. Gemini 1.5: Unlocking 352
+multimodal understanding across millions of tokens of context. arXiv preprint arXiv:2403.05530 , 2024. 353
+[10] Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating long sequences with sparse 354
+transformers. arXiv preprint arXiv:1904.10509 , 2019. 355
+[11] Beidi Chen, Tri Dao, Eric Winsor, Zhao Song, Atri Rudra, and Christopher Ré. Scatterbrain: Unifying 356
+sparse and low-rank attention. Advances in Neural Information Processing Systems , 34:17413–17426, 357
+2021. 358
+[12] Zhiqing Sun, Yiming Yang, and Shinjae Yoo. Sparse attention with learning to hash. In International 359
+Conference on Learning Representations , 2021. 360
+[13] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and 361
+Weizhu Chen. Lora: Low-rank adaptation of large language models. arXiv preprint arXiv:2106.09685 , 362
+2021. 363
+[14] Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo Molchanov, Yu-Chiang Frank Wang, Kwang- 364
+Ting Cheng, and Min-Hung Chen. Dora: Weight-decomposed low-rank adaptation. arXiv preprint 365
+arXiv:2402.09353 , 2024. 366
+[15] Yukang Chen, Shengju Qian, Haotian Tang, Xin Lai, Zhijian Liu, Song Han, and Jiaya Jia. Longlora: 367
+Efficient fine-tuning of long-context large language models. arXiv preprint arXiv:2309.12307 , 2023. 368
+[16] Rafael Rafailov, Archit Sharma, Eric Mitchell, Christopher D Manning, Stefano Ermon, and Chelsea Finn. 369
+Direct preference optimization: Your language model is secretly a reward model. Advances in Neural 370
+Information Processing Systems , 36, 2024. 371
+[17] Hanze Dong, Wei Xiong, Deepanshu Goyal, Yihan Zhang, Winnie Chow, Rui Pan, Shizhe Diao, Jipeng 372
+Zhang, Kashun Shum, and Tong Zhang. Raft: Reward ranked finetuning for generative foundation model 373
+alignment. arXiv preprint arXiv:2304.06767 , 2023. 374
+[18] Tianqi Liu, Yao Zhao, Rishabh Joshi, Misha Khalman, Mohammad Saleh, Peter J Liu, and Jialu Liu. 375
+Statistical rejection sampling improves preference optimization. arXiv preprint arXiv:2309.06657 , 2023. 376
+10[19] Kawin Ethayarajh, Winnie Xu, Niklas Muennighoff, Dan Jurafsky, and Douwe Kiela. Kto: Model 377
+alignment as prospect theoretic optimization. arXiv preprint arXiv:2402.01306 , 2024. 378
+[20] Tianqi Liu, Zhen Qin, Junru Wu, Jiaming Shen, Misha Khalman, Rishabh Joshi, Yao Zhao, Mohammad 379
+Saleh, Simon Baumgartner, Jialu Liu, et al. Lipo: Listwise preference optimization through learning-to-rank. 380
+arXiv preprint arXiv:2402.01878 , 2024. 381
+[21] Minae Kwon, Sang Michael Xie, Kalesha Bullard, and Dorsa Sadigh. Reward design with language models. 382
+arXiv preprint arXiv:2303.00001 , 2023. 383
+[22] Hunter Lightman, Vineet Kosaraju, Yura Burda, Harri Edwards, Bowen Baker, Teddy Lee, Jan Leike, John 384
+Schulman, Ilya Sutskever, and Karl Cobbe. Let’s verify step by step. arXiv preprint arXiv:2305.20050 , 385
+2023. 386
+[23] Binghai Wang, Rui Zheng, Lu Chen, Yan Liu, Shihan Dou, Caishuang Huang, Wei Shen, Senjie Jin, Enyu 387
+Zhou, Chenyu Shi, et al. Secrets of rlhf in large language models part ii: Reward modeling. arXiv preprint 388
+arXiv:2401.06080 , 2024. 389
+[24] Alexandre Rame, Guillaume Couairon, Corentin Dancette, Jean-Baptiste Gaya, Mustafa Shukor, Laure 390
+Soulier, and Matthieu Cord. Rewarded soups: towards pareto-optimal alignment by interpolating weights 391
+fine-tuned on diverse rewards. Advances in Neural Information Processing Systems , 36, 2024. 392
+[25] John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy 393
+optimization algorithms. arXiv preprint arXiv:1707.06347 , 2017. 394
+[26] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep bidirec- 395
+tional transformers for language understanding. arXiv preprint arXiv:1810.04805 , 2018. 396
+[27] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language 397
+models are unsupervised multitask learners. OpenAI blog , 1(8):9, 2019. 398
+[28] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée Lacroix, 399
+Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and efficient foundation 400
+language models. arXiv preprint arXiv:2302.13971 , 2023. 401
+[29] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay 402
+Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation and 403
+fine-tuned chat models. arXiv preprint arXiv:2307.09288 , 2023. 404
+[30] Wei Huang, Xudong Ma, Haotong Qin, Xingyu Zheng, Chengtao Lv, Hong Chen, Jie Luo, Xiaojuan Qi, 405
+Xianglong Liu, and Michele Magno. How good are low-bit quantized llama3 models? an empirical study. 406
+arXiv preprint arXiv:2404.14047 , 2024. 407
+[31] Mario Michael Krell, Matej Kosec, Sergio P Perez, and Andrew Fitzgibbon. Efficient sequence packing 408
+without cross-contamination: Accelerating large language models without impacting performance. arXiv 409
+preprint arXiv:2107.02027 , 2021. 410
+[32] Mostafa Dehghani, Basil Mustafa, Josip Djolonga, Jonathan Heek, Matthias Minderer, Mathilde Caron, 411
+Andreas Steiner, Joan Puigcerver, Robert Geirhos, Ibrahim M Alabdulmohsin, et al. Patch n’pack: Navit, a 412
+vision transformer for any aspect ratio and resolution. Advances in Neural Information Processing Systems , 413
+36, 2024. 414
+[33] PaddleNLP Contributors. Paddlenlp: An easy-to-use and high performance nlp library. https://github. 415
+com/PaddlePaddle/PaddleNLP , 2021. 416
+[34] BYTEDANCE INC. Effective transformer. https://github.com/bytedance/effective_ 417
+transformer , 2021. 418
+[35] Qingxiu Dong, Lei Li, Damai Dai, Ce Zheng, Zhiyong Wu, Baobao Chang, Xu Sun, Jingjing Xu, and 419
+Zhifang Sui. A survey on in-context learning. arXiv preprint arXiv:2301.00234 , 2022. 420
+[36] Amanda Bertsch, Maor Ivgi, Uri Alon, Jonathan Berant, Matthew R Gormley, and Graham Neubig. 421
+In-context learning with long-context models: An in-depth exploration. arXiv preprint arXiv:2405.00200 , 422
+2024. 423
+[37] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming language 424
+models with attention sinks. arXiv preprint arXiv:2309.17453 , 2023. 425
+11[38] Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago Ontanon, 426
+Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for longer sequences. 427
+Advances in neural information processing systems , 33:17283–17297, 2020. 428
+[39] Markus N Rabe and Charles Staats. Self-attention does not need o (n2) memory. arXiv preprint 429
+arXiv:2112.05682 , 2021. 430
+[40] Tri Dao, Daniel Haziza, Francisco Massa, and Grigory Sizov. Flash-decoding for long-context inference, 431
+2023. 432
+[41] Ke Hong, Guohao Dai, Jiaming Xu, Qiuli Mao, Xiuhong Li, Jun Liu, Kangdi Chen, Hanyu Dong, 433
+and Yu Wang. Flashdecoding++: Faster large language model inference on gpus. arXiv preprint 434
+arXiv:2311.01282 , 2023. 435
+[42] Hao Liu, Matei Zaharia, and Pieter Abbeel. Ring attention with blockwise transformers for near-infinite 436
+context. arXiv preprint arXiv:2310.01889 , 2023. 437
+[43] Nikita Kitaev, Łukasz Kaiser, and Anselm Levskaya. Reformer: The efficient transformer. arXiv preprint 438
+arXiv:2001.04451 , 2020. 439
+[44] Sinong Wang, Belinda Z Li, Madian Khabsa, Han Fang, and Hao Ma. Linformer: Self-attention with linear 440
+complexity. arXiv preprint arXiv:2006.04768 , 2020. 441
+[45] Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao 442
+Liu, Aohan Zeng, Lei Hou, Yuxiao Dong, Jie Tang, and Juanzi Li. Longbench: A bilingual, multitask 443
+benchmark for long context understanding. arXiv preprint arXiv:2308.14508 , 2023. 444
+12A Appendix / supplemental material 445
+A.1 Algorithm Details 446
+The detail implementation of FlashMask Backward Pass is presented in Algorithm 2. We do 447
+precomputations of max and min values of FMS andFME similar to the Forward Pass. Then the 448
+FMS𝑗andFME𝑗can be loaded to SRAM outside the inner loop (line 14-15), reducing the HBM 449
+accesses to 2×𝑁. Then, we do inner loop on 𝑄𝑖(line 16), computing the two valid parts and 450
+bypassing the masked part 𝑖∈(jmaxFMS𝑗
+𝐵𝑟k
+,jminFME𝑗
+𝐵𝑟k
+). 451
+Algorithm 2 Optimized Backward Pass with FlashMask
+Require: Matrices Q,K,V,O,dO∈R𝑁×𝑑in HBM, vector 𝐿∈R𝑁in HBM, block sizes 𝐵𝑐,𝐵𝑟, dense bias
+mask𝐷∈R𝑁×𝑁, column-wise sparse mask starting rows FMS∈R𝑁, ending rows FME∈R𝑁.
+1:Divide Qinto𝑇𝑟=l
+𝑁
+𝐵𝑟m
+blocks Q1,..., Q𝑇𝑟of size𝐵𝑟×𝑑each, and divide K,Vin to𝑇𝑐=l
+𝑁
+𝐵𝑐m
+blocks
+K1,..., K𝑇𝑐andV1,..., V𝑇𝑐, of size𝐵𝑐×𝑑each.
+2:Divide Ointo𝑇𝑟blocks O𝑖,..., O𝑇𝑟of size𝐵𝑟×𝑑each, divide dOinto𝑇𝑟blocks dO𝑖,..., dO𝑇𝑟of size
+𝐵𝑟×𝑑each, and divide 𝐿into𝑇𝑟blocks𝐿𝑖,...,𝐿𝑇𝑟of size𝐵𝑟each.
+3:Initialize dQ=(0)𝑁×𝑑in HBM and divide it into 𝑇𝑟blocks dQ1,..., dQ𝑇𝑟of size𝐵𝑟×𝑑each. Divide
+dK,dV∈R𝑁×𝑑in to𝑇𝑐blocks dK1,..., dK𝑇𝑐anddV1,..., dV𝑇𝑐, of size𝐵𝑐×𝑑each.
+4: Divide the dense mask Dinto𝑇𝑟×𝑇𝑐blocks D1,1,...,D𝑇𝑟,𝑇𝑐
+5: Divide FMS into𝑇𝑐blocks FMS 1,...,FMS𝑇𝑐, and divide FME intoFME 1,...,FME𝑇𝑐.
+6: Precompute the max value maxFMS 1,...,maxFMS𝑇𝑐for each FMS 1,...,FMS𝑇𝑐, write to HBM.
+7: Precompute the max value maxFME 1,...,maxFME𝑇𝑐for each FME 1,...,FME𝑇𝑐, write to HBM.
+8: Precompute the min value minFMS 1,...,minFMS𝑇𝑐for each FMS 1,...,FMS𝑇𝑐, write to HBM.
+9: Precompute the min value minFME 1,...,minFME𝑇𝑐for each FME 1,...,FME𝑇𝑐, write to HBM.
+10:Compute𝐷=rowsum(dO◦O)∈R𝑑(pointwise multiply), write 𝐷to HBM and divide it into 𝑇𝑟blocks
+𝐷1,...,𝐷𝑇𝑟of size𝐵𝑟each.
+11:for1≤𝑗≤𝑇𝑐do
+12: Load K𝑗,V𝑗from HBM to on-chip SRAM.
+13: Initialize dK𝑗=(0)𝐵𝑐×𝑑,dV𝑗=(0)𝐵𝑐×𝑑on SRAM.
+14: Load FMS𝑗from HBM to on-chip SRAM.
+15: Load FME𝑗from HBM to on-chip SRAM.
+16: for1≤𝑖≤jmaxFMS𝑗
+𝐵𝑟k
+𝑎𝑛𝑑jminFME𝑗
+𝐵𝑟k
+≤𝑖≤𝑇𝑟do
+17: Load Q𝑖,O𝑖,dO𝑖,dQ𝑖,𝐿𝑖,𝐷𝑖from HBM to on-chip SRAM.
+18: On chip, compute S(𝑗)
+𝑖=Q𝑖K𝑇
+𝑗∈R𝐵𝑟×𝐵𝑐.
+19: On chip, set S(𝑗)
+𝑖=S(𝑗)
+𝑖+𝐷𝑖,𝑗
+20: ifjmaxFME𝑗
+𝐵𝑟k
+≤𝑖≤jminFMS𝑗
+𝐵𝑟k
+then
+21: On chip, set S(𝑗)
+𝑖[𝑥][𝑦]=−∞, for every𝑖∗𝐵𝑟+𝑥≥𝑀𝑗[𝑦].
+22: end if
+23: On chip, compute P(𝑗)
+𝑖=exp(S𝑖𝑗−𝐿𝑖)∈R𝐵𝑟×𝐵𝑐.
+24: On chip, compute dV𝑗←dV𝑗+(P(𝑗)
+𝑖)⊤dO𝑖∈R𝐵𝑐×𝑑.
+25: On chip, compute dP(𝑗)
+𝑖=dO𝑖V⊤
+𝑗∈R𝐵𝑟×𝐵𝑐.
+26: On chip, compute dS(𝑗)
+𝑖=P(𝑗)
+𝑖◦(dP(𝑗)
+𝑖−𝐷𝑖)∈R𝐵𝑟×𝐵𝑐.
+27: Load dQ𝑖from HBM to SRAM, then on chip, update dQ𝑖←dQ𝑖+dS(𝑗)
+𝑖K𝑗∈R𝐵𝑟×𝑑, and write
+back to HBM.
+28: On chip, compute dK𝑗←dK𝑗+dS(𝑗)
+𝑖⊤Q𝑖∈R𝐵𝑐×𝑑.
+29: end for
+30: Write dK𝑗,dV𝑗to HBM.
+31:end for
+32: Return dQ,dK,dV.
+A.2 Supplementary Experimental Details 452
+All end-to-end training and testing in this paper were conducted on 4 servers, each equipped with 32 453
+NVIDIA A800-SXM 80G GPUs. We comprehensively evaluated the performance of the LLaMA2 454
+13model across three different parameter scales, four downstream task scenarios, and various sequence 455
+lengths. Given the diversity of experimental combinations and the specific distributed parallel 456
+strategies required by models, in varying parameter scales, the primary goal of the experiments is 457
+not to achieve optimal end-to-end training performance but to demonstrate the effectiveness of the 458
+FlashMask method. Therefore, to ensure consistency, we set the following hyperparameters in Table 1 459
+with the same hardware configuration. 460
+Table 1: Training Hyperparameters for Various Scales of LLaMA2 Models.
+Model LLaMA2-7B LLaMA2-13B LLaMA2-70B
+Global Batch Size 16 16 16
+Gradient Accumulation Step 2 4 16
+Sharding Stage1 Degree 8 4 1
+Tensor Parallel Degree 4 4 8
+PipeLine Parallel Degree 1 2 4
+Sequence Parallel Degree ✓ ✓ ✓
+To verify the representativeness of our synthetic dataset, sparsity distribution histograms of synthetic 461
+dataset are presented in Figure 6. Then we use InToken method with max sequence length of 16K, 462
+32K, 64K, and 128K on the open-source dataset LongBench, and compute the distribution histograms, 463
+presented in Figure 7. Note that many long sentences are truncated for max sequence length 16K, 464
+and 32K. Results indicate that the sparsity distributions of LongBench dataset and synthetic dataset 465
+are similar. 466
+0 20 40 60 80 100
+Sparsity(%)020406080100CountSFT 2K
+0 20 40 60 80 100
+Sparsity(%)020406080CountSFT 4K
+0 20 40 60 80 100
+Sparsity(%)010203040506070CountSFT 8K
+0 20 40 60 80 100
+Sparsity(%)0102030405060CountSFT 16K
+0 20 40 60 80 100
+Sparsity(%)010203040506070CountSFT 32K
+0 20 40 60 80 100
+Sparsity(%)010203040506070CountSFT 64K
+0 20 40 60 80 100
+Sparsity(%)010203040506070CountSFT 128K
+0 20 40 60 80 100
+Sparsity(%)020406080100CountDPO 2K
+0 20 40 60 80 100
+Sparsity(%)020406080CountDPO 4K
+0 20 40 60 80 100
+Sparsity(%)01020304050607080CountDPO 8K
+0 20 40 60 80 100
+Sparsity(%)0102030405060CountDPO 16K
+0 20 40 60 80 100
+Sparsity(%)01020304050607080CountDPO 32K
+0 20 40 60 80 100
+Sparsity(%)010203040506070CountDPO 64K
+0 20 40 60 80 100
+Sparsity(%)0102030405060CountDPO 128K
+0 20 40 60 80 100
+Sparsity(%)0102030405060CountRM 2K
+0 20 40 60 80 100
+Sparsity(%)0102030405060CountRM 4K
+0 20 40 60 80 100
+Sparsity(%)0102030405060CountRM 8K
+0 20 40 60 80 100
+Sparsity(%)020406080100CountRM 16K
+0 20 40 60 80 100
+Sparsity(%)020406080100CountRM 32K
+0 20 40 60 80 100
+Sparsity(%)020406080CountRM 64K
+0 20 40 60 80 100
+Sparsity(%)020406080CountRM 128K
+Figure 6: Sparsity Distribution of Synthetic Dataset.
+0 20 40 60 80 100
+Sparsity(%)02004006008001000120014001600CountSFT 16K
+0 20 40 60 80 100
+Sparsity(%)0100200300400500600CountSFT 32K
+0 20 40 60 80 100
+Sparsity(%)050100150200250300350400CountSFT 64K
+0 20 40 60 80 100
+Sparsity(%)050100150200250300350CountSFT 128K
+Figure 7: Sparsity Distribution of LongBench Dataset.
+A.3 Full Experiment Results 467
+Kernel experiments are also conducted on batch sizes 4, and 8. FA-Varlen is excluded by default. 468
+Results are presented in Figure 8 and 9. The trends are identical to Figure 3 in Section 4.3, except 469
+memory exhaustion occurred with less sequence length, especially for FA-DenseMask and Vanilla 470
+Attention which require 𝑂(𝑁2)memory to launch. 471
+142 4 8 16 32 64 128
+Sequence Length(K)101102103104Latency(ms)SFT
+FA-DenseMask
+VanillaAttention
+FlashMask
+2 4 8 16 32 64 128
+Sequence Length(K)101102103104Latency(ms)DPO
+FA-DenseMask
+VanillaAttention
+FlashMask
+2 4 8 16 32 64 128
+Sequence Length(K)101102103104Latency(ms)RM
+FA-DenseMask
+VanillaAttention
+FlashMaskFigure 8: Kernel Latency Comparison with Varying the Length of Sequence.(Batch Size = 4)
+2 4 8 16 32 64 128
+Sequence Length(K)101102103Latency(ms)SFT
+FA-DenseMask
+VanillaAttention
+FlashMask
+2 4 8 16 32 64 128
+Sequence Length(K)101102103Latency(ms)DPO
+FA-DenseMask
+VanillaAttention
+FlashMask
+2 4 8 16 32 64 128
+Sequence Length(K)101102103Latency(ms)RM
+FA-DenseMask
+VanillaAttention
+FlashMask
+Figure 9: Kernel Latency Comparison with Varying the Length of Sequence. (Batch Size = 8)
+We evaluate the effectiveness of FlashMask on the open-source dataset LongBench. The throughput of 472
+LoRA fine-tuning for LLaMA2-7B are shown in Figure 10. FlashMask performed close to FA-Varlen, 473
+showcasing 4.12x faster than FA-DenseMask, proving that FlashMask can deliver significant training 474
+accelerations in generalized real-world scenarios. 475
+16 32 64
+Sequence Length(K)200030004000500060007000T okens/Sec/GPU
+Speed Up 4.12xLLaMA-7B
+FA-DenseMask
+FA-Varlen
+FlashMask
+Figure 10: Comparison of End-to-End Training Throughput on LongBench Dataset.
+Figure 11 presents the GPU memory consumption in End-to-End training. FlashMask showed linear 476
+memory consumption with increasing sequence length, far less than FA-DenseMask. Therefore, 477
+FlashMask supports training with much longer sequences in memory limits of 80G. 478
+154 8 16 32 64 128 256
+Sequence Length(K)010203040506070GPU Memory(GB)LLaMA-7B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask
+4 8 16 32 64 128 196
+Sequence Length(K)010203040506070GPU Memory(GB)LLaMA-13B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask
+4 8 16 32 64 96
+Sequence Length(K)010203040506070GPU Memory(GB)LLaMA-70B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask(a) SFT
+4 8 16 32 64 128 256 512 544
+Sequence Length(K)010203040506070GPU Memory(GB)LLaMA-7B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask
+4 8 16 32 64 128 224
+Sequence Length(K)010203040506070GPU Memory(GB)LLaMA-13B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask
+4 8 16 32 64 128
+Sequence Length(K)0102030405060GPU Memory(GB)LLaMA-70B
+VanillaAttention
+FA-DenseMask
+FA-Varlen
+FlashMask (b) LoRA
+4 8 16 32 64 96
+Sequence Length(K)010203040506070GPU Memory(GB)LLaMA-7B
+VanillaAttention
+FA-DenseMask
+FlashMask
+4 8 16 32 64 128 180
+Sequence Length(K)010203040506070GPU Memory(GB)LLaMA-13B
+VanillaAttention
+FA-DenseMask
+FlashMask
+4 8 16 32 64 80
+Sequence Length(K)010203040506070GPU Memory(GB)LLaMA-70B
+VanillaAttention
+FA-DenseMask
+FlashMask (c) DPO
+4 8 16 32 64 128 256
+Sequence Length(K)010203040506070GPU Memory(GB)LLaMA-7B
+VanillaAttention
+FA-DenseMask
+FlashMask
+4 8 16 32 64 128 196
+Sequence Length(K)010203040506070GPU Memory(GB)LLaMA-13B
+VanillaAttention
+FA-DenseMask
+FlashMask
+4 8 16 32 64 96
+Sequence Length(K)010203040506070GPU Memory(GB)LLaMA-70B
+VanillaAttention
+FA-DenseMask
+FlashMask (d) RM
+Figure 11: Comparison of End-to-End Training GPU Memory.
+16NeurIPS Paper Checklist 479
+1.Claims 480
+Question: Do the main claims made in the abstract and introduction accurately reflect the 481
+paper’s contributions and scope? 482
+Answer: [Yes] 483
+Justification: This paper’s contributions and scope are described in Abstract and Introduction. 484
+Guidelines: 485
+•The answer NA means that the abstract and introduction do not include the claims 486
+made in the paper. 487
+•The abstract and/or introduction should clearly state the claims made, including the 488
+contributions made in the paper and important assumptions and limitations. A No or 489
+NA answer to this question will not be perceived well by the reviewers. 490
+•The claims made should match theoretical and experimental results, and reflect how 491
+much the results can be expected to generalize to other settings. 492
+•It is fine to include aspirational goals as motivation as long as it is clear that these goals 493
+are not attained by the paper. 494
+2.Limitations 495
+Question: Does the paper discuss the limitations of the work performed by the authors? 496
+Answer: [Yes] 497
+Justification: The paper includes a discussion section about limitations. 498
+Guidelines: 499
+•The answer NA means that the paper has no limitation while the answer No means that 500
+the paper has limitations, but those are not discussed in the paper. 501
+• The authors are encouraged to create a separate "Limitations" section in their paper. 502
+•The paper should point out any strong assumptions and how robust the results are to 503
+violations of these assumptions (e.g., independence assumptions, noiseless settings, 504
+model well-specification, asymptotic approximations only holding locally). The authors 505
+should reflect on how these assumptions might be violated in practice and what the 506
+implications would be. 507
+•The authors should reflect on the scope of the claims made, e.g., if the approach was 508
+only tested on a few datasets or with a few runs. In general, empirical results often 509
+depend on implicit assumptions, which should be articulated. 510
+•The authors should reflect on the factors that influence the performance of the approach. 511
+For example, a facial recognition algorithm may perform poorly when image resolution 512
+is low or images are taken in low lighting. Or a speech-to-text system might not be 513
+used reliably to provide closed captions for online lectures because it fails to handle 514
+technical jargon. 515
+•The authors should discuss the computational efficiency of the proposed algorithms 516
+and how they scale with dataset size. 517
+•If applicable, the authors should discuss possible limitations of their approach to 518
+address problems of privacy and fairness. 519
+•While the authors might fear that complete honesty about limitations might be used by 520
+reviewers as grounds for rejection, a worse outcome might be that reviewers discover 521
+limitations that aren’t acknowledged in the paper. The authors should use their best 522
+judgment and recognize that individual actions in favor of transparency play an impor- 523
+tant role in developing norms that preserve the integrity of the community. Reviewers 524
+will be specifically instructed to not penalize honesty concerning limitations. 525
+3.Theory Assumptions and Proofs 526
+Question: For each theoretical result, does the paper provide the full set of assumptions and 527
+a complete (and correct) proof? 528
+Answer: [Yes] 529
+17Justification: In sec 3.3 Complexity Analysis 530
+Guidelines: 531
+• The answer NA means that the paper does not include theoretical results. 532
+•All the theorems, formulas, and proofs in the paper should be numbered and cross- 533
+referenced. 534
+•All assumptions should be clearly stated or referenced in the statement of any theorems. 535
+•The proofs can either appear in the main paper or the supplemental material, but if 536
+they appear in the supplemental material, the authors are encouraged to provide a short 537
+proof sketch to provide intuition. 538
+•Inversely, any informal proof provided in the core of the paper should be complemented 539
+by formal proofs provided in appendix or supplemental material. 540
+• Theorems and Lemmas that the proof relies upon should be properly referenced. 541
+4.Experimental Result Reproducibility 542
+Question: Does the paper fully disclose all the information needed to reproduce the main ex- 543
+perimental results of the paper to the extent that it affects the main claims and/or conclusions 544
+of the paper (regardless of whether the code and data are provided or not)? 545
+Answer: [Yes] 546
+Justification: The source code will be public available and can reproduce the results accord- 547
+ing README. 548
+Guidelines: 549
+• The answer NA means that the paper does not include experiments. 550
+•If the paper includes experiments, a No answer to this question will not be perceived 551
+well by the reviewers: Making the paper reproducible is important, regardless of 552
+whether the code and data are provided or not. 553
+•If the contribution is a dataset and/or model, the authors should describe the steps taken 554
+to make their results reproducible or verifiable. 555
+•Depending on the contribution, reproducibility can be accomplished in various ways. 556
+For example, if the contribution is a novel architecture, describing the architecture fully 557
+might suffice, or if the contribution is a specific model and empirical evaluation, it may 558
+be necessary to either make it possible for others to replicate the model with the same 559
+dataset, or provide access to the model. In general. releasing code and data is often 560
+one good way to accomplish this, but reproducibility can also be provided via detailed 561
+instructions for how to replicate the results, access to a hosted model (e.g., in the case 562
+of a large language model), releasing of a model checkpoint, or other means that are 563
+appropriate to the research performed. 564
+•While NeurIPS does not require releasing code, the conference does require all submis- 565
+sions to provide some reasonable avenue for reproducibility, which may depend on the 566
+nature of the contribution. For example 567
+(a)If the contribution is primarily a new algorithm, the paper should make it clear how 568
+to reproduce that algorithm. 569
+(b)If the contribution is primarily a new model architecture, the paper should describe 570
+the architecture clearly and fully. 571
+(c)If the contribution is a new model (e.g., a large language model), then there should 572
+either be a way to access this model for reproducing the results or a way to reproduce 573
+the model (e.g., with an open-source dataset or instructions for how to construct 574
+the dataset). 575
+(d)We recognize that reproducibility may be tricky in some cases, in which case 576
+authors are welcome to describe the particular way they provide for reproducibility. 577
+In the case of closed-source models, it may be that access to the model is limited in 578
+some way (e.g., to registered users), but it should be possible for other researchers 579
+to have some path to reproducing or verifying the results. 580
+5.Open access to data and code 581
+Question: Does the paper provide open access to the data and code, with sufficient instruc- 582
+tions to faithfully reproduce the main experimental results, as described in supplemental 583
+material? 584
+18Answer: [Yes] 585
+Justification: The source code will be public available. 586
+Guidelines: 587
+• The answer NA means that paper does not include experiments requiring code. 588
+•Please see the NeurIPS code and data submission guidelines ( https://nips.cc/ 589
+public/guides/CodeSubmissionPolicy ) for more details. 590
+•While we encourage the release of code and data, we understand that this might not be 591
+possible, so “No” is an acceptable answer. Papers cannot be rejected simply for not 592
+including code, unless this is central to the contribution (e.g., for a new open-source 593
+benchmark). 594
+•The instructions should contain the exact command and environment needed to run to 595
+reproduce the results. See the NeurIPS code and data submission guidelines ( https: 596
+//nips.cc/public/guides/CodeSubmissionPolicy ) for more details. 597
+•The authors should provide instructions on data access and preparation, including how 598
+to access the raw data, preprocessed data, intermediate data, and generated data, etc. 599
+•The authors should provide scripts to reproduce all experimental results for the new 600
+proposed method and baselines. If only a subset of experiments are reproducible, they 601
+should state which ones are omitted from the script and why. 602
+•At submission time, to preserve anonymity, the authors should release anonymized 603
+versions (if applicable). 604
+•Providing as much information as possible in supplemental material (appended to the 605
+paper) is recommended, but including URLs to data and code is permitted. 606
+6.Experimental Setting/Details 607
+Question: Does the paper specify all the training and test details (e.g., data splits, hyper- 608
+parameters, how they were chosen, type of optimizer, etc.) necessary to understand the 609
+results? 610
+Answer: [Yes] 611
+Justification: Refer to Experiments section. 612
+Guidelines: 613
+• The answer NA means that the paper does not include experiments. 614
+•The experimental setting should be presented in the core of the paper to a level of detail 615
+that is necessary to appreciate the results and make sense of them. 616
+•The full details can be provided either with the code, in appendix, or as supplemental 617
+material. 618
+7.Experiment Statistical Significance 619
+Question: Does the paper report error bars suitably and correctly defined or other appropriate 620
+information about the statistical significance of the experiments? 621
+Answer: [Yes] 622
+Justification: All our experimental results are run multiple times and then averaged. 623
+Guidelines: 624
+• The answer NA means that the paper does not include experiments. 625
+•The authors should answer "Yes" if the results are accompanied by error bars, confi- 626
+dence intervals, or statistical significance tests, at least for the experiments that support 627
+the main claims of the paper. 628
+•The factors of variability that the error bars are capturing should be clearly stated (for 629
+example, train/test split, initialization, random drawing of some parameter, or overall 630
+run with given experimental conditions). 631
+•The method for calculating the error bars should be explained (closed form formula, 632
+call to a library function, bootstrap, etc.) 633
+• The assumptions made should be given (e.g., Normally distributed errors). 634
+•It should be clear whether the error bar is the standard deviation or the standard error 635
+of the mean. 636
+19•It is OK to report 1-sigma error bars, but one should state it. The authors should 637
+preferably report a 2-sigma error bar than state that they have a 96% CI, if the hypothesis 638
+of Normality of errors is not verified. 639
+•For asymmetric distributions, the authors should be careful not to show in tables or 640
+figures symmetric error bars that would yield results that are out of range (e.g. negative 641
+error rates). 642
+•If error bars are reported in tables or plots, The authors should explain in the text how 643
+they were calculated and reference the corresponding figures or tables in the text. 644
+8.Experiments Compute Resources 645
+Question: For each experiment, does the paper provide sufficient information on the com- 646
+puter resources (type of compute workers, memory, time of execution) needed to reproduce 647
+the experiments? 648
+Answer: [Yes] 649
+Justification: Referring to the Experiments section, we provide a running environment. 650
+Guidelines: 651
+• The answer NA means that the paper does not include experiments. 652
+•The paper should indicate the type of compute workers CPU or GPU, internal cluster, 653
+or cloud provider, including relevant memory and storage. 654
+•The paper should provide the amount of compute required for each of the individual 655
+experimental runs as well as estimate the total compute. 656
+•The paper should disclose whether the full research project required more compute 657
+than the experiments reported in the paper (e.g., preliminary or failed experiments that 658
+didn’t make it into the paper). 659
+9.Code Of Ethics 660
+Question: Does the research conducted in the paper conform, in every respect, with the 661
+NeurIPS Code of Ethics https://neurips.cc/public/EthicsGuidelines ? 662
+Answer: [Yes] 663
+Justification: We follow the NeurIPS Code of Ethics properly. 664
+Guidelines: 665
+•The answer NA means that the authors have not reviewed the NeurIPS Code of Ethics. 666
+•If the authors answer No, they should explain the special circumstances that require a 667
+deviation from the Code of Ethics. 668
+•The authors should make sure to preserve anonymity (e.g., if there is a special consid- 669
+eration due to laws or regulations in their jurisdiction). 670
+10.Broader Impacts 671
+Question: Does the paper discuss both potential positive societal impacts and negative 672
+societal impacts of the work performed? 673
+Answer: [NA] 674
+Justification: There is no societal impact of the work performed. 675
+Guidelines: 676
+• The answer NA means that there is no societal impact of the work performed. 677
+•If the authors answer NA or No, they should explain why their work has no societal 678
+impact or why the paper does not address societal impact. 679
+•Examples of negative societal impacts include potential malicious or unintended uses 680
+(e.g., disinformation, generating fake profiles, surveillance), fairness considerations 681
+(e.g., deployment of technologies that could make decisions that unfairly impact specific 682
+groups), privacy considerations, and security considerations. 683
+•The conference expects that many papers will be foundational research and not tied 684
+to particular applications, let alone deployments. However, if there is a direct path to 685
+any negative applications, the authors should point it out. For example, it is legitimate 686
+to point out that an improvement in the quality of generative models could be used to 687
+20generate deepfakes for disinformation. On the other hand, it is not needed to point out 688
+that a generic algorithm for optimizing neural networks could enable people to train 689
+models that generate Deepfakes faster. 690
+•The authors should consider possible harms that could arise when the technology is 691
+being used as intended and functioning correctly, harms that could arise when the 692
+technology is being used as intended but gives incorrect results, and harms following 693
+from (intentional or unintentional) misuse of the technology. 694
+•If there are negative societal impacts, the authors could also discuss possible mitigation 695
+strategies (e.g., gated release of models, providing defenses in addition to attacks, 696
+mechanisms for monitoring misuse, mechanisms to monitor how a system learns from 697
+feedback over time, improving the efficiency and accessibility of ML). 698
+11.Safeguards 699
+Question: Does the paper describe safeguards that have been put in place for responsible 700
+release of data or models that have a high risk for misuse (e.g., pretrained language models, 701
+image generators, or scraped datasets)? 702
+Answer: [NA] 703
+Justification: The paper poses no such risks. 704
+Guidelines: 705
+• The answer NA means that the paper poses no such risks. 706
+•Released models that have a high risk for misuse or dual-use should be released with 707
+necessary safeguards to allow for controlled use of the model, for example by requiring 708
+that users adhere to usage guidelines or restrictions to access the model or implementing 709
+safety filters. 710
+•Datasets that have been scraped from the Internet could pose safety risks. The authors 711
+should describe how they avoided releasing unsafe images. 712
+•We recognize that providing effective safeguards is challenging, and many papers do 713
+not require this, but we encourage authors to take this into account and make a best 714
+faith effort. 715
+12.Licenses for existing assets 716
+Question: Are the creators or original owners of assets (e.g., code, data, models), used in 717
+the paper, properly credited and are the license and terms of use explicitly mentioned and 718
+properly respected? 719
+Answer: [Yes] 720
+Justification: CC BY-NC-ND 4.0 721
+Guidelines: 722
+• The answer NA means that the paper does not use existing assets. 723
+• The authors should cite the original paper that produced the code package or dataset. 724
+•The authors should state which version of the asset is used and, if possible, include a 725
+URL. 726
+• The name of the license (e.g., CC-BY 4.0) should be included for each asset. 727
+•For scraped data from a particular source (e.g., website), the copyright and terms of 728
+service of that source should be provided. 729
+•If assets are released, the license, copyright information, and terms of use in the 730
+package should be provided. For popular datasets, paperswithcode.com/datasets 731
+has curated licenses for some datasets. Their licensing guide can help determine the 732
+license of a dataset. 733
+•For existing datasets that are re-packaged, both the original license and the license of 734
+the derived asset (if it has changed) should be provided. 735
+•If this information is not available online, the authors are encouraged to reach out to 736
+the asset’s creators. 737
+13.New Assets 738
+Question: Are new assets introduced in the paper well documented and is the documentation 739
+provided alongside the assets? 740
+21Answer: [NA] 741
+Justification: The paper does not release new assets. 742
+Guidelines: 743
+• The answer NA means that the paper does not release new assets. 744
+•Researchers should communicate the details of the dataset/code/model as part of their 745
+submissions via structured templates. This includes details about training, license, 746
+limitations, etc. 747
+•The paper should discuss whether and how consent was obtained from people whose 748
+asset is used. 749
+•At submission time, remember to anonymize your assets (if applicable). You can either 750
+create an anonymized URL or include an anonymized zip file. 751
+14.Crowdsourcing and Research with Human Subjects 752
+Question: For crowdsourcing experiments and research with human subjects, does the paper 753
+include the full text of instructions given to participants and screenshots, if applicable, as 754
+well as details about compensation (if any)? 755
+Answer: [NA] 756
+Justification: The paper does not involve crowdsourcing nor research with human subjects. 757
+Guidelines: 758
+•The answer NA means that the paper does not involve crowdsourcing nor research with 759
+human subjects. 760
+•Including this information in the supplemental material is fine, but if the main contribu- 761
+tion of the paper involves human subjects, then as much detail as possible should be 762
+included in the main paper. 763
+•According to the NeurIPS Code of Ethics, workers involved in data collection, curation, 764
+or other labor should be paid at least the minimum wage in the country of the data 765
+collector. 766
+15.Institutional Review Board (IRB) Approvals or Equivalent for Research with Human 767
+Subjects 768
+Question: Does the paper describe potential risks incurred by study participants, whether 769
+such risks were disclosed to the subjects, and whether Institutional Review Board (IRB) 770
+approvals (or an equivalent approval/review based on the requirements of your country or 771
+institution) were obtained? 772
+Answer: [NA] 773
+Justification: The paper does not involve crowdsourcing nor research with human subjects. 774
+Guidelines: 775
+•The answer NA means that the paper does not involve crowdsourcing nor research with 776
+human subjects. 777
+•Depending on the country in which research is conducted, IRB approval (or equivalent) 778
+may be required for any human subjects research. If you obtained IRB approval, you 779
+should clearly state this in the paper. 780
+•We recognize that the procedures for this may vary significantly between institutions 781
+and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the 782
+guidelines for their institution. 783
+•For initial submissions, do not include any information that would break anonymity (if 784
+applicable), such as the institution conducting the review. 785
+22

@@ -1,0 +1,1202 @@
+Under review as submission to TMLR
+LTL-Constrained Policy Optimization with Cycle Experience
+Replay
+Anonymous authors
+Paper under double-blind review
+Abstract
+Linear Temporal Logic (LTL) offers a precise means for constraining the behavior of rein-
+forcement learning agents. However, in many settings where both satisfaction and optimality
+conditions are present, LTL is insufficient to capture both. Instead, LTL-constrained policy
+optimization, where the goal is to optimize a scalar reward under LTL constraints, is needed.
+This constrained optimization problem proves difficult in deep Reinforcement Learning (DRL)
+settings, where learned policies often ignore the LTL constraint due to the sparse nature
+of LTL satisfaction. To alleviate the sparsity issue, we introduce Cycle Experience Replay
+(CyclER), a novel reward shaping technique that exploits the underlying structure of the LTL
+constraint to guide a policy towards satisfaction by encouraging partial behaviors compliant
+with the constraint. We provide a theoretical guarantee that optimizing CyclER will achieve
+policies that satisfy the LTL constraint with near-optimal probability. We evaluate CyclER
+in three continuous control domains. Our experimental results show that optimizing CyclER
+in tandem with the existing scalar reward outperforms existing reward-shaping methods at
+finding performant LTL-satisfying policies.
+1 Introduction
+Significant research effort has explored Linear Temporal Logic (LTL) as an alternative means of specifying
+objectives for reinforcement learning (RL) agents (Sadigh et al., 2014; Hasanbeig et al., 2018; Camacho et al.,
+2019; Wang et al., 2020; Vaezipoor et al., 2021; Alur et al., 2022; De Giacomo et al., 2020; Voloshin et al.,
+2023). LTL provides a flexible language for defining objectives, or specifications , that are often not reducible
+to scalar Markovian rewards (Abel et al., 2021). Unlike typical reward functions, objectives defined in LTL
+are composable, easily transferred across environments, and offer a precise notion of satisfaction.
+LTL specifications and Markovian reward functions have been used separately in a variety of RL settings,
+but few works consider both rewards andspecifications in the same setting (Voloshin et al., 2022). The
+combination of the two is important: an LTL specification can define the meaning of achieving a task, and a
+reward function can be optimized to find the best way of achieving that task. For example, in robot motion
+planning, an LTL specification can describe the waypoints a robot should reach and obstacles it should avoid,
+and a reward function can optimize for factors like energy consumption, stability of motion, and so forth.
+This work considers the problem setting of RL-based reward optimization under an LTL constraint. This
+constrained learning problem can be naturally formulated in an unconstrained form through a Lagrange-style
+relaxation (Le et al., 2019; Achiam et al., 2017) where the LTL constraint is represented by a proxyreward
+function. Some versions of this proxy have been introduced in prior literature (Hasanbeig et al., 2020; Voloshin
+et al., 2023; Camacho et al., 2019). However, these proxy rewards are sparse and difficult to optimize. As
+a result, learned policies in practice often end up ignoring the LTL constraint entirely and focus only on
+optimizing the reward function. A few existing works attempt to circumvent this sparsity issue by considering
+alternative temporal logics that provide a denser reward signal (Krasowski et al., 2023; Lavaei et al., 2020;
+Gundana & Kress-Gazit, 2021) or by limiting their approach to discrete state spaces that can be solved
+exactly (Voloshin et al., 2022).
+1Under review as submission to TMLR
+Figure 1: Left: The FlatWorld MDP and an example trajectory. Right: An LDBA for the LTL formula
+φ=G(F(r)&F(g)&F(y))&G(¬b)(some edges omitted for readability); the accepting state 0 is coded in
+green. The CyclER method considers all accepting paths within an LDBA and selects the most reward-ful
+path for the trajectory to shape LTL reward. Unlike other approaches (Camacho et al., 2019; Voloshin et al.,
+2023), CyclER offers dense reward, even without visiting the accepting state.
+In this paper, we introducing a novel reward-shaping proxy for LTL called Cycle Experience Replay (CyclER)
+that alleviates the reward-sparsity issue of previous LTL proxy rewards, allowing us to scale to continuous
+state and action spaces with an objective readily optimizable by deep RL (DRL) approaches. We briefly
+summarize the CyclER approach as follows. Given the (known) automaton structure representing an LTL
+objective, CyclER computes all possible infinite paths, or cycles, through the automaton that define accepting
+behaviors for our task. Then, when an agent collects a finite episode of experience in the world, CyclER
+counterfactually reasons over that experience by considering how much progress it made through each cycle.
+The cycle that the agent progressed through the furthest is then used to shape LTL reward. We provide a
+visualization of this approach in Figure 1.
+Under certain assumptions, CyclER maintains theoretical guarantees on LTL optimality that are competitive
+with state-of-the-art LTL proxy rewards (Voloshin et al., 2023). A key advantage of CyclER is how it readily
+incorporates quantitative semantics (QS), a popular technique for reward design in temporal logic that has
+yet to be extended to infinite-horizon LTL tasks. Our empirical results demonstrate CyclER’s effectiveness
+during policy learning.
+In summary, this paper makes the following contributions. We present a problem formulation for LTL-
+constrained policy optimization in the presence of continuous spaces and function approximators for use in
+deep RL. We propose a technique for this problem setting, CyclER, that alleviates the proxy reward sparsity
+issue and provides guarantees that ensure approximate optimality of LTL satisfaction. Third, we introduce a
+new way to leverage quantitative semantics in LTL reward shaping. Lastly, we present promising experimental
+results using CyclER in LTL-constrained optimization settings, outperforming existing approaches.
+2 Problem Setting
+2.1 Preliminaries
+Linear Temporal Logic (LTL) Linear Temporal Logic (Pnueli, 1977) is a specification language that
+composes atomic propositions with logical and temporal operators to precisely define tasks. An atomic
+proposition is a variable that takes on a Boolean truth value. We define an alphabet Σas all possible
+combinations over a finite set of atomic propositions ( AP); that is, Σ = 2AP. For example, if AP={a,b},
+then Σ ={{a,b},{b},{a},{}}.We will refer to individual combinations of atomic propositions, or predicates,
+inΣasν. We use the symbol φto refer to an LTL task specification, also called an LTL formula.
+In LTL, specifications are constructed using both logical connectives: not (¬), and (&), and implies (→);
+and temporal operators: next (X), repeatedly/always/globally (G), eventually (F), and until (U). For more
+detail on the exact semantics of LTL operators, see Baier & Katoen (2008).
+As an example, consider the “FlatWorld” environment in Figure 1 (left), where AP={r,g,b,y}, corresponding
+to whether the agent is in the red, green, blue, or yellow region at any point in time. LTL can easily
+define some simple objectives, such as safety G(¬b), reachability F(g), or progress F(y)&X(F(r)). We
+can also combine operators to bring together these objectives into more complex specifications, such as
+2Under review as submission to TMLR
+G(F(r)&F(y)&F(g))&G(¬b), which instructs an agent to oscillate amongst the red, yellow, and green regions
+indefinitely while avoiding the blue region.
+In order to determine the logical satisfaction of an LTL specification, we can transform it into a specialized
+automaton called a Limit Deterministic Büchi Automaton (LDBA) . See Sickert et al. (2016); Hahn et al.
+(2013); Křetínsk` y et al. (2018) for details on how LTL specifications can be transformed into semantically
+equivalent LDBA.
+More precisely, a (de-generalized) LDBA is a tuple B= (B,Σ,TB,B∗,E,b−1)with a set of states B, the
+alphabet Σof predicates νthat defines deterministic transitions in the automaton, a transition function
+TB:B×(2Σ∪E)→B, a set of accepting states B∗, and an initial state b−1. An LDBA may have separate
+deterministic and nondeterministic components B=BD∪BN, such thatB∗⊆BD, and forb∈BD,x∈Σthen
+TB(b,x)⊆BD.Eis a set of “jump” actions, also known as epsilon-transitions, for b∈BNthat transitions to
+BDwithout evaluating any atomic propositions. A path ξ= (b0,b1,...)is a sequence of states in Breached
+through successive transitions under TB, not including the initial state b−1.
+Definition 2.1 (Acceptance of ξ).We accept a path ξ= (b0,b1,...)if an accepting state of the Büchi
+automaton is visited infinitely often by ξ.
+Labeled MDPs We formulate our environment as a labelled Markov Decision Process M=
+(S,A,TM,d0,γ,r,LM), containing a state space S, an action space A, anunknown transition function,
+TM:S×A→ ∆(S), an initial state distribution d0∈∆(S), a discount factor 0<γ < 1, a reward function
+r:S×A→ [Rmin,Rmax], and a labelling function LM:S→ Σ. The labelling function returns which atomic
+propositions in our set AP are true for a given MDP state.
+2.2 Problem Statement
+We would like to learn a policy that produces satisfactory (accepting) trajectories with respect to a given
+LTL formula φwhile maximizing r, the reward function from the MDP. Before we define our formal problem
+statement, we introduce more notation:
+Definition 2.2 (Product MDP) .Aproduct MDP synchronizes the MDP with an LDBA. Specifically,
+letMφbe an MDP with state space Sφ=S×B. Policies over our product MDP space can be defined as
+π:Sφ→∆(Aφ), where our new set of actions combine Aφ((s,b)) =A(s)∪E, to include the jump transitions
+inBas possible actions. We define the space of all possible policies as Π. The new probabilistic transition
+relation of our product MDP is defined as:
+T(s,b,a,s′,b′) =
+
+TM(s,a,s′)a∈A(s),b′=TB(b,L(s′))
+1 a∈E,b′=TB(b,a),s=s′
+0 otherwise(1)
+A policy generates trajectories τ= ((s0,b0,a0),(s1,b1,a1),...)in the product MDP. Define R(τ)≡/summationtext∞
+t=0γtr(st,at)as the total reward along a trajectory τ.
+Definition 2.3 (Trajectory acceptance) .A trajectory is said to be accepting with respect to φ(τ|=φ, or
+“φacceptsτ”) if there exists some b∈B∗that is visited infinitely often.
+Definition 2.4 (Policy satisfaction) .A policyπ∈Πsatisfiesφwith some probability P[π|=φ] =
+Eτ∼Mφ
+π[1τ|=φ]. Here,1is an indicator variable that checks whether or not a trajectory τis accepted by φ,
+andMφ
+πis the distribution of trajectories induced by policy πin a product MDP Mφ.
+Definition 2.5 (Probability-optimal policies) .We will denote Π∗as the set of policies that maximize the
+probability of satisfaction with respect to φ; that is, the policies that have the highest probability of producing
+an accepted trajectory: Π∗={π∈Π|P[π|=φ] = maxπ′∈ΠP[π′|=φ]}.
+Our aim is to find a policy in the probability-optimal set Π∗that collects the largest expected cumulative
+discounted reward. We state this constrained objective formally as follows:
+3Under review as submission to TMLR
+π∗∈argmaxπ∈Π∗Eτ∼Mφ
+π/bracketleftbig
+R(τ)/bracketrightbig
+(2)
+For notational convenience, we will refer to the MDP value function as Rπ≡Eτ∼Mφ
+π/bracketleftbig
+R(τ)/bracketrightbig
+.
+In certain cases, the probability-optimal set of policies Π∗may be empty; consequently, a solution to 2 may
+not exist. In section 3, we introduce a proxy objective with a similar potential of non-existence and discuss
+how our ultimate optimization objective behaves in this setting.
+To align with our intended applications towards deep RL, we consider stochastic, memoryless policies over the
+product MDP. Such policies are capable of capturing probability-optimal policies for a given LTL specification
+if an optimal policy exists (Bozkurt et al., 2020; Voloshin et al., 2022).
+3 LTL-Constrained Policy Optimization
+Finding a policy within Π∗is, in general, not tractable: an LTL constraint φis defined over infinite-length
+trajectories but policy rollouts in practice produce only finite-length trajectories (Yang et al., 2022). We
+adopteventual discounting (Voloshin et al., 2023), a common approach in the existing literature which aims
+to optimize a proxy value function that approximates the satisfaction of φ. Eventual discounting is defined as:
+Vπ=E
+τ∼Mφ
+π/bracketleftbigg∞/summationdisplay
+t=0ΓtrLTL(bt)/bracketrightbigg
+, Γt=γj
+φ, r LTL(bt) =/braceleftigg
+1if(bt∈B∗)
+0otherwise(3)
+wherej=/summationtextt
+k=0rLTL(bk)counts how many times the set B∗has been visited (up to and including the
+current timestep). Notably, eventual discounting does not discount based on the amount of time between
+visits to an accepting state. A policy that maximizes this eventual discounting reward is approximately
+probability-optimal with respect to φwhenγφ, the discounting factor associated with φ, is selected properly
+(see Theorem 4.2 in Voloshin et al. (2023) for an exact bound).
+As a result of eventual discounting, we can replace Π∗in objective 2 with the set of policies that maximize
+Vπ. LetVmax= maxπ∈ΠVπbe the maximal value.
+π∗= argmax
+π∈{π∈Π|Vπ=Vmax}/bracketleftbig
+Rπ/bracketrightbig
+(4)
+We now form the Lagrangian dual of objective 4 as π∗=minλargmaxπ∈Π/bracketleftbig
+Rπ+λ(Vπ−Vmax)/bracketrightbig
+. In theorem 3.2
+we show that because we only care about constraint-maximizing policies, there exists λ∗∈Rsuch that solving
+the inner maximization of the Lagrangian dual must be constraint optimal for any fixed λ>λ∗. Intuitively,
+the higher λis, the more our learned policy will account for Vπduring optimization until the constraint
+must be satisfied. At that point, because we are already achieving the maximum possible Vπ, any additional
+lift will only come from maximizing over the MDP value R, even if we continue to increase λ. With this
+observation, we can form an unconstrained objective function from objective 4 to be the following:
+π∗= arg max
+π∈Π/bracketleftbig
+Rπ+λVπ/bracketrightbig
+(5)
+where we have dropped the dependence on Vmaxsince it is a constant and fixed λ>λ∗. We show that under
+certain assumptions, an exact value for λ∗can be found to ensure that a policy that maximizes eq. 5 will
+certainly maximize Vπ.
+Assumption 3.1. There exists a positive nonzero gap ϵ>0between the value Vπof policies in π∈Π∗and
+the highest-value policies that are not; that is, Vmax−maxπ∈(Π\Π∗)(Vπ)>ϵ.
+Theorem 3.2. Under Assumption 3.1, for any choice of λ>Rmax−Rmin
+ϵ(1−γ), the solution to objective 5 must be
+a solution to objective 4. See Appendix Section B for the proof.
+4Under review as submission to TMLR
+We note that Assumption 3.1 can be found in previous literature (Voloshin et al., 2023) and serves as
+a sufficient but not necessary condition for our results. We provide further analysis for the existence of
+Assumption 3.1 in Appendix Section B.1.
+As briefly mentioned in Section 2, the probability-optimal set of policies with respect to φmay be empty.
+The same is true for our updated definition of Π∗that contain policies that achieve Vmax. In the case of this
+non-existence, Assumption 3.1 does not hold, and a policy that optimizes 5 will prioritize improving Vπat
+the potential expense of Rπ. We provide an extended discussion of this consequence in Section B.2.
+Empirical Considerations. Since the conditions for Assumption 3.1 are often unknown, there may not be
+a verifiable way to know that that our learned policy is maximizing Vπ. Because of this, we will treat λas a
+tunable hyperparameter that allows a user to trade off the relative importance of empirically satisfying the
+LTL constraint. There are a number of strategies one can use to find an appropriate λ: for example, one can
+iteratively increase λuntil a desired LTL reward is achieved. In our experiments, we show an example of
+this trade off, and notice that the trade off lessens in severity once λexceeds a value that enables learning
+LTL-satisfying policies (table 2).
+4 Cycle Experience Replay (CyclER)
+To distinguish between the MDP’s reward function and the eventual-discounting proxy reward in 3, we write
+the MDP reward function r(s,a)asrMDP(s,a). In Deep RL settings, we maximize objective 5 using the
+reward function rDUAL (st,bt,at) =γtrMDP(st,at) + ΓtλrLTL(bt).
+However, optimizing objective 5 is challenging due to the sparsity of rLTL.rLTLis nonzero only when an
+accepting state in Bis visited, which may require a long, precise sequence of actions.
+Consider the FlatWorld MDP and LDBA in Figure 1. The MDP’s reward function incentivizes visiting the
+small purple regions in the world. Under rLTL, a policy will receive no reward until it completes the entire
+task of avoiding blue and visiting the red, yellow, and green regions through random exploration. If rMDPis
+dense, a policy may fall into an unsatisfactory ‘local optimum’ by optimizing for rMDPit receives early during
+learning, and ignore rLTLentirely. In Figure 2, we see that a policy trained on rDUALmakes such an error.
+We seek to address this shortcoming by automatically shapingrLTLso that a more dense reward for φis
+available during training. Below, we present our approach, which exploits the known structure of the LDBA
+Band cycles within Bthat visit accepting states.
+4.1 Rewarding Accepting Cycles in B
+Figure 2: Trajectories from un-
+shapedrDUAL(left) and CyclER
+rDUAL(right) for the formula
+G(F(r)&F(g)&F(y)) &G(¬b).By definition of LTL satisfaction (def. 2.3), a trajectory must repeatedly
+visit an accepting state b∗in an LDBA. In the context of the automaton
+itself, that means that an accepting trajectory will traverse an accepting
+pathfrom the initial state to an accepting state, and then repeatedly
+traverseaccepting cycles within Bthat continually visit accepting states.
+Definition 4.1 (Accepting Initial Path (AIP)) .An accepting initial
+path in Bis a set of valid transitions (bi,ν,bj)(i.e., the predicate νthat
+transitions bitobj) inBthat starts at the initial state b0and ends at an
+accepting state b∗
+k∈B∗.
+Definition 4.2 (Accepting Cycle (AC)) .An accepting cycle in Bis a set of valid transitions (bi,ν,bj)inB
+that start and end at accepting states b∗
+k,b∗
+l∈B∗.1
+Our key insight is that we can use accepting paths and cycles in Bto shaperLTL. Instead of only providing
+reward when an accepting state in Bis visited (as per previous approaches e.g. Voloshin et al. (2023)), we
+reward progress within an accepting path or cycle. In our example from fig 1, if we reward each transition in
+1Our usage of the word “cycle” is not a cycle in the traditional sense of graph search, but instead refers to paths that connect
+two accepting states in B(allowing for “cyclical” acceptance).
+5Under review as submission to TMLR
+the initial path{1,2,3,0}and the cycle with the same states, the agent would receive rewards for visiting
+the red region, then yellow, then green, then for returning to red, and so on.
+Multiple accepting paths and cycles may exist in B. The path and cycle that is used to shape rLTLcannot
+be picked arbitrarily, since they may be infeasible under the dynamics of the MDP. For example, the cycle
+{1,2,0}in Figure 1 cannot effectively shape rLTLbecause it is impossible to be both in the yellow and green
+regions at the same time.
+4.2 Reward Shaping with CyclER
+CyclER is a reward function that automatically selects paths and cycles to shape rLTLbased on collected
+experience.
+Definition 4.3 (Minimal AIP (MAIP)) .A minimal accepting initial path for accepting state b∗
+kis an AIP
+that does not contain a subcycle for any node biin the path where bi̸=b∗
+k.
+Definition 4.4 (Minimal AC (MAC)) .A minimal accepting cycle cfor accepting states b∗
+kandb∗
+lis an AC
+that does not contain a subcycle for any node biin the cycle where bi/∈{b∗
+k,b∗
+l}.
+We provide CyclER with all MAIPs and MACs in an LDBA using Depth-First Search with backtracking (see
+Appendix Algs. 2 and 3). Let PandCbe the set of MAIPs and MACs, respectively.
+We also maintain a frontier eof visited transitions in Bat each timestep in a trajectory that ensures reward
+will only be given once per transition until an accepting state is visited. In particular, we set e[(bi,ν,bi)] = 1
+when a transition (bi,ν,bi)is taken and reset all e≡0whenbj∈B∗. Policies that use CyclER observe s,b,
+andeas their current state.
+Now we describe the CyclER reward computation. We first collect a complete trajectory τinduced byMφ
+π
+for a given policy π. Then, at each timestep tfrom 0to|τ|−1, we compute rCfor every path in Pif we
+have not yet visited an accepting state, or every cycle in Cif we have. We will abuse notation slightly and
+usecto refer to elements in either PorC:
+rC(bt,st+1,bt+1,e,c) =/braceleftigg
+1
+|c|if(b,LM(st+1),bt+1)∈cande[b,LM(st+1),bt+1] = 0
+0otherwise(6)
+This function rewards every transition taken in a given c. In other words, when an agent “gets closer” to an
+accepting state by progressing along a path or cycle, we reward that progress once per visit to an accepting
+state. To account for cof varying length, rewards are normalized by the length |c|.
+If we visit an accepting state b∗or reach the end of a trajectory, we retroactively assign rewards to the
+timesteps that preceded this point, up to the most recent accepting state visit (if one exists). Assigned
+rewards correspond to the cycle with the highest total reward for that partial trajectory. Put simply, CyclER
+picks the ‘best’ cycle for a partial trajectory and uses it to shape reward. Even if a trajectory does not
+manage to visit an accepting state, CyclER will still provide reward if it was able to take anytransition along
+anyMAIP. The specifics are given in Algorithm 1.
+We denote the rewards returned from Alg. 1 as rCyclER.rCyclERcan be used in place of the unshaped rLTL
+in function 3 to provide a more dense reward for τ.
+Theorem 4.1 (Informal) .By replacing rLTLwithrCyclERin 3, the solution to problem 5 remains (approxi-
+mately) probability optimal in satisfying the LTL formula φ. See Appendix Lemma C.3 for the proof.
+4.3 CyclER with Quantitative Semantics
+A number of recent works have explored the usage of Quantitative Semantics (QS) to help shape rewards for
+temporal logic tasks (Li et al., 2017; Balakrishnan & Deshmukh, 2019; Jothimurugan et al., 2021; Kalagarla
+et al., 2021; Ikemoto & Ushio, 2022). QS defines a set of rules for temporal logic which extend Boolean logic to
+operations over real values. Using QS, we can take real-valued signals from our atomic propositions x∈AP,
+and compose them with the QS version of our logical connectives (&, ¬and→) and temporal operators
+6Under review as submission to TMLR
+((X),(G),(F), and (U)) to compute a real-valued signal for how close a trajectory comes to satisfying a
+specification. We will refer to this computation as the quantitative evaluation of a trajectory with respect to
+an LTL task. The exact quantitative semantics of the aforementioned LTL operations are provided in Fig. 9
+of the Appendix.
+Algorithm 1: Cycle Experience Replay ( CyclER )
+Input: Trajectory τ,B∗, cyclesC, pathsP
+Initialize matrix RCsizemax(|C|,|P|)×(|τ|−1);
+InitializerCyclER to an array of size (|τ|−1);
+Initializej= 0;
+foreacht= 0,...,|τ|−1do
+ifj= 0then
+foreach Pathpi∈Pdo
+RC[i,t] =rC(bt,st+1,bt+1,et,pi)
+else
+foreach Cycleci∈Cdo
+RC[i,t] =rC(bt,st+1,bt+1,et,ci)
+ifbt+1∈B∗ort+ 1 =|τ|then
+Selecti=argmaxi∈|C|(/summationtextt
+j′=jRC[i,j′]);
+foreacht′fromjtot+ 1do
+rCyclER [t′] =RC[i,t′]
+j=t+ 1;
+returnrCyclER ;Unfortunately, there are several shortcomings of “off-
+the-shelf” usage of QS as a reward function. Quanti-
+tative evaluation produces a single value for an entire
+trajectory, which makes credit assignment for indi-
+vidual transitions difficult. More pressingly, quanti-
+tative evaluation of a finite trace frequently produces
+values that do not correlate with visits to accept-
+ing states in B, especially for LTL formulae with
+indefinite horizons or arbitrarily ordered sub-goals.
+Existing approaches have circumvented these issues
+by using QS for explicitly time-bounded temporal
+logics with simple tasks (Kalagarla et al., 2021; Bal-
+akrishnan & Deshmukh, 2019), or by considering
+fragments of LTL that can be reasoned about as
+finite sequences of ordered sub-tasks (Jothimurugan
+et al., 2021). In what follows, we show that CyclER
+easily incorporates QS for more effective LTL reward
+shaping by considering each transition in Bas an
+independently evaluable sub-task.
+We first define some notation. In order to use QS,
+we assign robustness measures (real-valued signals) fx:S→Rto each atomic proposition x∈AP, wherex
+is true when fx(s)≥cx(a constant threshold). We will follow standard practice and notate the quantitative
+evaluation of an LTL formula φover a trajectory τasρφ(τ), whereφis true when ρφ(τ)>0. We also define
+a maximum and minimum for ρasρmaxandρmin, respectively.
+Now we explain how to incorporate QS into CyclER. At a given state binB, we can think of our sub-task
+as taking the next transition in the accepting path or cycle currently under consideration by CyclER. We
+need to only consider one transition at a time because CyclER reasons about each accepting path and cycle
+independently. Our approach to incorporating QS builds on this idea by rewarding quantitative progress
+towards taking the next transition in a path or cycle. Importantly, each transition νinBis associated with
+an atomic predicate, which can be quantitatively evaluated at individual states rather than entire trajectories
+(i.e.,ρν(s) :S→R). If we move from state stos′inM, we can evaluate how much closer we are to satisfying
+the predicate of our next transition νby taking the difference in quantitative evaluation between successive
+states:ρν(s′)−ρν(s). This measure of progress is used to shape reward.
+Specifically, our approach to incorporating QS uses the following reward function for a given cycle or initial
+pathc. We usec[b]to refer to the transition predicate in cwith parent node b:
+rqs(s,b,s′,b′,e,c) =/braceleftiggρc[b](s′)−ρc[b](s)
+(ρmax−ρmin)∗|c|if(b,LM(st+1),bt+1)∈cande[b,LM(st+1),bt+1] = 0
+0 otherwise(7)
+We useρmaxandρminto normalize the quantitative progress made towards taking a transition2. Reward
+function 7 acts as a direct substitute to function 6 in Alg. 1 to compute rCyclER. Unlike function 6, function 7
+allows for dense reward even in LDBAs with few transitions. In our experiments (section 5), we show
+that incorporating quantitative semantics into CyclER for shaping rLTLleads to improvement in empirical
+performance when compared to existing methods of using QS. We provide the full QS for LTL, along with
+additional explanation and examples for CyclER+QS in Appendix E.
+2We note that the reward in fn. 7 is most well-shaped when the robustness measures for all x∈APare of similar scale, but
+we make no such assumptions for the sake of generality.
+7Under review as submission to TMLR
+5 Experiments
+We demonstrate experimental results in several domains with continuous state and action spaces on LTL tasks
+of varying complexity. We seek to answer the following questions: (1)Does CyclER learn satisfactory policies
+and avoid ignoring rLTLin favor ofrMDP?(2)Does a policy that optimizes the dual reward formulation in
+rDUALgain higher rMDPthan a policy that only seeks to satisfy the LTL constraint? (3)How does the value
+ofλinrDUALaffect the performance of the learned policy?
+5.1 Experimental Domains and Tasks
+In our experiments, we evaluate the efficacy of CyclER on indefinite-horizon ( ω-regular) tasks expressible
+by LTL. We use environments where rMDPdoes not explicitly correlate with rLTLin order to effectively
+distinguish between policies that learn to only optimize rMDPand policies that learn to satisfy the LTL
+specification.
+FlatWorld The FlatWorld domain (1) is a two dimensional world with continuous state and action spaces.
+The agent (denoted by a green dot) starts at (-1, -1). The agent’s state, denoted by x, is updated by an action
+aviax′=x+a/10wherex∈R2anda∈[0,1]2. There exists a set of randomly generated purple ‘bonus
+regions’, which offer a small reward when visited. We use the specification from Figure 1 as our LTL task.
+ZonesEnv We use the Zones environment from the MuJoCo-based Safety-Gymnasium suite of environ-
+ments (Ji et al., 2023). In this domain, a robot must navigate the environment, which includes four differently
+colored goal regions and ‘hazard’ areas that offer a small negative reward. The robot receives an observation
+of lidar data that detects the presence of nearby objects at each timestep. The LTL task description instructs
+the agent to oscillate amongst visiting the four colored regions.
+ButtonsEnv We use the Buttons environment, also from Safety-Gymnasium. This domain is a more
+challenging version of the Zones environment, where an agent must press a number of small buttons in a larger
+space while avoiding cube-shaped ‘gremlins’ that move in a fixed circular path. The LTL task description
+instructs the agent to press two specific buttons infinitely often, while avoiding making contact with gremlins.
+Unlike the ZonesEnv, ‘bonus’ regions are scattered around the environment, offering a small reward if visited.
+5.2 Implementation Details and Baselines
+We use entropy-regularized PPO (Schulman et al., 2017) with a Gaussian policy over the action space as our
+policy class.
+Although we are not aware of an existing approach that considers reward optimization under general LTL
+constraints for deep RL, we compare against a number of existing reward methods for temporal logic-guided RL
+asrLTLin ourrDUALformulation. We use a baseline policy trained using the LCER method (Voloshin et al.,
+2023), a state-of-the-art approach to RL for general LTL that uses an unshaped reward with counterfactual
+experience replay to improve the sample efficiency of learning. Additionally, we compare against the LCER
+baseline, but trained onlyon the unshaped LTL reward function rLTL, in order to observe the performance of
+a policy that does not get ‘distracted’ during training by rMDP.
+In the ZonesEnv and ButtonsEnv domains, where the dynamics are more complex, we define simple robustness
+measures for each atomic proposition and use the QS version of CyclER defined in section 4.3 . In
+these environments, we compare against two additional baselines that also use QS for reward shaping and are
+computable for infinite-horizon LTL tasks: a TLTL-based reward (Li et al., 2017) and BHNR (Balakrishnan
+& Deshmukh, 2019). For each baseline, λwas chosen to be that which led to best performance (on unshaped
+rLTL, usingrMDPas a tie-breaker) from a hyperparameter sweep. The robustness measures used in these
+domains along with all hyperparameters used during training are available in Appendix G.
+5.3 Results
+(1) Does CyclER learn satisfying policies and prevent ignoring rLTL?Yes - our results demonstrate
+that CyclER achieves significant improvement in performance in satisfying the LTL task when compared to
+8Under review as submission to TMLR
+FlatWorld ZonesEnv ButtonsEnv
+B∗visitsrMDPB∗visitsrMDPB∗visitsrMDP
+CyclER 2.0±0.545.3±8.51.8±0.4−27.8±4.552.6±0.330.4±5.6
+LCER 0.0±0.0 103.4±76.60.0±0.0−3.8±1.90.0±0.0 118.8±143.2
+LCER, norMDP 0.8±0.4 30.8±10.10.0±0.0−2.7±0.90.6±0.4 13.2±8.53
+TLTL - - 0.0±0.0−4.0±2.20.0±0.0 9.6±6.7
+BHNR - - 0.0±0.0−0.8±0.60.0±0.0 35.8±7.9
+Table 1: Reward average and standard deviation achieved on each domain with an extended horizon. B∗
+visits identifies the average number of visits to an accepting state in Bachieved for a trajectory from π, and
+rMDPrefers to the average MDP reward collected during a trajectory.
+FlatWorld
+ ZonesEnv
+ ButtonsEnv
+Figure 3: Training curves showing unshaped rLTL(top) andrMDP(bottom) performance averaged over 5
+random seeds. Each point is the mean of 10 stochastic policy rollouts.
+our baseline methods. In Figure 3, we plot the learning curves for both the unshapedrLTLandrMDP. We
+record the (stochastic) performance of the best policies found during training on an extended horizon to
+enable repeated visits to the accepting state, and present the results (averaged over 50 rollouts) in Table 1.
+We find that unshaped rewards (LCER) quickly ignore rLTLin most trials. From Table 1, we see that the
+LCER baseline even without rMDPwas not able to accomplish the LTL task as consistently as CyclER,
+even when successful in visiting an accepting state. This implies that reward shaping is critical for LTL-
+guided RL even in settings where no rMDPis present. In ZonesEnv and ButtonsEnv, the TLTL and BHNR
+baselines, which are not suited to infinite-horizon tasks with multiple unordered subgoals, learned behavior
+that optimized their respective QS-shaped LTL rewards but did not correlate with task satisfaction (zero
+rLTLachieved in Fig. 3). CyclER with QS, on the other hand, quickly learned to achieve the tasks in these
+two domains. Most meaningfully, CyclER is able to repeatedly visit the accepting state in all domains
+(as evidenced by Table 1), demonstrating that our technique enables consistent-behaving policies that can
+indefinitely traverse accepting cycles. We additionally provide a qualitative analysis of learned behavior in
+the FlatWorld domain in Appendix D.
+(2) Does optimizing rDUALimproverMDP?To evaluate this question, we conducted an ablation study
+where we trained a CyclER-based policy in the FlatWorld domain, making it completely unaware of rMDP,
+and then evaluated its performance to observe if the rDUALformulation led to a nontrivial difference in
+behavior between policies. We found that the rDUAL-optimizing CyclER policy achieved a B∗visits value of
+2.0 (std. dev. 0.3) and MDP reward of 45.3 (std. dev. 8.5), and the rLTL-only policy achieved a B∗visits
+9Under review as submission to TMLR
+value of 2.2 (std. dev. 0.4) and MDP reward of 27.4 (std. dev. 0.7). Optimizing rDUALdoes lead to an
+improvement in rMDP, albeit at the potential cost of LTL satisfaction. We provide a qualitative comparison
+of the two learned policies in Appendix D.
+FlatWorld
+B∗visitsrMDP
+λ= 100 0.0±0.0 62.7±4.36
+λ= 200 0.0±2.0 69.6±4.1
+λ= 300 2.0±0.4 37.2±9.0
+λ= 400 2.1±0.4 34.3±7.3
+Table 2: Performance results for
+CyclER with differing λ.(3) How does varying λaffect the resulting policy? In Table 2, we
+report results from a study where we vary the value of λinrDUALfor the
+FlatWorld domain experiment. We observe, as expected, a tradeoff in the
+performance of LTL satisfaction and rMDPasλincreases. However, we
+notice that the tradeoff diminishes once a value for λis reached that enables
+LTL-satisfying behavior. This supports our intuition that λcan effectively
+be used as a hyperparameter to trade off the empirical performance of
+LTL satisfaction and the MDP reward achieved by a policy.
+6 Related Work
+Temporal Logic-Constrained Policy Optimization. Previous work
+has explored cost-optimal control under linear temporal logic constraints
+with known dynamics (Ding et al., 2014; Cai et al., 2021). More recently, interest has emerged in RL-based
+approaches to logic-constrained policy optimization. Voloshin et al. (2022) provides an exact solution method
+for policy optimization under general LTL constraints in discrete settings where the dynamics are unknown
+by assuming a lower bound on transition probabilities in M. Other works focus on Signal Temporal Logic
+(STL) and are either designed for discrete spaces (Kalagarla et al., 2021) or lack guarantees (Ikemoto &
+Ushio, 2022). Our CyclER-QS method can be viewed as an approach designed for a subset of STL, with
+improved performance by our leveraging of the LDBA during policy learning.
+RL with Temporal Logic Objectives. In contrast to settings with both temporal logic constraints and
+reward functions, a significant amount of work has been devoted to developing RL approaches with temporal
+logic specification(s) as the lone objective. Early efforts focused primarily on using Q-learning-style methods
+over augmentations of M(Sadigh et al., 2014; Aksaray et al., 2016; Venkataraman et al., 2020; Cai et al.,
+2021). Subsequent works (Hasanbeig et al., 2020; Toro Icarte et al., 2022; Camacho et al., 2019; Jothimurugan
+et al., 2019) extend temporal logic-guided RL to deep RL settings. In developing the theoretical limitations
+of temporal-logic guided RL, (Yang et al., 2022; Alur et al., 2022) show that guarantees on RL for LTL
+cannot in general be made. To obtain (approximate) guarantees on learning, existing works have made
+assumptions on the environment dynamics (Fu & Topcu, 2014; Voloshin et al., 2022; Wolff et al., 2012) or
+finitized the policy’s horizon through discounting or recurrence time (Alur et al., 2023; Perez et al., 2023). In
+continuous spaces, prior works provide guarantees that the optimal policy under a proxy objective will satisfy
+the original logical specification of interest (Voloshin et al., 2023; Hasanbeig et al., 2020; Jothimurugan et al.,
+2021; Camacho et al., 2019), similar to the guarantees made in our work.
+To handle longer-horizon specifications, previous endeavors proposed compositional RL approaches that
+leverage the DAG-like structure for finitary fragments of temporal logic (Jothimurugan et al., 2021; Bonassi
+et al., 2023). Other works take a multi-task RL approach that learns subtasks, which allows for the completion
+of extended-horizon tasks and unseen tasks over the same APset (Vaezipoor et al., 2021; Qiu et al., 2023;
+León et al., 2022; Liu et al., 2022). An extensive body of work uses quantitative signals to provide denser
+feedback for temporal logic objectives that aids policy learning in longer-horizon task settings Li et al. (2017);
+Balakrishnan & Deshmukh (2019); Ikemoto & Ushio (2022); Krasowski et al. (2023). These quantative signals,
+which are often captured in Signal Temporal Logic, are also used by our QS approach introduced in section 4.3.
+However, the usage of these quantitative signals leads to a number of pitfalls in deep RL that CyclER is able
+to avoid, as discussed in section 4.3 and Appendix E. More recent work considers problem settings where
+there is uncertainty in an agent’s knowledge of atomic propositions and proposes a belief-based approach to
+policy learning in this setting (Li et al., 2024). Our approach is able to handle indefinite-horizon specifications
+for single tasks and we see the integration of our reward shaping into both multi-task frameworks and noisy
+environments as exciting directions for future work.
+Constrained Policy Optimization. The broader constrained policy optimization works mostly relate to
+the constrained Markov Decision Process (CMDP) framework (Le et al., 2019; Achiam et al., 2017; Altman,
+10Under review as submission to TMLR
+2021), which enforce penalties over expected constraint violations rather than absolute constraint violations.
+In contrast, our work aims to satisfy absolute constraints in the form of LTL.
+7 Conclusion
+This paper proposes a novel approach to finding policies that are both reward-maximal and probability-optimal
+with respect to an LTL constraint. Specifically, we introduce CyclER, an experience replay technique that
+automatically shapes the LTL proxy reward based on cycles within a Büchi automaton, alleviating a sparsity
+issue that often plagues LTL-driven RL approaches. CyclER enables LTL-constrained policy optimization in
+continuous spaces using function approximators. We extend CyclER to effectively use quantitative semantics
+for full LTL and demonstrate its success empirically.
+There are numerous directions for future work. For example, the reward shaping idea behind CyclER can be
+extended to other classes of logical specifications, such as Reward Machines (Toro Icarte et al., 2022). We
+are also interested in applying CyclER to accelerate learning in multi-task LTL settings, such as (Vaezipoor
+et al., 2021; Qiu et al., 2023).
+References
+David Abel, Will Dabney, Anna Harutyunyan, Mark K Ho, Michael Littman, Doina Precup,
+and Satinder Singh. On the expressivity of markov reward. In Advances in Neural In-
+formation Processing Systems , 2021. URL https://proceedings.neurips.cc/paper/2021/file/
+4079016d940210b4ae9ae7d41c4a2065-Paper.pdf .
+Joshua Achiam, David Held, Aviv Tamar, and Pieter Abbeel. Constrained policy optimization. In International
+conference on machine learning , pp. 22–31. PMLR, 2017.
+DeryaAksaray, AustinJones, ZhaodanKong, MacSchwager, andCalinBelta. Q-learningforrobustsatisfaction
+of signal temporal logic specifications. In 55th IEEE Conference on Decision and Control, CDC 2016, Las
+Vegas, NV, USA, December 12-14, 2016 , pp. 6565–6570. IEEE, 2016. doi: 10.1109/CDC.2016.7799279.
+URL https://doi.org/10.1109/CDC.2016.7799279 .
+Eitan Altman. Constrained Markov decision processes . Routledge, 2021.
+Rajeev Alur, Suguman Bansal, Osbert Bastani, and Kishor Jothimurugan. A framework for transforming spec-
+ifications in reinforcement learning. In Jean-François Raskin, Krishnendu Chatterjee, Laurent Doyen, and
+Rupak Majumdar (eds.), Principles of Systems Design - Essays Dedicated to Thomas A. Henzinger on the
+Occasion of His 60th Birthday , volume 13660 of Lecture Notes in Computer Science , pp. 604–624. Springer,
+2022. doi: 10.1007/978-3-031-22337-2\_29. URL https://doi.org/10.1007/978-3-031-22337-2_29 .
+Rajeev Alur, Osbert Bastani, Kishor Jothimurugan, Mateo Perez, Fabio Somenzi, and Ashutosh Trivedi.
+Policy synthesis and reinforcement learning for discounted LTL. In Constantin Enea and Akash Lal (eds.),
+Computer Aided Verification - 35th International Conference, CAV 2023, Paris, France, July 17-22, 2023,
+Proceedings, Part I , volume 13964 of Lecture Notes in Computer Science , pp. 415–435. Springer, 2023. doi:
+10.1007/978-3-031-37706-8\_21. URL https://doi.org/10.1007/978-3-031-37706-8_21 .
+Christel Baier and Joost-Pieter Katoen. Principles of model checking . The MIT Press, Cambridge, Mass,
+2008. ISBN 978-0-262-02649-9.
+Anand Balakrishnan and Jyotirmoy V. Deshmukh. Structured reward shaping using signal temporal logic
+specifications. In 2019 IEEE/RSJ International Conference on Intelligent Robots and Systems, IROS 2019,
+Macau, SAR, China, November 3-8, 2019 , pp. 3481–3486. IEEE, 2019. doi: 10.1109/IROS40897.2019.
+8968254. URL https://doi.org/10.1109/IROS40897.2019.8968254 .
+Luigi Bonassi, Giuseppe De Giacomo, Marco Favorito, Francesco Fuggitti, Alfonso Emilio Gerevini, and Enrico
+Scala. Planning for temporally extended goals in pure-past linear temporal logic. In Sven Koenig, Roni
+Stern, and Mauro Vallati (eds.), Proceedings of the Thirty-Third International Conference on Automated
+11Under review as submission to TMLR
+Planning and Scheduling, July 8-13, 2023, Prague, Czech Republic , pp. 61–69. AAAI Press, 2023. doi:
+10.1609/ICAPS.V33I1.27179. URL https://doi.org/10.1609/icaps.v33i1.27179 .
+Alper Kamil Bozkurt, Yu Wang, Michael M Zavlanos, and Miroslav Pajic. Control synthesis from linear
+temporallogicspecificationsusingmodel-freereinforcementlearning. In 2020 IEEE International Conference
+on Robotics and Automation (ICRA) , pp. 10349–10355. IEEE, 2020.
+Mingyu Cai, Shaoping Xiao, Zhijun Li, and Zhen Kan. Optimal probabilistic motion planning with potential
+infeasible ltl constraints. IEEE Transactions on Automatic Control , 68(1):301–316, 2021.
+Alberto Camacho, Rodrigo Toro Icarte, Toryn Q. Klassen, Richard Valenzano, and Sheila A. McIlraith. Ltl
+and beyond: Formal languages for reward function specification in reinforcement learning. In Proceedings
+of the Twenty-Eighth International Joint Conference on Artificial Intelligence, IJCAI-19 , pp. 6065–6073.
+International Joint Conferences on Artificial Intelligence Organization, 7 2019. doi: 10.24963/ijcai.2019/840.
+URL https://doi.org/10.24963/ijcai.2019/840 .
+Giuseppe De Giacomo, Marco Favorito, Luca Iocchi, Fabio Patrizi, and Alessandro Ronca. Temporal Logic
+Monitoring Rewards via Transducers. In Proceedings of the 17th International Conference on Principles
+of Knowledge Representation and Reasoning , pp. 860–870, 9 2020. doi: 10.24963/kr.2020/89. URL
+https://doi.org/10.24963/kr.2020/89 .
+Xuchu Ding, Stephen L. Smith, Calin Belta, and Daniela Rus. Optimal control of markov decision processes
+with linear temporal logic constraints. IEEE Transactions on Automatic Control , 59(5):1244–1257, May
+2014. ISSN 0018-9286, 1558-2523. doi: 10.1109/TAC.2014.2298143.
+Alexandre Duret-Lutz, Etienne Renault, Maximilien Colange, Florian Renkin, Alexandre Gbaguidi Aisse,
+Philipp Schlehuber-Caissier, Thomas Medioni, Antoine Martin, Jérôme Dubois, Clément Gillard, and
+Henrich Lauko. From Spot 2.0 to Spot 2.10: What’s new? In Proceedings of the 34th International
+Conference on Computer Aided Verification (CAV’22) , volume 13372 of Lecture Notes in Computer Science ,
+pp. 174–187. Springer, August 2022. doi: 10.1007/978-3-031-13188-2_9.
+Georgios E. Fainekos and George J. Pappas. Robustness of temporal logic specifications for continuous-
+time signals. Theor. Comput. Sci. , 410(42):4262–4291, 2009. doi: 10.1016/J.TCS.2009.06.021. URL
+https://doi.org/10.1016/j.tcs.2009.06.021 .
+Jie Fu and Ufuk Topcu. Probably approximately correct MDP learning and control with temporal logic
+constraints. In Dieter Fox, Lydia E. Kavraki, and Hanna Kurniawati (eds.), Robotics: Science and Systems
+X, University of California, Berkeley, USA, July 12-16, 2014 , 2014. doi: 10.15607/RSS.2014.X.039. URL
+http://www.roboticsproceedings.org/rss10/p39.html .
+David Gundana and Hadas Kress-Gazit. Event-based signal temporal logic synthesis for single and multi-
+robot tasks. IEEE Robotics Autom. Lett. , 6(2):3687–3694, 2021. doi: 10.1109/LRA.2021.3064220. URL
+https://doi.org/10.1109/LRA.2021.3064220 .
+Ernst Moritz Hahn, Guangyuan Li, Sven Schewe, Andrea Turrini, and Lijun Zhang. Lazy probabilistic model
+checking without determinisation. arXiv preprint arXiv:1311.2928 , 2013.
+Mohammadhosein Hasanbeig, Alessandro Abate, and Daniel Kroening. Logically-constrained reinforcement
+learning, 2018. URL https://arxiv.org/abs/1801.08099 .
+Mohammadhosein Hasanbeig, Daniel Kroening, and Alessandro Abate. Deep reinforcement learning with
+temporal logics. In International Conference on Formal Modeling and Analysis of Timed Systems , pp. 1–22.
+Springer, 2020.
+Junya Ikemoto and Toshimitsu Ushio. Deep reinforcement learning under signal temporal logic constraints
+using lagrangian relaxation. IEEE Access , 10:114814–114828, 2022. doi: 10.1109/ACCESS.2022.3218216.
+URL https://doi.org/10.1109/ACCESS.2022.3218216 .
+12Under review as submission to TMLR
+Jiaming Ji, Borong Zhang, Jiayi Zhou, Xuehai Pan, Weidong Huang, Ruiyang Sun, Yiran Geng, Yifan Zhong,
+Juntao Dai, and Yaodong Yang. Safety-gymnasium: A unified safe reinforcement learning benchmark.
+arXiv preprint arXiv:2310.12567 , 2023.
+Kishor Jothimurugan, Rajeev Alur, and Osbert Bastani. A composable specification language for reinforcement
+learning tasks. Advances in Neural Information Processing Systems , 32, 2019.
+Kishor Jothimurugan, Suguman Bansal, Osbert Bastani, and Rajeev Alur. Compositional reinforcement
+learning from logical specifications. In Marc’Aurelio Ranzato, Alina Beygelzimer, Yann N. Dauphin,
+Percy Liang, and Jennifer Wortman Vaughan (eds.), Advances in Neural Information Processing Systems
+34: Annual Conference on Neural Information Processing Systems 2021, NeurIPS 2021, December 6-
+14, 2021, virtual , pp. 10026–10039, 2021. URL https://proceedings.neurips.cc/paper/2021/hash/
+531db99cb00833bcd414459069dc7387-Abstract.html .
+Krishna C. Kalagarla, Rahul Jain, and Pierluigi Nuzzo. Cost-optimal control of markov decision processes
+under signal temporal logic constraints. In 2021 Seventh Indian Control Conference (ICC) , pp. 317–322,
+2021. doi: 10.1109/ICC54714.2021.9703164.
+Hanna Krasowski, Prithvi Akella, Aaron D. Ames, and Matthias Althoff. Safe reinforcement learning with
+probabilistic guarantees satisfying temporal logic specifications in continuous action spaces. In 62nd
+IEEE Conference on Decision and Control, CDC 2023, Singapore, December 13-15, 2023 , pp. 4372–4378.
+IEEE, 2023. doi: 10.1109/CDC49753.2023.10383601. URL https://doi.org/10.1109/CDC49753.2023.
+10383601 .
+Jan Křetínsk` y, Tobias Meggendorfer, and Salomon Sickert. Owl: a library for ω-words, automata, and ltl. In
+International Symposium on Automated Technology for Verification and Analysis , pp. 543–550. Springer,
+2018.
+Abolfazl Lavaei, Fabio Somenzi, Sadegh Soudjani, Ashutosh Trivedi, and Majid Zamani. Formal controller
+synthesisforcontinuous-spacemdpsviamodel-freereinforcementlearning. In 11th ACM/IEEE International
+Conference on Cyber-Physical Systems, ICCPS 2020, Sydney, Australia, April 21-25, 2020 , pp.98–107.IEEE,
+2020. doi: 10.1109/ICCPS48487.2020.00017. URL https://doi.org/10.1109/ICCPS48487.2020.00017 .
+Hoang Le, Cameron Voloshin, and Yisong Yue. Batch policy learning under constraints. In International
+Conference on Machine Learning , pp. 3703–3712. PMLR, 2019.
+Borja G. León, Murray Shanahan, and Francesco Belardinelli. In a nutshell, the human asked for this:
+Latent goals for following temporal specifications. In The Tenth International Conference on Learning
+Representations, ICLR 2022, Virtual Event, April 25-29, 2022 . OpenReview.net, 2022. URL https:
+//openreview.net/forum?id=rUwm9wCjURV .
+Andrew C. Li, Zizhao Chen, Toryn Q. Klassen, Pashootan Vaezipoor, Rodrigo Toro Icarte, and Sheila A.
+McIlraith. Reward machines for deep RL in noisy and uncertain environments. CoRR, abs/2406.00120,
+2024. doi: 10.48550/ARXIV.2406.00120. URL https://doi.org/10.48550/arXiv.2406.00120 .
+Xiao Li, Cristian-Ioan Vasile, and Calin Belta. Reinforcement learning with temporal logic rewards. In 2017
+IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS) , pp. 3834–3839. IEEE,
+2017.
+Jason Xinyu Liu, Ankit Shah, Eric Rosen, George Konidaris, and Stefanie Tellex. Skill transfer for temporally-
+extended task specifications. CoRR, abs/2206.05096, 2022. doi: 10.48550/ARXIV.2206.05096. URL
+https://doi.org/10.48550/arXiv.2206.05096 .
+Oded Maler and Dejan Nickovic. Monitoring temporal properties of continuous signals. In Yassine Lakhnech
+and Sergio Yovine (eds.), Formal Techniques, Modelling and Analysis of Timed and Fault-Tolerant Systems,
+Joint International Conferences on Formal Modelling and Analysis of Timed Systems, FORMATS 2004 and
+Formal Techniques in Real-Time and Fault-Tolerant Systems, FTRTFT 2004, Grenoble, France, September
+22-24, 2004, Proceedings , volume 3253 of Lecture Notes in Computer Science , pp. 152–166. Springer, 2004.
+doi: 10.1007/978-3-540-30206-3\_12. URL https://doi.org/10.1007/978-3-540-30206-3_12 .
+13Under review as submission to TMLR
+Mateo Perez, Fabio Somenzi, and Ashutosh Trivedi. A PAC learning algorithm for LTL and omega-
+regular objectives in mdps. CoRR, abs/2310.12248, 2023. doi: 10.48550/ARXIV.2310.12248. URL
+https://doi.org/10.48550/arXiv.2310.12248 .
+Amir Pnueli. The temporal logic of programs. In 18th Annual Symposium on Foundations of Computer
+Science (sfcs 1977) , pp. 46–57. ieee, 1977.
+Wenjie Qiu, Wensen Mao, and He Zhu. Instructing goal-conditioned reinforcement learning agents
+with temporal logic objectives. In Alice Oh, Tristan Naumann, Amir Globerson, Kate Saenko,
+Moritz Hardt, and Sergey Levine (eds.), Advances in Neural Information Processing Systems 36: An-
+nual Conference on Neural Information Processing Systems 2023, NeurIPS 2023, New Orleans, LA,
+USA, December 10 - 16, 2023 , 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/
+7b35a69f434b5eb07ed1b1ef16ace52c-Abstract-Conference.html .
+Dorsa Sadigh, Eric S Kim, Samuel Coogan, S Shankar Sastry, and Sanjit A Seshia. A learning based approach
+to control synthesis of markov decision processes for linear temporal logic specifications. In 53rd IEEE
+Conference on Decision and Control , pp. 1091–1096. IEEE, 2014.
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy optimization
+algorithms. CoRR, abs/1707.06347, 2017. URL http://arxiv.org/abs/1707.06347 .
+Salomon Sickert, Javier Esparza, Stefan Jaax, and Jan Křetínský. Limit-deterministic büchi automata for
+linear temporal logic. In Swarat Chaudhuri and Azadeh Farzan (eds.), Computer Aided Verification , pp.
+312–332, Cham, 2016. Springer International Publishing. ISBN 978-3-319-41540-6.
+Rodrigo Toro Icarte, Toryn Q. Klassen, Richard Valenzano, and Sheila A. McIlraith. Reward machines:
+Exploiting reward function structure in reinforcement learning. J. Artif. Int. Res. , 73, may 2022. ISSN
+1076-9757. doi: 10.1613/jair.1.12440. URL https://doi.org/10.1613/jair.1.12440 .
+Pashootan Vaezipoor, Andrew C. Li, Rodrigo Toro Icarte, and Sheila A. McIlraith. Ltl2action: Generalizing
+LTL instructions for multi-task RL. In Proceedings of the 38th International Conference on Machine
+Learning, ICML , volume 139 of Proceedings of Machine Learning Research , pp. 10497–10508, 2021. URL
+http://proceedings.mlr.press/v139/vaezipoor21a.html .
+Harish K. Venkataraman, Derya Aksaray, and Peter Seiler. Tractable reinforcement learning of signal
+temporal logic objectives. In Alexandre M. Bayen, Ali Jadbabaie, George J. Pappas, Pablo A. Parrilo,
+Benjamin Recht, Claire J. Tomlin, and Melanie N. Zeilinger (eds.), Proceedings of the 2nd Annual
+Conference on Learning for Dynamics and Control, L4DC 2020, Online Event, Berkeley, CA, USA, 11-12
+June 2020 , volume 120 of Proceedings of Machine Learning Research , pp. 308–317. PMLR, 2020. URL
+http://proceedings.mlr.press/v120/venkataraman20a.html .
+Cameron Voloshin, Hoang Minh Le, Swarat Chaudhuri, and Yisong Yue. Policy optimization with linear
+temporal logic constraints. In Alice H. Oh, Alekh Agarwal, Danielle Belgrave, and Kyunghyun Cho (eds.),
+Advances in Neural Information Processing Systems , 2022. URL https://openreview.net/forum?id=
+yZcPRIZEwOG .
+Cameron Voloshin, Abhinav Verma, and Yisong Yue. Eventual discounting temporal logic counterfactual
+experience replay. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato,
+and Jonathan Scarlett (eds.), International Conference on Machine Learning, ICML 2023, 23-29 July
+2023, Honolulu, Hawaii, USA , volume 202 of Proceedings of Machine Learning Research , pp. 35137–35150.
+PMLR, 2023. URL https://proceedings.mlr.press/v202/voloshin23a.html .
+Chuanzheng Wang, Yinan Li, Stephen L Smith, and Jun Liu. Continuous motion planning with temporal
+logic specifications using deep neural networks. arXiv preprint arXiv:2004.02610 , 2020.
+Eric M. Wolff, Ufuk Topcu, and Richard M. Murray. Robust control of uncertain markov decision processes
+with temporal logic specifications. In 2012 IEEE 51st IEEE Conference on Decision and Control (CDC) ,
+pp. 3372–3379, 2012. doi: 10.1109/CDC.2012.6426174.
+14Under review as submission to TMLR
+Cambridge Yang, Michael L. Littman, and Michael Carbin. On the (in)tractability of reinforcement learning
+for ltl objectives. In Lud De Raedt (ed.), Proceedings of the Thirty-First International Joint Conference on
+Artificial Intelligence, IJCAI-22 , pp. 3650–3658. International Joint Conferences on Artificial Intelligence
+Organization, 7 2022. doi: 10.24963/ijcai.2022/507. URL https://doi.org/10.24963/ijcai.2022/507 .
+Main Track.
+15Under review as submission to TMLR
+Contents
+1 Introduction 1
+2 Problem Setting 2
+2.1 Preliminaries . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 2
+2.2 Problem Statement . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 3
+3 LTL-Constrained Policy Optimization 4
+4 Cycle Experience Replay (CyclER) 5
+4.1 Rewarding Accepting Cycles in B. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 5
+4.2 Reward Shaping with CyclER . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 6
+4.3 CyclER with Quantitative Semantics . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 6
+5 Experiments 8
+5.1 Experimental Domains and Tasks . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 8
+5.2 Implementation Details and Baselines . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 8
+5.3 Results . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 8
+6 Related Work 10
+7 Conclusion 11
+A Limitations 17
+B Proof for Theorem 3.2 17
+B.1 On the existence of Assumption 3.1. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 17
+B.2 On the existence of a solution to 4 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 18
+C Proof for Theorem 4.1 18
+D Additional Experimental Results 20
+E Quantitative Semantics for LTL 22
+F Additional Algorithmic Details 24
+F.1 Finding Minimal Accepting Cycles and Accepting Initial Paths . . . . . . . . . . . . . . . . . 24
+G Additional Experimental Details 24
+16Under review as submission to TMLR
+A Limitations
+The success of CyclER is ultimately limited to the quality and achievability of the atomic propositional
+variables in a given environment. If robustness measures are not available and a task specification has
+relatively few variables that are difficult to satisfy, CyclER will not provide significant improvement over
+existing unshaped LTL reward proxies. For example, the specification F(G(x))with no robustness measure
+forxwill offer the same reward under CyclER and existing methods. When robustness measures are available,
+it is important that measures for each variable in the set APare of a similar scale, so that the QS-shaped
+rewards do not vary highly across different transitions in B. The issue of needing similar scale for robustness
+measures is well-known in the temporal logic literature and is an open direction for future work Balakrishnan
+& Deshmukh (2019); Li et al. (2017).
+Although we show that the performance of policy learning is somewhat robust to λin our formulation of rDUAL,
+we do not have a systematic way of finding an appropriate value for λbeyond traditional hyperparameter
+search methods. We see an interesting opportunity for future work to intelligently search for λbased on the
+desiredrLTLandrMDPof a user.
+The CyclER approach incurs computational overhead by (1) computing all possible cycles prior to policy
+learning and (2) keeping track of all potential reward values for each cycle for each trajectory stored in an
+agent’s replay buffer. We did not observe a significant slowdown or memory increase in our experiments as a
+result of this overhead. We acknowledge that in complex specifications with a large number of cycles this
+overhead may become meaningful.
+B Proof for Theorem 3.2
+Proof.Consider two policies: (1) π∈Π\Π∗, which does not achieve Vmax, (2) ˜π∈Π∗, achieving Vmax. Let
+RmaxandRminbe upper and lower bounds on the maximum and minimum achievable RinM, respectively.
+Evaluating objective 5 for both of these policies satisfies the following series of inequalities:
+R˜π+λV˜π(a)
+≥Rmin
+1−γ+λ(Vπ+ϵ)(b)
+≥Rmax
+1−γ+λVπ(c)
+≥Rπ+λVπ
+where (a)follows from assumption 3.1 and bounding the worst-case MDP value, (b)follows from selecting
+λ>Rmax−Rmin
+ϵ(1−γ)(≡λ∗),(c)follows since the highest MDP value achievable by πmust be upper bounded by
+the best-case MDP value.
+As a consequence of (a−c)we see that policies achieving Vmaxare preferred by objective 5. Consider π∗∈Π∗,
+the solution to objective 5. Thus, since π∗∈Π∗, thenπ∗must also achieve Vπ∗=V˜π=Vmax. Therefore,
+in comparing objective 5 for both π∗and˜πit follows immediately that Rπ∗≥R ˜πsinceπ∗is optimal for
+objective 5. Since the choice of ˜πis arbitrary, we have shown that π∗is also a solution to objective 4.
+B.1 On the existence of Assumption 3.1.
+If we are restricted to stationary policies and the space of policies Πis finite, then assumption 3.1 will always
+hold. A finite space of policies can be enumerated over, and we can take the difference between the optimal
+and next-best policies to find ϵ. As an example, consider a toy MDP with a continuous, 1-dimensional state
+space [0,1]and continuous, 1-dimensional action space [0,1], where the transition function determines the
+next state as the agent’s action, i.e. TM(s,a,s′). Suppose we are given a task specification G(F(1)). Under
+this specification, the agent will receive a reward of 1 every time it outputs 1, and 0 otherwise.
+Consider a finite-sized policy class Πof just two deterministic policies: π0that only outputs 0, and π1that
+only outputs 1. Here, assumption 3.1 holds even in this continuous space.
+However, assumption 3.1 is not limited to just finite-sized policy classes. Consider an infinite-sized Π, where
+one policy in Π, calledπ∗, always outputs 1, and all other policies are Gaussian policies with σ= 0.0001
+andµuniformly sampled from the interval [0,0.0001]. Here, even when Πis infinite and contains stochastic
+policies in a continuous space, assumption B.1 holds.
+17Under review as submission to TMLR
+Although the aforementioned examples are toyish, they demonstrate that although assumption 3.1 is always
+true when Πis finite, this is not the only case. Further characterization for when the assumption holds is left
+for future work.
+B.2 On the existence of a solution to 4
+In our definition of Π∗in 2.5 and the formulation of our objective in 2, it is possible that no solution to 2
+exists in settings where Π∗is empty. This non-existence issue reoccurs in objective 4, where it is possible
+that no policies exist that achieve Vmax. In all of these cases, non-existence is a result of an infinite-sized Π
+where a sequence of policies exists in Πthat come increasingly arbitrarily close to achieving Vmax(or, in the
+case of 2, to achieving the optimal probability of satisfying φ), without ever reaching the maximum value.
+In these cases, we clarify what a policy that optimizes our true objective 5 is actually achieving. Recall that
+we ultimately aim to optimize a proxy objective of Rπ+λVπ, under a sufficiently large λ. If the set Π∗is
+empty, then by definition, there does not exist a “gap” between policies in Π∗and policies outside of it. In
+other words, the value of ϵis 0, and Assumption 3.1 does not hold. As a result, if λis sufficiently large, the
+sequence of policies that is increasingly optimal with respect to Rπ+λVπwill always prioritize increasing Vπ
+overRπ. In other words, if assumption 3.1 does not hold, optimizing 5 will continually try to improve the
+proxy reward for LTL satisfaction and will ignore resulting changes to the MDP reward Rπ.
+It is theoretically possible that subsequent policies along the aforementioned sequence have arbitrarily different
+Rπ, which is undesirable. However, in practice, this does not tend to be the case, and policies that learn
+to optimize objective 5 exhibit behavior that is apparently both LTL-satisfying and performant in MDP
+reward, as evidenced by our experiments in Section 5. Generally, values for Rπare not highly unstable
+along the sequence of policies that are increasingly optimal with respect to Vπ, and allowing λto serve as a
+hyperparameter effectively enables a tradeoff to value RπagainstVπ(see Section 5).
+C Proof for Theorem 4.1
+We start with some notation. Let rτ
+CyclERrepresent the reward function for a trajectory τthat are returned
+by the execution of Alg. 1. Let T(τ)be the set of timesteps when an accepting state in Bis visited for a
+trajectory. We write the value function for CyclER, letting Γtbe the same function as defined in function 3:
+Assumption C.1. SupposeTmax=maxπ∈ΠEτ∼MPπ/bracketleftbigg
+T(τ)/vextendsingle/vextendsingle/vextendsingle/vextendsingleτ̸|=φ/bracketrightbigg
+<M, there is a uniform bound on the
+last time a bad (non-accepting) trajectory visits an accepting state across all bad trajectories induced by any
+policy.
+Lemma C.2. Under Assumption C.1, for any π∈Πandϵ>0we have
+|(1−γ)Vcyc
+π−P[π|=φ]|≤ϵ
+whenγ≥(1−ϵ)1
+M+1is chosen appropriately.
+Proof.We follow the proof style of Lemma 4.1 from Voloshin et al. (2023). Let P[π|=φ] =pbe the probability
+thatπsatisfies the LTL specification φ. Recall the value function
+Vcyc
+π=E
+τ∼Mφ
+π/bracketleftbigg∞/summationdisplay
+t=0Γtrτ
+CyclER [t]/bracketrightbigg
+LetT(τ)(i)be the (random) i-th visit to an accepting state in B. LetT(τ)(0),T(τ)(−1)refer to the first and
+last visit, respectively.
+Becauserτ
+CyclER [t] =1
+|c|only when a transition in a cycle is taken (and only once per that transition) and the
+distance between successive visits to an accepting state is |c|then at most γireward is accumulated between
+18Under review as submission to TMLR
+successive visits to an accepting state. In other words Eτ∼Mφ
+π/bracketleftbigg/summationtextT(i+1)
+t=T(i)+1Γtrτ
+CyclER [t]/bracketrightbigg
+=γiand therefore
+Vcyc
+π≤1
+1−γ.
+Further, every trajectory τis decomposable into (1) the partial trajectory up to the first visit (ie. at time
+T(τ)(0)), the partial trajectory between the first and last visit (ie. between time T(τ)(0)andT(τ)(−1)), and (3)
+the remainder of the trajectory. For trajectories that satisfy the LTL specification, T(τ)(−1)=∞, otherwise
+T(τ)(−1)≤M, finite and bounded (by Assumption C.1). For ease of notation, we omit the dependence of T
+onτ(i.e. we write T(τ)(0)asT(0)). By linearity of expectation, we can rewrite our previous equation as:
+Vcyc
+π=E
+τ∼Mφ
+π/bracketleftbiggT(0)/summationdisplay
+t=0Γtrτ
+CyclER [t]/bracketrightbigg
++E
+τ∼Mφ
+π/bracketleftbiggT(−1)/summationdisplay
+t=T(0)+1Γtrτ
+CyclER [t]/bracketrightbigg
++E
+τ∼Mφ
+π/bracketleftbigg∞/summationdisplay
+t=T(−1)+1Γtrτ
+CyclER [t]/bracketrightbigg
+.
+When a path τis accepting, by definition, Eτ∼Mφ
+π/bracketleftbigg/summationtextT(0)
+t=0Γtrτ
+CyclER [t]/vextendsingle/vextendsingle/vextendsingle/vextendsingleτ|=φ/bracketrightbigg
+= 1because every accepting
+initial path will achieve a reward of 1.
+By considering accepting trajectories of LTL formula φ, thenT(−1)=∞:
+Vcyc
+π≥
+1 + E
+τ∼Mφ
+π/bracketleftbigg∞/summationdisplay
+t=T(0)+1Γtrτ
+CyclER [t]/vextendsingle/vextendsingle/vextendsingle/vextendsingleτ|=φ/bracketrightbigg
+P[π|=φ] =p
+1−γ
+where the inequality follows from having dropped any value from non-satisfying trajectories. On the other
+hand, by the law of total expectation, for a lower bound we have:
+Vcyc
+π=pE
+τ∼Mφ
+π/bracketleftbigg∞/summationdisplay
+t=0Γtrτ
+CyclER [t]/vextendsingle/vextendsingle/vextendsingle/vextendsingleτ|=φ/bracketrightbigg
++(1−p)E
+τ∼Mφ
+π/bracketleftbigg∞/summationdisplay
+t=0Γtrτ
+CyclER [t]/vextendsingle/vextendsingle/vextendsingle/vextendsingleτ̸|=φ/bracketrightbigg
+≤p1
+1−γ+ (1−p)1−γM+1
+1−γ
+where the first term comes from the upper bound on Vcyc
+π≤1
+1−γand the second term comes from bounding
+T(0)with a uniform upper bound Mby Assumption C.1
+Combining the upper and lower bound together and subtracting off pfrom both sides, we have
+0≤(1−γ)Vcyc
+π−p≤1−γM+1
+Selectγ≥(1−ϵ)1
+M+1which implies that
+|(1−γ)Vcyc
+π−p|≤ϵ
+Lemma C.3. Letp∗=maxπ∈ΠP[π|=φ]. Under Assumption C.1, then any policy πoptimizing Vcyc
+π(ie.
+achievingVcyc
+max}maintains|Vcyc
+π−p∗|≤ϵ.
+Proof.This follows by an identical argument as in Theorem 4.2 in Voloshin et al. (2023), by using Lemma
+C.2:Vcyc-optimizing policy π∗
+cycmust satisfy|(1−γ)Vcyc
+max−p∗|≤ϵwhenγis selected as in Lemma C.2.
+19Under review as submission to TMLR
+FlatWorld
+ ZonesEnv
+ ButtonsEnv
+Figure 4: Training curves showing the shapedrLTLachieved by CyclER-learned policies, averaged over 5
+random seeds. Each point is the mean of 10 stochastic policy rollouts.
+CyclER
+ LCER
+ LCER (no rMDP)
+Figure 5: Sample trajectories from each baseline method in the FlatWorld domain (each row is a different
+seed). CyclER is able to consistently learn behavior that repeatedly visits and accepting state. The LCER
+baseline cannot achieve this long horizon task and instead optimizes for rMDP. The LCER (no rMDP)baseline,
+even when successful in visiting the accepting state (bottom right), does qualitatively learn satisfying behavior
+despite visiting the accepting state.
+D Additional Experimental Results
+Shaped Reward Training Curves In Figure 4, we provide training curves for CyclER’s performance on
+theshapedLTL proxy reward (i.e., CyclER-shaped reward) in each of our experimental domains. These
+curves allow us to compare the difference in performance between unshaped and shaped LTL reward and
+provide insight into a potential correlation between the two. We notice that in all baselines, CyclER-learned
+policies are able to achieve nonzero shaped reward early in training. Our learned policies achieve nonzero
+unshaped reward (recall the curves in Figure 3) slightly after significant returns in shaped reward are achieved,
+which supports our hypothesis that CyclER-shaped reward will successfully ‘guide’ a policy towards visiting
+the LDBA accepting state. We note that the scales of the CyclER-shaped LTL rewards visualized in Figure 4
+vary significantly; the exact numerical values are dependent on specific environments and do not hold any
+exact meaning with respect to the unshaped LTL reward.
+Qualitative Analysis To provide more insight into how CyclER learns to repeatedly visit the accepting
+state, we visualize sample trajectories from policies learned by each of our baselines in the FlatWorld domain,
+and present these samples in Figure 5. Recall that in this domain, our LTL specification instructs an agent
+to traverse the red, yellow, and green regions indefinitely, while avoiding the blue region. It is obvious that
+20Under review as submission to TMLR
+Figure 7: Training curve comparing unshaped LTL reward achieved by CyclER and LCER in the FlatWorld
+domain with φ=G(F(r)&F(y))&G(¬b). Performance is averaged over 5 random seeds. Each point is the
+mean of 10 stochastic policy rollouts.
+the most efficient path to achieve this behavior is to navigate around the blue region and visit each colored
+region along a circular path.
+On the left hand column of Fig. 5, we see that policies learned using CyclER are able to perform this behavior,
+only slightly diverting from the circular path to visit purple regions and collect reward from rMDP. In the
+middle column, we visualize trajectories from policies learned where LCER is used as rLTL. Due to the
+sparsity of this reward function, the policy quickly finds areas in the MDP where purple regions are clustered
+together, and repeatedly visits those areas (in the top middle, it traverses to a corner where the entropy of
+the policy will affect its position the least.) On the right hand column, we show trajectories from LCER
+trained without rMDPin its reward formulation. On the top right, we see that the baseline fails to achieve the
+task at all. More interestingly, however, on the bottom right, we find that the baseline does indeed achieve
+the task (i.e., visits the accepting state once), but does not exhibit behavior that qualitatively satisfies our
+task specification. After completing the task once, the agent turns back in the opposite direction and does
+not make obvious progress back towards either the red or yellow regions, suggesting that this baseline has not
+learned to repeatedly satisfy the task.
+Figure 6: Trajectories from a
+CyclER-trained policy on rDUAL
+(left) and a CyclER-trained pol-
+icy on just the shaped rLTL
+(right) in the FlatWorld domain.We also provide sample trajectories from the two policies learned in the
+experiment addressing question 2in section 5. The trajectories, visualized
+in Figure 6, show the difference in behavior between the two successful
+policies when one is aware of rMDPduring training and when one is not.
+The MDP reward-aware policy acts notably different, altering its trajectory
+to reach purple bonus areas (even those that are somewhat far away from
+the colored regions of interest), while the MDP reward-unaware policy
+makes no such adjustments and optimizes for completing the LTL task as
+often as possible.
+Direct comparison in LTL-only setting To more directly eval-
+uate CyclER’s efficacy in alleviating the reward sparsity problem,
+we recreate the FlatWorld experiment from (Voloshin et al., 2023) with the LTL specification
+G(F(red)&X(F(yellow )))&G(¬blue). This domain does not have an additional MDP reward to be op-
+timized. As such, the LCER baseline is able to consistently accomplish this objective. This allows us to
+observe whether CyclER-based reward shaping provides improvements in LTL-guided policy learning even in
+the absence of an MDP reward. We visualize the training curves in Figure 7. We can see that CyclER not
+only converges to a satisfying policy more quickly, but consistently achieves a higher reward when compared
+to the LCER baseline. This confirms our hypothesis that reward shaping is valuable even in settings where
+the LTL specification serves as the lone objective.
+21Under review as submission to TMLR
+ρ(st:t+k,⊤) =ρmax,
+ρ(st:t+k,fx(st)<cx) =cx−fx(st),
+ρ(st:t+k,¬φ) =−ρ(st:t+k,φ)
+ρ(st:t+k,φ=⇒ψ) = max(−ρ(st:t+k,φ),ρ(st:t+k,ψ))
+ρ(st:t+k,φ&ψ) = min(ρ(st:t+k,φ),ρ(st:t+k,ψ))
+ρ(st:t+k,φ∥ψ) = max(−ρ(st:t+k,φ),ρ(st:t+k,ψ))
+ρ(st:t+k,G(φ)) = min
+t′∈[t,t+k)(ρ(st′:t+k,φ))
+ρ(st:t+k,F(φ)) = max
+t′∈[t,t+k)(ρ(st′:t+k,φ))
+ρ(st:t+k,X(φ)) =ρ(st+1:t+k,φ)(k>0)
+ρ(st:t+k,(φUψ )) = max
+t′∈[t,t+k)(min(ρ(st′:t+k,ψ),min
+t′′∈[t,t′)(ρ(st′′:t′,φ))))
+Figure 9: Quantitative Semantics for LTL.
+E Quantitative Semantics for LTL
+Practitioners have defined Quantitative Semantics (QS) for a number of temporal logics in order to quantify
+the measure of satisfaction for a given specification. These semantics, originally developed to monitor how
+close hybrid control systems are to violating properties reliant on continuous-value sensor data (Maler &
+Nickovic, 2004), have since been used in reinforcement learning to learn policies that satisfy formulae in
+a variety of specification languages, including Signal Temporal Logic (STL) (Li et al., 2017; Balakrishnan
+& Deshmukh, 2019). However, existing methods of QS for reward shaping fail to effectively extend to
+indefinite-horizon LTL tasks. In what follows, we will introduce QS for LTL, discuss why naïvely using QS
+as reward is ill-fitted to deep RL for LTL, and introduce our own approach, extending the CyclER reward
+shaping method to effectively incorporate QS.
+Figure 8: A toy trajectory
+in the Flatworld MDP.To use QS, we associate each atomic predicate x∈APwith arobustness measure
+fx:S→Rthat quantifies how close xis to being satisfied at state s.xevaluates
+to true at a given state iff fx(s)≥cx, wherecxis a constant threshold. We
+can compose variables in APwith the logical and temporal operators of LTL by
+introducing QS for each operator, which follows the standard semantics defined
+for languages like TLTL (Li et al., 2017) and STL (Maler & Nickovic, 2004;
+Fainekos & Pappas, 2009) and is provided in figure 9. An LTL formula φis
+true if the quantitative evaluation of ρφ>0and false otherwise. We also define
+a maximum and minimum achievable value for ρin a given MDP as ρmaxand
+ρmin, respectively.
+To better understand quantitative evaluation for a given LTL formula, consider a
+trajectory (which we will denote as ξ) from the Flatworld MDP, shown in figure 8
+and the formula φtoy=F(r)&G(¬b). We can define robustness measures for our
+atomic propositional variables as fx(s) =distance (s,xcenter )<xradius, requiring
+that the agent be within a region for its variable to evaluate to true.
+Let’s quantitatively evaluate φtoyon the trajectory ξ. For the expression F(r), we find the maximum
+quantitative evaluation for the variable rin our trajectory. Since our trajectory visits the red region at point
+(0.5, -1), the evaluation for rat that point is some positive value cr>0, so the expression F(r)will evaluate
+to true. For the expression G(¬b), we negate the quantitative evaluation and find the minimum value for
+the negated evaluation of b. At the point (-1, 0), the agent is closest to the blue region, but since it does
+22Under review as submission to TMLR
+not enter it, the minimum value is some positive value cb>0. The quantitative evaluation for φtoyonξis
+therefore a positive value min(cr,cb), soφtoyevaluates to true for ξ.
+Suppose we were to naively use the quantitative evaluation of a given LTL specification “off-the-shelf” as a
+reward function for an RL agent. Since the quantitative evaluation of a trajectory at any given point in time
+requires evaluating the future states of the trajectory, we can only assign a reward for entire trajectories.
+For the toy specification considered in our example, the reward would be the smaller of (1) the maximum
+distance the agent reaches from the blue region and (2) the minimum distance the agent reaches from the red
+region during the trajectory. Although this seems reasonable as a reward for our example, the quantitative
+evaluation of an LTL formula becomes increasingly more obscure as the specification increases in complexity.
+For example, for the specification defined in Figure 1, which instructs the agent to indefinitely oscillate
+amongst the red, green and yellow regions while avoiding blue, ξwould have a lower quantitative evaluation
+than a trajectory that does not visit any of the three regions but just barely enters the blue region, even
+though the latter violates the specification without making any qualitative progress. Moreover, there would
+be no meaningful difference in quantitative evaluation between ξand a trajectory that visits red, green and
+yellow while avoiding blue, or between a trajectory that completes the task twice, or thrice, and so on.
+The quantitative evaluation of a trajectory as a reward signal for LTL fails because there are no well-defined
+terminal conditions for evaluating a finite trace under an infinite-horizon specification (e.g., φfrom Figure 1),
+which means that value produced is often useless when used as a reward signal. This is made worse due to
+the fact that quantitative evaluation of an LTL formula assigns a single value for an entire trajectory, making
+credit assignment difficult. We propose an alternative reward that avoids these issues, extending the CyclER
+approach to handle quantitative semantics by rewarding “progress” made by traversing individual transitions
+inB.
+The high-level intuition for our method is as follows: recall that for a given trajectory, CyclER computes
+hypothetical rewards for each cycle in B, where reward is given if the next transition is taken within that
+cycle during the trajectory. Our key insight is that we can straightforwardly extend this paradigm to use QS
+by instead rewarding quantitative progress made towards taking the next transition within an individual
+cycle. Each transition in Bcorresponds to a non-temporal predicate of atomic propositions. Crucially, we
+can quantitatively evaluate these predicates on individual states, rather than trajectories. When an agent
+moves to a new state in M, we can quantify how close the agent is to satisfying the transition predicate
+(and therefore taking the transition in the cycle), and compare it to how close the agent was to satisfying
+the transition predicate in the previous state. If there is a positive difference between these two values, we
+reward that progress made towards satisfying the transition predicate.
+We present our reward function in function 7 in the main text. In the context of Alg. 1, the reward function
+defined in 7 will replace rC. Intuitively, we can interpret the reward function defined in 7 as identical to rC,
+but rewarding quantitative progress towards taking a transition in a cycle rather than only offering reward
+once that transition is taken. We normalize progress using ρmaxandρminto ensure that the scale of rewards
+from function 7 remain consistent.
+Let us once again return to the example trajectory in Figure 8, with the LTL specification and Buchi
+automaton from Figure 1 as our objective, and consider the cycle {1,2,3,0}. We begin in state 1 of B, where
+the transition we aim to take has the corresponding predicate r. When we transition from (-1, -1) to (0.5, -1),
+we satisfyr, and receive positive reward from CyclER because we are closer to rthan we were in the previous
+state. We are now in state 2 of Band seek to take the transition with predicate g. For the transition from
+(0.5, -1) to (1, 0), we receive positive reward for getting closer to g, and for the transition from (1, 0) to (0.5,
+1) we receive positive reward for successfully moving closer to g. Note that each transition of our trajectory ξ
+qualitatively makes progress towards visiting the accepting state of B, and this is reflected in the positive
+rewards assigned by rqs.
+In environments where the individual variables in APare difficult to satisfy, the usage of QS can offer
+a more dense reward that still leverages the full expressivity of LTL. In our experiments, we show that
+using the QS version of CyclER strongly outperforms existing approaches of using QS in learning to satisfy
+indefinite-horizon LTL specifications (Li et al., 2017; Balakrishnan & Deshmukh, 2019) and enables the
+learning of LTL-compliant policies in complex environments.
+23Under review as submission to TMLR
+Algorithm 2: Find Minimal Accepting Initial Paths and Cycles ( FindMAIPsAndMACs )
+Input: Buchi Automaton B, accepting states set B∗
+InitializeCto an empty set;
+InitializePto an empty set;
+DFS (b−1,{},P);
+foreach accepting state b∗∈B∗do
+Initialize visited to an empty set;
+InitializeCto an empty set;
+DFS (b∗,{},C);
+AddCtoC;
+returnC,P
+Algorithm 3: DFS (Helper for Alg. 2
+Input: Starting node b, Pathp, setS
+Add nodebtovisited ;
+foreach Outgoing transition (b,ν,b′)frombdo
+ifb′∈B∗then
+Add the transition (b,ν,b′)top;
+AddptoS;
+else
+ifb′/∈visited then
+Add the transition (b,ν,b′)top;
+DFS (b′,p,S);
+Remove node bfromvisited ;
+F Additional Algorithmic Details
+Figure 10: A partial
+Büchi automaton that
+necessitates a visited
+frontier.Motivation of visiting frontier. To motivate the importance of maintaining the
+visited frontier eintroduced in section 4.2, we show via example that the existence
+of non-accepting cycles in Bmay allow for trajectories that infinitely take transitions
+in a MAC or MAIP without ever visiting an accepting state.
+Consider the accepting cycle {3,1,2}in the partial automaton in Figure 10. Although
+this cycle is a MAC, there does exist a separate cycle starting and ending at state 1
+(i.e. the cycle{1,2,0}.) If we give reward every time a transition in the cycle {3,1,2}
+is taken, a policy may be able to collect infinite reward without ever visiting an
+accepting state. For example, in Figure 10, a path {1,2,0,1,2,0...}would infinitely
+take transitions in a MAC, and therefore collect infinite reward without ever visiting
+the accepting state 3. Our visited frontier ewill ensure that rewards will only be
+given once per transition until an accepting state is visited.
+F.1 Finding Minimal Accepting Cycles and Accepting Initial Paths
+In algorithms 2 and 3, we include the psuedocode for finding minimal accepting initial
+paths and minimal accepting cycles in a given B, which constitute the sets Pand
+Crespectively for usage in algorithm 1.
+G Additional Experimental Details
+Environments and Tasks. For each random seed of training, the locations of the following objects were
+randomized and fixed: in FlatWorld, the location of the bonus areas, in ZonesEnv, the locations of all
+colored regions and hazard regions, and in ButtonsEnv, the locations of the buttons, bonus areas, and
+24Under review as submission to TMLR
+Environment LTLφ
+FlatWorld G(F(red)&X(F(green )&X(F(yellow ))))&G(¬blue)
+ZonesEnv G(F(blue)&F(purple )&F(red)&F(green ))
+ButtonsEnv G(F(button1 )&F(button2 ))&G(¬gremlin )
+Table 3: Specification for each domain.
+gremlins. In ZonesEnv and ButtonsEnv, we use the Point robot from Ji et al. (2023) as our agent, which has
+a 2-dimensional action space a∈[−1,1]2.
+The observation space and environment used in our ZonesEnv are the the default spaces provided the Zones
+Level 1 environment in Ji et al. (2023), with the following changes: there are additional lidar observations for
+each of the four colored zones, and we place four static collidable walls as boundaries to enclose the agent’s
+environments at the border of where objects can be randomly placed. The observation space and environment
+used in our ButtonsEnv experiments are the default spaces provided the Button Level 1 environment in Ji
+et al. (2023), with two gremlins and eight bonus regions.
+In ZonesEnv and ButtonsEnv, we define a simple robustness measure for each atomic propositional variable
+in the environments (the red, yellow, green, and purple regions in ZonesEnv, and buttons 1 through 4 and
+gremlin for ButtonsEnv). The robustness measure for a general variable xat a given state sis defined as
+follows:
+fx(s) =distance (s,x)≤0
+For example, if an agent was a distance of 2 units away from the red region in ZonesEnv, the robustness
+measure of the variable “red” at that state would evaluate to -2. For ButtonsEnv, where the gremlin variable
+refers to multiple moving objects, the robustness measure corresponds to the minimum distance from the
+agent to any gremlin. We set ρmax= 0in our environments and ρminto be the negative largest distance
+achievable in each environment.
+Figure 11: Example visualizations of the ZonesEnv
+(left) and ButtonsEnv (right) environments.Our LTL task specifications are defined in Table 3.
+We use the Spot tool Duret-Lutz et al. (2022) to con-
+vert our specifications into corresponding Büchi au-
+tomata. We report the number of states, transitions,
+andMACs in each LDBA used in our experiments
+in Table 5.
+Training details. For all experiments, results are
+averaged over five random seeds. We provide hyper-
+parameter choices for PPO for each experiment in
+Table 6 and choices for λin Table 4. In Table 6,
+batch size refers to the number of trajectories. In our
+PPO implementation, we use a 3-layer, 64-hidden
+unit network as the actor using ReLU activations, and a 3-layer, 64-hidden unit network architecture with
+tanh activations in between layers and no final activation function for the critic. The actor outputs the mean
+of a Gaussian, the variance for which is learned by a 3-layer, 64-hidden unit network that shares the first 2
+layers with the actor policy itself. All experiments were done on an Intel Core i9 processor with 10 cores
+equipped with an NVIDIA RTX A4500 GPU. We use the Adam optimizer in all experiments.
+In Figure 3, reward was computed by evaluating the policy every ten trajectories in the case of FlatWorld,
+and every 25 trajectories for ZonesEnv and ButtonsEnv. The rLTLandrMDPvalues shown are from averaging
+performance over ten rollouts for each data point with a smoothing window of size 5.
+For the BHNR baseline, we use a partial signal window size of 60 for FlatWorld, 700 for ZonesEnv, and 750
+for ButtonsEnv, treating this value as a hyperparameter and performing a sweep to select the window size.
+25Under review as submission to TMLR
+Environment CyclER LCER TLTLBHNR
+FlatWorld 400 1000 - -
+ZonesEnv 200 1000 10 1
+ButtonsEnv 100 1000 10 1
+Table 4: Values for λused by baselines for each domain.
+Environment States EdgesMACs
+FlatWorld 518 14
+ZonesEnv 835 44
+ButtonsEnv 3 9 4
+Table 5: Details for the LDBAs used in each experimental domain.
+Our TLTL baseline is trained by assigning the TLTL value of a trajectory as the reward at the end of the
+trajectory, and using the discounted reward-to-go for each prior timestep as the reward signal. For our TLTL
+and BHNR baselines, we tried computing rLTLin two ways: first, we tried using the original quantitative
+evaluation of the formula as the reward, where the resulting rewards were mostly negative due to how we
+defined our robustness measures for each variable. To evaluate if the sign and magnitude of the reward caused
+difficulty during learning, we normalized the quantitative evaluation done in TLTL and BHNR using ρmin
+andρmax, so that the reward value would be between 0 and 1. We found that this adjustment did not have a
+significant impact on either baseline’s ability to learn rLTL, but it did allow for easier optimization of rMDP;
+therefore, we report the results from the normalized evaluation in our experiments.
+Environment Critic LR Actor LR αUpdate freq. γBatch size|τ|(training)
+FlatWorld 0.001 0.0003 - 1 0.98 128 120
+ZonesEnv 0.0125 0.0025 0.3 3 0.99 128 700
+ButtonsEnv 0.001 0.0003 0.2 3 0.99 128 750
+Table 6: Hyperparameters used during training for each domain.
+26

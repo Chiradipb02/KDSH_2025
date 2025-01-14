@@ -1,0 +1,1071 @@
+BacktrackSTL: Ultra-Fast Online Seasonal-Trend Decomposition
+with Backtrack Technique
+Haoyu Wang
+Alibaba Group
+Hangzhou, China
+lingzun.why@alibaba-inc.comHongke Guo
+Alibaba Group
+Beijing, China
+guohongke.ghk@alibaba-inc.comZhaoliang Zhu
+Alibaba Group
+Hangzhou, China
+rongdi.zzl@alibaba-inc.com
+You Zhang
+Alibaba Group
+Hangzhou, China
+zhangyou.zy@alibaba-inc.comYu Zhou
+Alibaba Group
+Beijing, China
+tuhu@alibaba-inc.comXudong Zheng
+Alibaba Group
+Hangzhou, China
+xudong.zxd@alibaba-inc.com
+Abstract
+Seasonal-trend decomposition (STD) is a crucial task in time se-
+ries data analysis. Due to the challenges of scalability, there is a
+pressing need for an ultra-fast online algorithm. However, exist-
+ing algorithms either fail to handle long-period time series (such
+as OnlineSTL), or need time-consuming iterative processes (such
+as OneShotSTL). Therefore, we propose BacktrackSTL, the first
+non-iterative online STD algorithm with period-independent 𝑂(1)
+update complexity. It is also robust to outlier, seasonality shift and
+trend jump because of the combination of outlier-resilient smooth-
+ing, non-local seasonal filtering and backtrack technique. Experi-
+mentally, BacktrackSTL decomposes a value within 1.6𝜇𝑠, which
+is15×faster than the state-of-the-art online algorithm OneShot-
+STL, while maintaining comparable accuracy to the best offline
+algorithm RobustSTL. We have also deployed BacktrackSTL on the
+top of Apache Flink to decompose monitoring metrics in Alibaba
+Cloud for over a year. Besides, we have open-sourced the artifact
+of this proposal on GitHub.
+CCS Concepts
+•Information systems →Data stream mining; •Computer
+systems organization →Real-time systems.
+Keywords
+Online seasonal-trend decomposition; backtrack; streaming com-
+puting
+ACM Reference Format:
+Haoyu Wang, Hongke Guo, Zhaoliang Zhu, You Zhang, Yu Zhou, and Xudong
+Zheng. 2024. BacktrackSTL: Ultra-Fast Online Seasonal-Trend Decompo-
+sition with Backtrack Technique. In Proceedings of the 30th ACM SIGKDD
+Conference on Knowledge Discovery and Data Mining (KDD ’24), August
+25–29, 2024, Barcelona, Spain. ACM, New York, NY, USA, 12 pages. https:
+//doi.org/10.1145/3637528.3671510
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+KDD ’24, August 25–29, 2024, Barcelona, Spain.
+©2024 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 979-8-4007-0490-1/24/08
+https://doi.org/10.1145/3637528.3671510Table 1: Comparison of different STD algorithms ( 𝑇is the
+period length and 𝐼is the maximum iterations)
+AlgorithmTrend Seasonality Outlier Online
+Jump Shift Tolerance Complexity
+STL No No No -
+TBATS Yes No No -
+STR No Yes Yes -
+SSA No No No -
+RobustSTL Yes Yes Yes -
+OnlineSTL No No No 𝑂(𝑇)
+OneShotSTL Yes Yes No 𝑂(𝐼)
+BacktrackSTL Yes Yes Yes 𝑶(1)
+1 Introduction
+Many time series exhibit repeating segments, in other words, pe-
+riodicity. This periodicity can stem from human activities, such
+as website visits, or from timed behavior, such as machine loads
+with scheduled tasks. Many methods including frequency domain
+analysis [ 24,33], wavelet analysis [ 29,31], and correlation analysis
+[25,30] are commonly used in the analysis of periodic time series.
+Besides, seasonal-trend decomposition (STD) is also widely used.
+STD decomposes a periodic time series into three components:
+trend, seasonality, and residual. The decomposition plays a crucial
+role in downstream time series analysis tasks, such as data repair
+[32,34,39], anomaly detection [ 15,21,38], and forecasting [ 20,35].
+For leading cloud service providers such as Alibaba Cloud, the
+challenge of scalability necessitates a focused investment in AIOps
+technologies including STD. A case in point is Alibaba Cloud’s
+Elastic Compute Service (ECS) [ 2], which oversees tens of millions
+of virtual machine instances, generating a vast amount of periodic
+time series. In such an industrial context, time efficiency has the
+highest priority in the design of STD algorithm, even taking
+precedence over accuracy.
+There are numerous existing works on STD, some of which are
+compared in Table 1. STD algorithms can be broadly categorized
+into two groups. The first group consists of offline algorithms, such
+as STL [ 16], TBATS [ 26], STR [ 17], SSA [ 22] and RobustSTL [ 35],
+which process a batch of values in one go and output their decom-
+positions. These algorithms, however, do not support incremental
+updates, making their time complexity unacceptable in the scalable
+5848
+KDD ’24, August 25–29, 2024, Barcelona, Spain. Haoyu Wang et al.
+Table 2: Notations
+Symbol Description
+𝑦𝑡 Raw value at time 𝑡
+𝜏𝑡 Trend component at time 𝑡
+𝑠𝑡 Seasonality component at time 𝑡
+𝑟𝑡 Residual component at time 𝑡
+𝑇 Period length of time series
+𝑁 Number of points in offline STD algorithm
+𝐾 Number of considered past neighborhoods
+𝑊 Constant window size in online STD algorithm, 𝑊=
+(𝐾+1)𝑇in BacktrackSTL
+𝐻 One-side width of a neighborhood
+𝛿 Standard deviation of seasonal component variations
+𝐿 Consecutive outlier threshold for trend jump
+𝑛 Parameter for N-Sigma detection
+ˆ𝑦𝑡 Reference value of 𝑦𝑡
+Y Circular queue for moving average
+R Circular queue for N-Sigma
+𝜆1,𝜆2 Regularization parameters of RobustSTL
+𝐼 Maximum number of iterations
+scenario. Despite this limitation, these algorithms can achieve high
+decomposition accuracy. For instance, RobustSTL utilizes 𝑙1-norm
+optimization and non-local seasonal filtering to enhance robustness
+to trend jumps, seasonal shifts, and outliers.
+The second group consists of online algorithms, such as On-
+lineSTL [ 27] and OneShotSTL [ 23], which decompose values incre-
+mentally. OnlineSTL employs a simple tri-cube filter and exponen-
+tial smoothing to extract trend and seasonality; however, its time
+complexity is 𝑂(𝑇), unsuitable for long-period series. On the other
+hand, OneShotSTL proposes an incremental variant of 𝑙1-norm op-
+timization and realizes a period-independent complexity, yet still
+requires iterative approximation of the optimal solution.
+As discussed above, the time efficiency of existing algorithms
+still need improvements. In Section 3, a detailed analysis of the
+current approaches is conducted. To fulfill multiple requirements si-
+multaneously, a high-complexity 𝑙1-norm optimization is employed.
+To reduce the complexity further, our insight is that combining
+various low-complexity methods may be more effective in
+addressing complex requirements than using a single high-
+complexity method.
+Based on the insight, we present BacktrackSTL, a novel online
+STD algorithm with 𝑂(1)time complexity. Specifically, Backtrack-
+STL incorporates an outlier-resilient smoothing. It combines the
+strengths of anomaly detection and smoothing, which proficiently
+manages outliers across a spectrum of severity while extracting the
+trend. Moreover, non-local seasonal filtering is integrated to capture
+seasonality and accommodate shifts. Additionally, jump detection
+reveals the underlying principles obscured by complex optimization
+objectives, resolving trend jumps via a novel backtrack technique.
+As a result, BacktrackSTL can decompose a new value from the
+stream in constant time based on the decomposition results in the
+sliding window. This efficient computational performance positions
+BacktrackSTL as a robust solution for real-time periodic time-series
+analysis in large-scale streaming environments.Our contributions are summarized as follows:
+•To the best of our knowledge, BacktrackSTL is the first
+non-iterative online seasonal-trend decomposition algorithm
+with period-independent 𝑂(1)time complexity. It is 400×
+and15×faster than OnlineSTL and OneShotSTL, respec-
+tively, when the period is 12800.
+•BacktrackSTL combines outlier-resilient smoothing, non-
+local seasonal filtering and backtrack technique to achieve
+the robustness to outlier, seasonality shift and trend jump,
+respectively. The accuracy of BacktrackSTL is comparable
+to existing online and offline STD algorithms.
+•We have successfully deployed the BacktrackSTL algorithm
+based on Apache Flink in the production environment of
+Alibaba Cloud, where it has been used to perform real-time
+decomposition of monitoring metrics for over a year.
+The artifact of BacktrackSTL is open-sourced on GitHub [ 8]. The
+frequently used notations are listed in Table 2.
+2 Preliminary
+2.1 Decomposition Model
+As a traditional problem, seasonal-trend decomposition is defined
+as follows:
+𝑦𝑡=𝜏𝑡+𝑠𝑡+𝑟𝑡,1≤𝑡≤𝑁 (1)
+where𝑦𝑡corresponds to the original value at time 𝑡,𝜏𝑡,𝑠𝑡and𝑟𝑡is
+the trend, seasonal component and the residual, respectively.
+Usually, the trend 𝜏𝑡changes not very fast. However, 𝜏𝑡may
+still have abrupt changes at a low frequency, which is called trend
+jump. It occurs at a very low frequency, typically manifesting once
+over multiple periods. The seasonality component 𝑠𝑡is a repeated
+pattern with period 𝑇. To ensure the uniqueness of decomposition,
+the sum of all seasonality components in a period is fixed to 0.
+Formally,Í𝑡+𝑇−1
+𝑖=𝑡𝑠𝑖=0is satisfied for any 𝑖. Due to seasonality
+shift, the period varies slightly in the time domain. Besides, the
+residual𝑟𝑡can be decomposed further into two parts:
+𝑟𝑡=𝑎𝑡+𝑛𝑡,1≤𝑡≤𝑁 (2)
+where𝑎𝑡is the outlier part and𝑛𝑡is the white noise. The occurrence
+of outliers is random.
+In short, our assumption is that: the original value 𝑦𝑡can be
+decomposed into three components, 𝜏𝑡with trend jumps, 𝑠𝑡with
+seasonality shifts and 𝑟𝑡with outliers.
+2.2 Online Decomposition
+In the online scenario, the original values arrive continuously as a
+stream, while the decomposition proceeds incrementally. For each
+value𝑦𝑡, we decompose it into trend 𝜏𝑡, seasonal component 𝑠𝑡, and
+residual𝑟𝑡, just as the model in formula (1). Due to limited mem-
+ory, the decomposition relies on the recent history, i.e., 𝜏𝑡−𝑊..𝑡−1,
+𝑠𝑡−𝑊..𝑡−1and𝑟𝑡−𝑊..𝑡−1in a window with constant size 𝑊.
+3 Motivation
+To the best of our knowledge, RobustSTL is currently the most
+accurate STD algorithm. In this section, we take RobustSTL as an
+example to explore potential directions for further enhancing time
+efficiency.
+5849BacktrackSTL: Ultra-Fast Online Seasonal-Trend Decomposition with Backtrack Technique KDD ’24, August 25–29, 2024, Barcelona, Spain.
+Trend Extraction (96.716%)Final Adjustment (0.002%)Seasonality Extraction (2.181%)Noise Removal (1.101%)
+Figure 1: Time cost breakdown of RobustSTL
+3.1 Analysis on Time Complexity
+RobustSTL consists of four stages: noise removal, trend extraction,
+seasonality extraction, and final adjustment. We evaluate the time
+cost of each stage and present the results in Figure 1. It is evident
+that the trend extraction stage consumes the majority of the time,
+accounting for over 96%. In fact, this stage solves an optimization
+problem based on the 𝑙1-norm. Since 𝑙1-norm optimization does
+not have a closed-form solution, RobustSTL utilizes a computation-
+intensive numerical method to obtain the solution.
+To improve time efficiency further, we identify two promising av-
+enues for exploration. The first one entails the utilization of approx-
+imation to lower the computational burden of 𝑙1-norm optimization.
+An illustration of this approach is OneShotSTL, which introduces
+an incremental variant. Despite this innovation, it still requires
+iterations for approximated results, consequently its level of com-
+plexity optimization remains somewhat inadequate. Conversely,
+the second one involves investigating a synthesis of low-complexity
+methods aimed at delivering comparable effectiveness. Owing to
+its expansive potential on efficiency, we opt for the second avenue
+for our research endeavors.
+3.2 Analysis on Effectiveness
+Now, let’s look at how well 𝑙1-norm optimization works. In Robust-
+STL [35], the objective function of the optimization is a minimum
+weighted sum function, which is defined as follows:
+min𝜏1...𝑁𝑁∑︁
+𝑡=𝑇+1|(𝑦𝑡−𝜏𝑡)−(𝑦𝑡−𝑇−𝜏𝑡−𝑇)|+𝜆1𝑁∑︁
+𝑡=2|𝜏𝑡−𝜏𝑡−1|
++𝜆2𝑁∑︁
+𝑡=3|𝜏𝑡−2𝜏𝑡−1+𝜏𝑡−2| (3)
+The first term helps to make the differences between periods smaller
+after we remove the trends. The subsequent two terms represent the
+first and second-order differences of the trend, aiming to smooth the
+trend. As illustrated in the paper of RobustSTL, this optimization
+exhibits robustness to outliers and trend jumps.
+Firstly, consider a simple case about outliers in Figure 2(a). Ig-
+noring all seasonal components for simplicity, there is an outlier at
+time𝑖, e.g.,𝑦𝑡=1for only𝑡=𝑖and𝑦𝑡=0otherwise. Obviously,
+the objective function formula (3) reaches the minimum when all
+other𝜏𝑡=0if𝑡≠𝑖. Therefore, when incorporating all the afore-
+mentioned values, 𝜏𝑖is the only variable for the following minimum
+...i-4i-2ii+2i+4...
+Time0.00.51.0Value
+Raw
+Trend(a) Outlier
+...i-4i-2 ii+2     ... i+k
+Time0.00.51.0Value
+Raw
+Trend (b) Trend jump
+Figure 2: Effectiveness of trend extraction with 𝑙1-norm
+objective function:
+min𝜏𝑖2|1−𝜏𝑖|+2𝜆1|𝜏𝑖|+4𝜆2|𝜏𝑖| (4)
+The solution is as follows:
+𝜏𝑖=0, 𝜆 1+2𝜆2>1
+1, 𝜆 1+2𝜆2≤1(5)
+Besides, the optimization is also suitable for trend jump. Consider
+the trend jump (shown by the overlapped blue line) in Figure 2(b),
+suppose all values after time 𝑖are 1 and the last value is at 𝑖+𝑘.
+Similarly, calculating the objective function when 𝜏is jump or not,
+we find that the extracted trend is the same to the raw value when
+𝜆1+2𝜆2<𝑘+1 (6)
+Otherwise, the jump is not detected and the extracted trend stays 0.
+In summary, 𝑙1-norm-based optimization can handle both out-
+liers and trend jumps, as shown by the orange line in Figure 2.
+This prompts us to employ two low-complexity methods each tai-
+lored to a specific challenge and then integrate them. Motivated
+by this insight, we apply outlier-resilience smoothing and back-
+track technique that is robust against jumps, achieving comparable
+performance while significantly reducing computational effort.
+4 BacktrackSTL Decomposition
+4.1 Overview
+Based on the analysis in Section 3.2, we propose a new online decom-
+position algorithm, BacktrackSTL. Figure 3 provides an overview.
+Similar to other online algorithms, such as OnlineSTL and OneShot-
+STL, it consists of two stages: initialization and online update.
+For initialization, we can use any offline STD algorithm to de-
+compose the values in the window, including STL and RobustSTL.
+This stage is conducted only once for a time series. Appendix A
+introduces the initialization algorithm utilized in BacktrackSTL.
+In the online update stage, we maintain a sliding window whose
+length is an integer multiple of period 𝑇. This stage involves four
+steps. In Section 4.2, we use outlier-resilient smoothing to extract
+the trend with robustness to outliers. In Section 4.3, we employ
+the non-local seasonal filtering to extract the seasonality compo-
+nent and handle seasonality shifts simultaneously. After that, in
+Section 4.4, we detect trend jumps based on the idea of concept
+shift. If a jump is detected, we utilize the backtrack technique in
+Section 4.5 to correct the past decompositions.
+5850KDD ’24, August 25–29, 2024, Barcelona, Spain. Haoyu Wang et al.
+Jump DetectedStage 2: Online UpdateStage 1: Initialization
+(a) Outlier-Resilient Smoothing
+Outlier(b) Non-local Seasonal Filtering
+Seasonality Shift
+(c) Jump Detection (d) Backtrack
+Trend Jump
+Figure 3: Overview of BacktrackSTL
+4.2 Outlier-Resilient Smoothing
+First, let us consider a simple case without outliers. To extract
+the trend in online update, we employ a moving average [ 28], as
+described below:
+𝜏𝑡=1
+𝑊𝑡∑︁
+𝑖=𝑡−𝑊+1𝑦𝑖=1
+𝑊𝑡∑︁
+𝑖=𝑡−𝑊+1(𝜏𝑖+𝑠𝑖+𝑟𝑖) (7)
+Since𝑊is an integer multiple of 𝑇and the residual is nearly a
+white noise, the terms of seasonality and residual can both be re-
+moved from formula (7). Furthermore, due to the very slow change
+of the trend components, formula (7) is a proper approximation.
+To address outliers, we employ a dynamic N-Sigma mechanism
+with parameter 𝑛on𝑠𝑡−𝑊...𝑡−1to detect outliers. For each 𝑦𝑡, we
+calculate its reference value ˆ𝑦𝑡. If the difference between 𝑦𝑡and ˆ𝑦𝑡
+is above the N-Sigma threshold, it will be classified as an outlier and
+ˆ𝑦𝑡will be used in moving average instead. Additionally, if the differ-
+ence is below the threshold, moving average can effectively smooth
+them. Therefore, this method is called outlier-resilient smoothing.
+When calculating the reference value ˆ𝑦𝑡, we estimate the trend
+component with 𝜏𝑡−1. For seasonality, 𝐾past neighborhoods of
+decomposed seasonality, centered at 𝑠𝑡−𝐾𝑇,···,𝑠𝑡−𝑇with width
+𝐻, are considered. Specially, each neighborhood contains 2𝐻+
+1components, e.g., 𝑠𝑡−𝑇−𝐻,···,𝑠𝑡−𝑇,···,𝑠𝑡−𝑇+𝐻belong to the
+neighborhood centered at 𝑠𝑡−𝑇. The one closest to 𝑦𝑡−𝜏𝑡−1is
+selected. Formally, the equation is as follows:
+ˆ𝑦𝑡=𝜏𝑡−1+arg min
+𝑠𝑖,𝑖∈Ω|𝑠𝑖−(𝑦𝑡−𝜏𝑡−1)| (8)
+Ω={𝑖|(𝑡′=𝑡−𝑘𝑇,𝑖=𝑡′±ℎ)} (9)
+𝑘=1,2,...,𝐾 ;ℎ=0,1,...,𝐻
+In the implementation, we maintain two circular queues YandR,
+both of length 𝑊, which includes all 𝑦𝑖(orˆ𝑦𝑖if outlier detected) andAlgorithm 1: Outlier Resilient Smoothing
+Data:𝑦𝑡−𝑊...𝑡,𝜏𝑡−𝑊...𝑡−1,𝑠𝑡−𝑊...𝑡−1,𝑟𝑡−𝑊...𝑡−1,Y,R
+1Obtain ˆ𝑦𝑡according to formula (8)-(9) ;
+2𝑑𝑒𝑡𝑒𝑐𝑡𝑒𝑑←𝑁𝑆𝑖𝑔𝑚𝑎(𝑦𝑡−ˆ𝑦𝑡);
+3ifdetected then
+4 Add ˆ𝑦𝑡toY;
+5else
+6 Add𝑦𝑡toY;
+7𝜏𝑡←𝑚𝑒𝑎𝑛(Y);
+8return𝜏𝑡,𝑑𝑒𝑡𝑒𝑐𝑡𝑒𝑑
+𝑠𝑖in the sliding window, respectively. For Y, we maintain the size
+|Y|and the sumÍ
+𝑦𝑖∈Y𝑦𝑖as the inner state variable, and update
+them whenever the elements in Yare changed. As a result, the
+operation complexities of addition, removal and moving average are
+all𝑂(1). Similarly, N-Sigma detection with Rcan also be completed
+in𝑂(1). Algorithm 1 shows the main procedure.
+Figure 3(a) illustrates the trend extracted by outlier-resilient
+smoothing. For clarity, we present the results for all data points,
+though the decomposition is performed one by one. Neither outliers
+(encircled in red) nor noise significantly impact the accuracy of the
+trend extraction. However, smoothing alone is unable to extract
+trend accurately after jump, thus the supports of jump detection in
+Section 4.4 and backtrack in Section 4.5 are needed.
+4.3 Non-local Seasonal Filtering
+To extract the seasonality component, we directly utilize the non-
+local seasonal filtering proposed by RobustSTL [ 35], which is robust
+to seasonality shifts. It is weighted average of neighborhoods Ω
+shown in formula (9), which is defined as follows:
+𝑠𝑡=∑︁
+𝑗∈Ω𝑤𝑡
+𝑗𝑦′
+𝑗(10)
+𝑤𝑡
+𝑗=1
+𝑧exp{−(𝑗−𝑡′)2
+2𝐻2−(𝑦′
+𝑗−𝑦′
+𝑡)2
+2𝛿2} (11)
+𝑦′
+𝑗=𝑦𝑗−𝜏𝑗 (12)
+where𝑧is the normalization factor, 𝑡′is the center of the neighbor-
+hood𝑗belongs to and 𝛿is a parameter which controls how different
+the seasonal components are in various periods. Since the weights
+𝑤𝑡
+𝑗are given by two Gaussian functions. The component close to
+neighborhood center 𝑡′and de-trend value 𝑦′
+𝑡is large.
+Figure 3(b) illustrates the seasonality extracted by non-local
+seasonal filtering. Similarly, the accurate seasonality turns to inac-
+curate after the jump.
+4.4 Jump Detection
+Before discussing the specific method for jump detection, let us first
+consider a simple example illustrated in Figure 4 to demonstrate
+the challenge of jump detection. Suppose that the seasonality com-
+ponents have been removed, and at time 𝑖, we observe that 𝑦𝑖=1,
+which deviates clearly from the normal trend. However, we still
+cannot decide whether it is an outlier (following the blue line in
+the future) or a trend jump (following the orange line). Since we
+5851BacktrackSTL: Ultra-Fast Online Seasonal-Trend Decomposition with Backtrack Technique KDD ’24, August 25–29, 2024, Barcelona, Spain.
+... i-5 i-4 i-3 i-2 i-1 ii+1 i+2 i+3 i+4  ...
+Time0.00.51.0Value
+Outlier
+Trend jump
+History
+Figure 4: Challenge of jump detection
+are unable to predict the future, a delayed decision is naturally
+embedded in the online scenario.
+As shown in Figure 3(c), a trend jump leads to consecutive high
+residuals (encircled in red), which is greatly different from the
+outlier (encircled in blue). We employ the concept drift detection
+idea to detect it. If an extremely rare event occurs under the given
+model or assumption, it suggests the presence of a concept drift
+problem. Specifically, we introduce a parameter 𝐿, and assume
+that there is no trend jump with outlier probability 𝑝. We classify
+all deviated values as outliers. When the number of consecutive
+outliers exceeds 𝐿, i.e., the probability 𝑝𝑘is less than the threshold
+𝑝𝐿, we consider that an extreme event has taken place, resulting in
+a violated assumption and a detected trend jump.
+In fact, referring to formula (6), the optimization objective of
+RobustSTL also implies a similar judgment. Only after detecting
+⌈𝜆1+2𝜆2⌉consecutive deviations can it be determined as a jump
+and provide the correct decomposition. Compared with the regu-
+larization parameter in RobustSTL, consecutive outlier threshold 𝐿
+is more intuitive and easier to set.
+4.5 Backtrack
+When a trend jump is detected at time 𝑡, all values after the jump,
+i.e.,𝑦𝑡−𝐿+1...𝑡, have been decomposed in the wrong way due to the
+detection delay. Since each decomposition relies on the previous
+ones, a backtrack is necessary to correct them.
+Specifically, we still use the average method to estimate the trend.
+Considering that the seasonality components are similar between
+different periods, i.e., 𝑠𝑡≈𝑠𝑡−𝑇, we estimate all trends 𝜏𝑡−𝐿+1...𝑡as
+a constant𝜏:
+𝜏=1
+𝐿𝑡∑︁
+𝑖=𝑡−𝐿+1𝑦𝑖−𝑠𝑖−𝑇 (13)
+Then, we use non-local seasonal filtering in formula (10)-(12) to
+extract the seasonality components 𝑠𝑡−𝐿+1...𝑡.
+Besides, there is a noticeable difference in values before and after
+the jump, which can result in an incorrect result for the moving
+average. To address it, we make a compensation by adding the gap
+𝜏−𝜏𝑡−𝐿to all the elements before jump in Y. The main procedure
+of backtrack is shown in Algorithm 2. Figure 3(d) shows the correct
+decompositions when backtrack is applied.
+Discussion on Periodic Context Disruption. In practice, the seasonal
+component of a series may change significantly, called periodic
+context disruption. For example, when an API is transformed from
+private test to public release, the series of its request count may
+meet such a disruption. This situation violates the outlier-only
+assumption in Section 4.4, which may be misjudged as a jump,Algorithm 2: Backtrack
+Data:𝑦𝑡−𝑊...𝑡,𝜏𝑡−𝑊...𝑡,𝑠𝑡−𝑊...𝑡,𝑟𝑡−𝑊...𝑡,Y,R
+1𝜏𝑡−𝐿+1...𝑡←𝑚𝑒𝑎𝑛(𝑦𝑡−𝐿+1...𝑡−𝑠𝑡−𝑇−𝐿+1...𝑡−𝑇);
+2Estimate𝑠𝑡−𝐿+1...𝑡according to formula (10)-(12) ;
+3𝑟𝑡−𝐿+1...𝑡←𝑦𝑡−𝐿+1...𝑡−𝜏𝑡−𝐿+1...𝑡−𝑠𝑡−𝐿+1...𝑡;
+4Update𝑦𝑡−𝐿+1...𝑡and compensate other elements in Y;
+5Update𝑟𝑡−𝐿+1...𝑡inR;
+Algorithm 3: BacktrackSTL, Online Update
+Data:𝑦𝑡−𝑊...𝑡,𝜏𝑡−𝑊...𝑡−1,𝑠𝑡−𝑊...𝑡−1,𝑟𝑡−𝑊...𝑡−1,Y,R
+1Obtain𝜏𝑡and𝑑𝑒𝑡𝑒𝑐𝑡𝑒𝑑 with outlier-resilient smoothing;
+2Estimate𝑠𝑡according to formula (10)-(12) ;
+3𝑟𝑡←𝑦𝑡−𝜏𝑡−𝑠𝑡;
+4𝑎𝑛𝑜𝑚𝑎𝑙𝑦𝐶𝑛𝑡←𝑑𝑒𝑡𝑒𝑐𝑡𝑒𝑑 ?𝑎𝑛𝑜𝑚𝑎𝑙𝑦𝐶𝑛𝑡+1 : 0;
+5if𝑎𝑛𝑜𝑚𝑎𝑙𝑦𝐶𝑛𝑡≥𝐿then
+6 Backtrack the decompositions of last 𝐿values;
+7𝑎𝑛𝑜𝑚𝑎𝑙𝑦𝐶𝑛𝑡←0;
+8return𝜏𝑡,𝑠𝑡,𝑟𝑡
+triggering a backtrack. Therefore, if the majorities of residuals after
+backtrack still violate the N-Sigma constraint, a periodic context
+disruption is suggested. It is necessary to discard all values and
+regard the series as a new one. Because periodic context disruption
+is out of the scope of the model in Section 2, we leave it as part of
+our future work.
+4.6 Summary
+In this section, we introduce an online decomposition algorithm
+called BacktrackSTL. The sliding window length 𝑊=(𝐾+1)𝑇,
+since it is the minimum length containing all considered past neigh-
+borhoods. Algorithm 3 shows the online update procedure of Back-
+trackSTL.
+Proposition 4.1 (Update complexity). In online update stage,
+BacktrackSTL updates the decomposition of a single value within
+amortized𝑂(1)time complexity.
+Proof. There are four steps of BacktrackSTL update.
+Outlier-resilient smoothing: First, we calculate the reference value
+by traversing all values in 𝐾neighborhoods with 𝑂(𝐾𝐻)complex-
+ity. Second, N-Sigma detection costs 𝑂(1)time since useful inner
+state variables are precomputed. Third, the complexity of updating
+Yand getting average is 𝑂(1)due to precomputed states as well.
+Thus, the total complexity of outlier-resilient smoothing is 𝑂(𝐾𝐻).
+Non-local seasonal filtering: This step is a weighted linear combi-
+nation of𝐾neighborhoods. Thus, the computational complexity is
+𝑂(𝐾𝐻).
+Jump detection: This step is a comparison with complexity 𝑂(1).
+Backtrack: First, calculating 𝜏needs𝑂(𝐿)time. Second, since
+the computational complexity of a non-local seasonal filtering is
+𝑂(𝐾𝐻), extracting the seasonality of 𝐿values costs 𝑂(𝐾𝐻𝐿)time.
+Then, all elements in Yneed update or compensation, which costs
+𝑂(𝑊)time. Thus, the total complexity of backtrack is 𝑂(𝑊+𝐾𝐻𝐿).
+5852KDD ’24, August 25–29, 2024, Barcelona, Spain. Haoyu Wang et al.
+Finally, since 𝐾and𝐻are both fixed constant parameters, the
+complexities of outlier-resilient smoothing and non-local seasonal
+filtering can be considered as 𝑂(1). Similarly, also due to the con-
+stant𝐿threshold, the complexity of backtrack is 𝑂(𝑊). Considering
+the rarity of jumps, e.g., lower than1
+𝑊, its amortized complexity is
+still𝑂(1). Therefore, the total complexity of BacktrackSTL is 𝑂(1),
+independent of the period length 𝑇. □
+5 Deployment
+Stability is crucial for cloud companies. In Alibaba Cloud, ECS
+anomaly scheduling platform is built to monitor metrics and exe-
+cute operational workflows such as restarting and migrating. Ac-
+cording to our statistics, billions of metric series are monitored
+and approximately 20.8% of them are seasonal. To handle these
+sequence more effectively, the platform employs the BacktrackSTL
+algorithm for decomposition.
+In ECS anomaly scheduling platform, period identification is
+operationalized as an offline process, distinct from the online de-
+composition. Executed within MaxCompute [ 11], the period identi-
+fication algorithm is implemented as a user-defined function (UDF),
+which is harnessed daily to calculate the period length of all moni-
+toring metric series. The results are then synced to the cloud-native
+memory database Tair [14].
+For online decomposition, BacktrackSTL consumes metric series
+from Simple Log Service (SLS) [ 5], retrieves associated period length
+from Tair, and leaves its decomposition results for downstream
+tasks, e.g., anomaly detection. Considering the independence be-
+tween series, it is deployed on Apache Flink [ 1] due to its horizontal
+scalability. Specifically, it is implemented as a keyed function with
+states, whose parameters are obtained from a broadcast stream. The
+task is hosted on Ververica Platform (VVP) [ 4]. According to the
+tests, each compute unit (CU)1can support about 127K throughput
+per second, greatly reducing the machine cost.
+On ECS anomaly scheduling platform, BacktrackSTL has been
+continuously and stably running for over one year. During this time,
+it helped the platform discover some real problems. For example,
+the release of a control software may bring unexpected compu-
+tational overhead on specific machines, leading to the feature of
+high utilization on a certain CPU core. As shown in Figure 7(a), by
+decomposing the count of node controllers with this feature, we
+discovered this trend jump and timely notified the software owner.
+6 Experimental Evaluation
+6.1 Experiment Setup
+6.1.1 Dataset. In this section, we conduct evaluations using three
+datasets, including one synthetic dataset and two real datasets.
+Figure 5 displays the synthetic dataset named SYNTHETIC, which
+has a period of 200, with four trend jumps and a severe outlier.
+Additionally, its seasonality components experience shifts with a
+maximum of 5. As shown in Figure 6 and Figure 7, the two real
+datasets are referred to as REAL1 and REAL2, which represent the
+counts of logs with specific features from Alibaba Cloud. Their
+period lengths are both 24.
+1CU is the resource unit of VVP. One CU is equal to 1 CPU core, 4 GiB of memory,
+and 20 GB of local storage.6.1.2 Baselines. Refer to Table 1, we compare the proposed Back-
+trackSTL with existing STD algorithms. The offline algorithms in-
+clude STL [ 16], SSA [ 22], TBATS [ 26] and RobustSTL [ 35,37]. STR
+[17] is not included due to its extremely high complexity. Based on a
+sliding window, these offline algorithms can be applied to online sce-
+narios, named Window-STL, Window-SSA, Window-TBATS and
+Window-RobustSTL. Additionally, Online-RobustSTL, an online
+variant of RobustSTL, and the native online algorithms OnlineSTL
+[27] and OneShotSTL [23] are used for comparison as well.
+In the experiment, we implement BacktrackSTL and reproduce
+OnlineSTL and SSA faithfully in Java. We also use the public Java
+implementations of STL [ 7] and OneShotSTL [ 3]. Moreover, since
+other baselines have no public Java implementation and are diffi-
+cult to reproduce because of dependencies, we have to use their
+public implementations in other languages. For example, the public
+repository SREWorks [ 6] provides the Python implementations of
+RobustSTL and its variants while R package forecast [12] provides
+the implementation of TBATS.
+6.1.3 Hyper-Parameters. All STD algorithms require the period
+length𝑇as a parameter. For generated datasets, without special
+instructions, we always use the ground truth value, i.e., 𝑇=200.
+For real datasets, RobustPeriod [ 36] is used to estimate their period
+lengths.
+For BacktrackSTL, we set 𝐾=2,𝐿=4and𝑛=6for all datasets.
+Meanwhile, we set 𝐻=5for the generated dataset and 𝐻=2
+for the real ones. As for 𝛿, we automatically determine it from the
+initialization data. For each 𝑦𝑖, we calculate its minimum distance
+to its previous neighborhood, i.e., min|𝑦𝑖−𝑦𝑗|when𝑖−𝑇−𝐻≤
+𝑗≤𝑖−𝑇+𝐻. Their standard deviation is used as the value of 𝛿.
+RobustSTL and its variants have dozens of parameters. For those
+parameters with similar meanings to BacktrackSTL, we adopt the
+same settings, such as 𝐾and𝐻. Meanwhile, we set 𝛿𝑖and𝛿𝑑to𝐻
+and𝛿in BacktrackSTL, respectively. The default values are used
+for the remaining parameters.
+Besides, STL does not require any parameters to be set. The
+smoothing parameter 𝛾of OnlineSTL is set to the recommended
+value of 0.7 by the author. 𝐻in OneShotSTL is consistent with
+BacktrackSTL, while the other parameters are the default values or
+determined automatically using the author-provided method.
+6.1.4 Environment. The experimental evaluations are conducted
+on an ECS (ecs.re4.10xlarge, 40 vCPU cores, 480 GiB memories)
+from Alibaba Cloud. The operation system is 64-bit CentOS 7.9. All
+implementations are run on JDK 1.8.0_382 or Python 3.6.8.
+6.2 Evaluation on Accuracy
+We first evaluate the accuracy of the decomposition algorithms. In
+line with existing work like RobustSTL and OneShotSTL, we can
+only provide quantitative results for synthetic datasets due to the
+absence of decomposition ground truth in real datasets. Meanwhile,
+visual results for all datasets are provided. Besides, to emphasize
+the generalizability of BacktrackSTL, results for more real datasets
+are shown in Appendix B.2.
+Figure 5 visually displays the decomposition results of Backtrack-
+STL, RobustSTL and OneShotSTL over SYNTHETIC. As shown in
+Figure 5(a), BacktrackSTL shows a similar result to RobustSTL in (c),
+5853BacktrackSTL: Ultra-Fast Online Seasonal-Trend Decomposition with Backtrack Technique KDD ’24, August 25–29, 2024, Barcelona, Spain.
+0500100015002000250030000510Raw
+Trend
+05001000150020002500300001Season
+0500100015002000250030000510
+Residual
+(a) BacktrackSTL
+0500100015002000250030000510Raw
+Trend
+05001000150020002500300001Season
+050010001500200025003000010
+Residual (b) OneShotSTL
+0500100015002000250030000510Raw
+Trend
+05001000150020002500300001Season
+0500100015002000250030000510
+Residual (c) RobustSTL
+Figure 5: Decomposition results on dataset SYNTHETIC
+0 100 200 300 400500010000Raw
+Trend
+0 100 200 300 400−500005000
+Season
+0 100 200 300 400−5000−25000Residual
+(a) BacktrackSTL on REAL1
+0 100 200 300 400500010000Raw
+Trend
+0 100 200 300 400−50000Season
+0 100 200 300 400−500005000Residual (b) OneShotSTL on REAL1
+0 100 200 300 400500010000Raw
+Trend
+0 100 200 300 400−500005000Season
+0 100 200 300 400−50000Residual (c) RobustSTL on REAL1
+Figure 6: Decomposition results on dataset REAL1
+capturing trend jumps and outliers well, while tolerating seasonal-
+ity shift. It is worth noting that the figures of online algorithms are
+drawn using the decomposition results without delay. Therefore, in
+(a) and (b), outlier in the residual near each detected jump attests
+to the inherent algorithm-independent presence of latency within
+online scenarios. In contrast, this occurrence is notably absent for
+offline RobustSTL in (c). Besides, for OneShotSTL in (b), due to
+the𝑙2-norm of the residual term in the optimization objective, it
+cannot handle severe outliers well. At the same time, it also fails to
+capture trend jumps, because the automatically determined regularparameters are not suitable. Moreover, Table 3 shows the mean
+absolute error (MAE) between the decomposition results and the
+ground truth. The performance of BacktrackSTL is comparable to
+RobustSTL, much better than other online algorithms.
+The visual results of two real datasets are presented in Figure 6-7.
+Similar to the results of SYNTHETIC, the decomposition of Back-
+trackSTL is comparable to that of RobustSTL, and significantly
+outperforms OneShotSTL. Specifically, as shown in Figure 6(a), the
+dip at time 348 is left in the residual, which makes it easy to be
+detected in downstream anomaly detection tasks. However, since
+5854KDD ’24, August 25–29, 2024, Barcelona, Spain. Haoyu Wang et al.
+0100200300400500600300035004000Raw
+Trend
+0100200300400500600−2000200400Season
+0100200300400500600−400−2000200Residual
+(a) BacktrackSTL on REAL2
+01002003004005006002500300035004000Raw
+Trend
+0100200300400500600−2500250Season
+0100200300400500600−2000200Residual (b) OneShotSTL on REAL2
+0100200300400500600300035004000Raw
+Trend
+0100200300400500600−2000200Season
+0100200300400500600−400−2000200 Residual (c) RobustSTL on REAL2
+Figure 7: Decomposition results on dataset REAL2
+Table 3: Decomposition comparison over SYNTHETIC
+Algorithm Type Trend MAE Seasonality MAE
+STL Offline 0.085 0.017
+SSA Offline 0.169 0.152
+TBATS Offline 0.066 0.064
+RobustSTL Offline 0.010 0.027
+Window-STL Online 0.165 0.066
+Window-SSA Online 0.444 0.426
+Window-TBATS Online 0.339 0.115
+Window-RobustSTL Online 0.071 0.030
+Online-RobustSTL Online 0.073 0.030
+OnlineSTL Online 0.368 0.303
+OneShotSTL Online 0.150 0.077
+BacktrackSTL Online 0.012 0.023
+the optimization objective of OneShotSTL does not sufficiently tol-
+erate the fluctuation of seasonality, there are still some periodic
+components in the residuals in Figure 6(b). Additionally, at time
+0-300 in Figure 7(a), BacktrackSTL effectively decomposes the series
+with a smoothly rising trend. Outlier-resilient smoothing regards
+the moving average without outliers as the extracted trend, thereby
+accurately capturing the smooth ascent of the series.
+6.3 Evaluation on Time Efficiency
+Next, we evaluate the time efficiency of the algorithms. We extend
+the dataset SYNTHETIC to obtain a sufficient long time series. Since
+the time complexity of most algorithms is related to the period
+length𝑇, Figure 8 shows the online update latency of a single value
+with respect to 𝑇, where𝑇takes values from 200 to 12800.
+200 400 800 1600 3200 6400 12800
+T1001021041061081010Update Latency (us)
+OnlineSTL
+OneShotSTL
+BacktrackSTL
+Window-STLWindow-SSA
+Window-TBATS
+Window-RobustSTL
+Online-RobustSTLFigure 8: Comparison on update latency
+The latency of BacktrackSTL is approximately 1.6𝜇𝑠per value,
+which represents a 103−1011×improvement over offline algo-
+rithms’ online variants, such as Window-STL, etc. This substantial
+improvement is chiefly attributable to the inherent algorithmic time
+complexities rather than variations across programming languages.
+Meanwhile, the latency is independent of the period length, which
+is consistent with our theoretical complexity of 𝑂(1). Compared to
+OneShotSTL with complexity of 𝑂(𝐼), BacktrackSTL achieves about
+15×improvement because it does not require iteration (maximum
+iterations𝐼=8for OneShotSTL) and has a smaller constant com-
+plexity. Additionally, it is also significantly faster than OnlineSTL
+with update complexity 𝑂(𝑇),5×when𝑇=200and400×when
+𝑇=12800.
+6.4 Evaluation on Robustness
+The period length 𝑇is an important parameter of BacktrackSTL. For
+real datasets, however, the value of 𝑇discovered by algorithms may
+5855BacktrackSTL: Ultra-Fast Online Seasonal-Trend Decomposition with Backtrack Technique KDD ’24, August 25–29, 2024, Barcelona, Spain.
+05101520ΔT0.00.10.20.3MAE
+H=0H=20
+(a) Trend MAE
+05101520ΔT0.00.10.20.3MAE
+H=0H=20 (b) Seasonality MAE
+Figure 9: Robustness on period length
+1 4 16 64 256
+N0123Latency (us)
+Latency
+(a) Latency
+141664256
+N0.00.20.4MAE
+Trend
+Season (b) MAE
+Figure 10: Influence of N-Sigma
+not always be true. Thus, we evaluate the tolerance of BacktrackSTL
+to errors in𝑇. Specially, we add a period length error Δ𝑇to𝑇and
+evaluate its MAE for the trend and seasonality. The values of Δ𝑇
+are set to{0,5,10,15,20}.
+Figure 9 shows the experimental results. Without extra process-
+ing, i.e.,𝐻=0, the MAE of trend and seasonality increase with Δ𝑇
+as shown by the blue line. Actually, the impact of an incorrect pe-
+riod length𝑇can be weakened by a proper neighborhood width 𝐻.
+If the width is large enough to cover the period error, e.g., 𝐻=20,
+the MAE significantly decrease, as shown by the orange line.
+6.5 Influence of N-Sigma Strategy
+In outlier-resilient smoothing in Section 4.2, we employ the N-sigma
+strategy for outlier detection. Consequently, 𝑁serves as a critical
+parameter in distinguishing noise from outliers. Thus, To explore
+the impact of varying 𝑁, we perform an evaluation of the average
+update latency and the trend/seasonality MAE with varying 𝐾. This
+evaluation is conducted on the SYNTHETIC dataset. The results
+are shown in Figure 10 with logarithmic-scaled horizontal axis.
+As the parameter 𝑁increases, a greater number of outliers are
+classified as noise, leading to a reduction in the number of de-
+tected jumps. This, in turn, results in a lesser number of backtracks
+and marginally reduces latency, as depicted in (a). Concerning the
+trend/seasonality MAE depicted in (b), we observe that both ex-
+cessively small and large values of 𝑁yield a detrimental effect.
+However, the performance retains robustness over a substantially
+wide range of 𝑁, suggesting that the parameter is not difficult to
+configure. In light of the commonly adopted N-sigma strategy and
+the infrequency of outliers, we set 𝑁=6uniformly in the proposal.7 Related Work
+STD has been the subject of extensive research for several decades.
+Among them, STL [ 16] is one of the most famous algorithms, which
+utilizes local regression (LOESS) smoothing to extract trend and
+seasonality, iterating until convergence. Meanwhile, SSA [ 22] folds
+the time series into a matrix based on the period length and em-
+ploys singular value decomposition (SVD) to extract the seasonality.
+Moreover, TBATS [ 26] builds a state space model for time series and
+solves it with maximum likelihood estimation (MLE), thereby pro-
+viding confidence intervals for the results. STR [ 17] combines trend
+and seasonality into a joint optimization function, while its variant
+Robust-STR [ 17] further enhances the algorithm’s robustness by
+introducing the 𝑙1-norm. After that, RobustSTL [ 35] is proposed,
+which utilizes 𝑙1-norm optimization to extract trend in the presence
+of trend jumps and outliers, and employs non-local seasonal filter-
+ing to extract seasonality with shifts. Furthermore, Fast RobustSTL
+[37] extends RobustSTL to support multiple seasonality and speeds
+up it with ADMM algorithm.
+In recent years, researchers have focused more on the online
+scenario. The most straightforward online strategy is to run the
+above offline algorithms within a sliding window. However, the time
+cost is extremely high. For instance, the time complexity of each
+decomposition is 𝑂(𝐼𝑊2)for RobustSTL on the sliding window.
+To address the efficiency issue, several native online STD al-
+gorithms have been proposed. OnlineSTL [ 27] is the first online
+algorithm, which decomposes time series 100×faster than tradi-
+tional STL. However, its complexity is still dependent with period
+length, making it less effective with long-period time series. On
+the other hand, OneShotSTL [ 23] calculates the trend and seasonal-
+ity using a joint optimization function and utilizes linear systems
+to approximate the solution. However, this approximation still re-
+quires iterations to approach the optimal solution, leaving space
+for optimization in terms of time efficiency. Different from the
+above algorithms, BacktrackSTL combines period-insensitive steps
+such as outlier-resilient smoothing and non-local seasonal filtering,
+achieving much lower update latency without iterations.
+8 Conclusion
+In this paper, we introduce BacktrackSTL, a novel seasonal-trend
+decomposition algorithm with 𝑂(1)time complexity. Our investiga-
+tion highlights that the main bottleneck for RobustSTL in terms of
+time efficiency is the high-complexity 𝑙1-norm optimization though
+it is robust to outliers and trend jumps. Therefore, we combine
+outlier-resilient smoothing and backtrack strategy to replace the
+optimization, and inherit non-local seasonal filtering, resulting in a
+significant improvement in time efficiency while still addressing
+trend jumps, seasonality shifts, and outliers. Our experimental re-
+sults demonstrate that our algorithm BacktrackSTL decomposes a
+value within 1.6𝜇𝑠, which is 15×faster than state-of-the-art online
+algorithms.
+Acknowledgments
+The authors would like to thank all reviewers and chairs for their
+helpful comments, and Prof. Shaoxu Song and Dr. Chengguang
+Fang for their encouragements and helps. Haoyu Wang (https:
+//wanghy.pages.dev/) is the corresponding author.
+5856KDD ’24, August 25–29, 2024, Barcelona, Spain. Haoyu Wang et al.
+References
+[1] 2023. Apache Flink. https://flink.apache.org/
+[2]2023. Elastic Compute Service (ECS). https://www.alibabacloud.com/help/en/
+ecs/
+[3] 2023. OneShotSTL. https://github.com/xiao-he/OneShotSTL
+[4]2023. Realtime Compute for Apache Flink. https://www.alibabacloud.com/help/
+en/flink/
+[5] 2023. Simple Log Service (SLS). https://www.alibabacloud.com/help/en/sls/
+[6] 2023. SREWorks. https://github.com/alibaba/SREWorks/
+[7] 2023. STL. https://github.com/ServiceNow/stl-decomp-4j
+[8] 2024. Artifact of BacktrackSTL. https://github.com/543202718/BacktrackSTL
+[9]2024. Daily Minimum Temperatures in Melbourne. https://www.kaggle.com/
+datasets/samfaraday/daily-minimum-temperatures-in-me
+[10] 2024. Daily total female births in California, 1959. https://www.kaggle.com/
+datasets/dougcresswell/daily-total-female-births-in-california-1959
+[11] 2024. MaxCompute. https://www.aliyun.com/product/odps
+[12] 2024. R package foreacst. https://cran.r-project.org/web/packages/forecast/
+index.html
+[13] 2024. Sunspots. https://www.kaggle.com/datasets/robervalt/sunspots
+[14] 2024. Tair. https://www.aliyun.com/product/apsaradb/kvstore/tair
+[15] Paul Boniol, Michele Linardi, Federico Roncallo, Themis Palpanas, Mohammed
+Meftah, and Emmanuel Remy. 2021. Unsupervised and scalable subsequence
+anomaly detection in large data series. VLDB J. 30, 6 (2021), 909–931. https:
+//doi.org/10.1007/s00778-021-00655-8
+[16] Robert B Cleveland, William S Cleveland, Jean E McRae, and Irma Terpenning.
+1990. STL: A seasonal-trend decomposition. J. Off. Stat 6, 1 (1990), 3–73.
+[17] Alexander Dokumentov, Rob J Hyndman, et al .2015. STR: A seasonal-trend
+decomposition procedure based on regression. Monash econometrics and business
+statistics working papers 13, 15 (2015), 2015–13.
+[18] Hadi Fanaee-T. 2013. Bike Sharing Dataset. UCI Machine Learning Repository.
+DOI: https://doi.org/10.24432/C5W894.
+[19] Hadi Fanaee-T and Joao Gama. 2013. Event labeling combining ensemble detec-
+tors and background knowledge. Progress in Artificial Intelligence (2013), 1–15.
+https://doi.org/10.1007/s13748-013-0040-3
+[20] Valentin Flunkert, David Salinas, and Jan Gasthaus. 2017. DeepAR: Probabilistic
+Forecasting with Autoregressive Recurrent Networks. CoRR abs/1704.04110
+(2017). arXiv:1704.04110 http://arxiv.org/abs/1704.04110
+[21] Jingkun Gao, Xiaomin Song, Qingsong Wen, Pichao Wang, Liang Sun, and
+Huan Xu. 2020. RobustTAD: Robust Time Series Anomaly Detection via De-
+composition and Convolutional Neural Networks. CoRR abs/2002.09545 (2020).
+arXiv:2002.09545 https://arxiv.org/abs/2002.09545
+[22] Nina Golyandina and E Osipov. 2007. The “Caterpillar”-SSA method for analysis
+of time series with missing values. Journal of Statistical planning and Inference
+137, 8 (2007), 2642–2653.
+[23] Xiao He, Ye Li, Jian Tan, Bin Wu, and Feifei Li. 2023. OneShotSTL: One-Shot
+Seasonal-Trend Decomposition For Online Time Series Anomaly Detection And
+Forecasting. Proc. VLDB Endow. 16, 6 (2023), 1399–1412. https://www.vldb.org/
+pvldb/vol16/p1399-he.pdf
+[24] Scott H Holan and Nalini Ravishanker. 2018. Time series clustering and classifi-
+cation via frequency domain methods. Wiley Interdisciplinary Reviews: Computa-
+tional Statistics 10, 6 (2018), e1444.
+[25] Davor Horvatic, H Eugene Stanley, and Boris Podobnik. 2011. Detrended cross-
+correlation analysis for non-stationary time series with periodic trends. Euro-
+physics Letters 94, 1 (2011), 18007.[26] Alysha M De Livera and Rob J Hyndman. 2011. Forecasting time series with
+complex seasonal patterns using exponential smoothing. Monash Econometrics &
+Business Statistics Working Papers 106, 496 (2011), 1513–1527.
+[27] Abhinav Mishra, Ram Sriharsha, and Sichen Zhong. 2022. OnlineSTL: Scaling
+Time Series Decomposition by 100x. Proc. VLDB Endow. 15, 7 (2022), 1417–1425.
+https://www.vldb.org/pvldb/vol15/p1417-mishra.pdf
+[28] Denise R. Osborn. 1995. Moving Average Detrending and the Analysis of Business
+Cycles. Oxford Bulletin of Economics and Statistics 57, 4 (1995), 547–558.
+[29] Donald B Percival and Andrew T Walden. 2000. Wavelet methods for time series
+analysis. Vol. 4. Cambridge university press.
+[30] Kira Rehfeld, Norbert Marwan, Jobst Heitzig, and Jürgen Kurths. 2011. Com-
+parison of correlation analysis techniques for irregularly sampled time series.
+Nonlinear Processes in Geophysics 18, 3 (2011), 389–404.
+[31] Manel Rhif, Ali Ben Abbes, Imed Riadh Farah, Beatriz Martínez, and Yanfang
+Sang. 2019. Wavelet transform application for/in non-stationary time-series
+analysis: A review. Applied Sciences 9, 7 (2019), 1345.
+[32] Shaoxu Song, Aoqian Zhang, Jianmin Wang, and Philip S. Yu. 2015. SCREEN:
+Stream Data Cleaning under Speed Constraints. In Proceedings of the 2015 ACM
+SIGMOD International Conference on Management of Data, Melbourne, Victoria,
+Australia, May 31 - June 4, 2015, Timos K. Sellis, Susan B. Davidson, and Zachary G.
+Ives (Eds.). ACM, 827–841. https://doi.org/10.1145/2723372.2723730
+[33] Haoyu Wang and Shaoxu Song. 2022. Frequency Domain Data Encoding in
+Apache IoTDB. Proc. VLDB Endow. 16, 2 (2022), 282–290. https://doi.org/10.
+14778/3565816.3565829
+[34] Haoyu Wang, Aoqian Zhang, Shaoxu Song, and Jianmin Wang. 2023. Streaming
+data cleaning based on speed change. VLDB J. (2023). https://doi.org/10.1007/
+s00778-023-00796-y
+[35] Qingsong Wen, Jingkun Gao, Xiaomin Song, Liang Sun, Huan Xu, and Shenghuo
+Zhu. 2019. RobustSTL: A Robust Seasonal-Trend Decomposition Algorithm for
+Long Time Series. In The Thirty-Third AAAI Conference on Artificial Intelligence,
+AAAI 2019, The Thirty-First Innovative Applications of Artificial Intelligence Confer-
+ence, IAAI 2019, The Ninth AAAI Symposium on Educational Advances in Artificial
+Intelligence, EAAI 2019, Honolulu, Hawaii, USA, January 27 - February 1, 2019.
+AAAI Press, 5409–5416. https://doi.org/10.1609/aaai.v33i01.33015409
+[36] Qingsong Wen, Kai He, Liang Sun, Yingying Zhang, Min Ke, and Huan Xu. 2021.
+RobustPeriod: Robust Time-Frequency Mining for Multiple Periodicity Detection.
+InSIGMOD ’21: International Conference on Management of Data, Virtual Event,
+China, June 20-25, 2021, Guoliang Li, Zhanhuai Li, Stratos Idreos, and Divesh
+Srivastava (Eds.). ACM, 2328–2337. https://doi.org/10.1145/3448016.3452779
+[37] Qingsong Wen, Zhe Zhang, Yan Li, and Liang Sun. 2020. Fast RobustSTL: Ef-
+ficient and Robust Seasonal-Trend Decomposition for Time Series with Com-
+plex Patterns. In KDD ’20: The 26th ACM SIGKDD Conference on Knowledge
+Discovery and Data Mining, Virtual Event, CA, USA, August 23-27, 2020 , Rajesh
+Gupta, Yan Liu, Jiliang Tang, and B. Aditya Prakash (Eds.). ACM, 2203–2213.
+https://doi.org/10.1145/3394486.3403271
+[38] Jiehui Xu, Haixu Wu, Jianmin Wang, and Mingsheng Long. 2022. Anomaly
+Transformer: Time Series Anomaly Detection with Association Discrepancy. In
+The Tenth International Conference on Learning Representations, ICLR 2022, Virtual
+Event, April 25-29, 2022. OpenReview.net. https://openreview.net/forum?id=
+LzQQ89U1qm_
+[39] Aoqian Zhang, Shaoxu Song, Jianmin Wang, and Philip S. Yu. 2017. Time Series
+Data Cleaning: From Anomaly Detection to Anomaly Repairing. Proc. VLDB
+Endow. 10, 10 (2017), 1046–1057. https://doi.org/10.14778/3115404.3115410
+5857BacktrackSTL: Ultra-Fast Online Seasonal-Trend Decomposition with Backtrack Technique KDD ’24, August 25–29, 2024, Barcelona, Spain.
+1 3 5 7 9
+K048Latency (us)
+Latency
+(a) Latency
+1 3 5 7 9
+K0.0000.0050.010Trend MAE
+0.000.020.04
+Seasonality MAE
+Trend
+Season (b) MAE
+Figure 11: Influence of window size 𝑊=(𝑘+1)𝑇
+A BacktrackSTL Initialization
+We use a simple offline algorithm in initialization with the first
+𝑊=(𝐾+1)𝑇values. The first step is jump detection. We calculate
+a new sequence 𝑑𝑇+1...𝑊−𝑇+1as follows:
+𝑑𝑖=1
+𝑇(𝑖+𝑇−1∑︁
+𝑗=𝑖𝑦𝑗−𝑖−1∑︁
+𝑗=𝑖−𝑇𝑦𝑗), 𝑇+1≤𝑖≤𝑊−𝑇+1 (14)
+Subsequently, we identify the local maximum/minimum values
+in the sequence as candidate jump points. For a candidate point 𝑑𝑖,
+if the difference before and after it exceeds the N-Sigma constraint,
+it is classified as a jump point. Formally, a jump point is a candidate
+which satisfies the following formula:
+|𝑑𝑖|>𝑛∗max{𝑠𝑡𝑑(𝑦𝑖...𝑖+𝑇−1),𝑠𝑡𝑑(𝑦𝑖−𝑇...𝑖−1)} (15)
+Suppose we have 𝑚jump points, donated as 𝑃1,𝑃2,...,𝑃𝑚. Let
+𝑃0=0and𝑃𝑚+1=𝑊+1, we divide the sequence into 𝑚+1
+segments based on the jump points. The 𝑘-th segment starts from
+index𝑃𝑘−1and ends at index 𝑃𝑘−1, formulated as 𝑦𝑃𝑘−1...𝑃𝑘−1.
+After that, we calculate the moving average of length 𝑇as the
+trend for each segment. Specifically, if the segment is shorter than
+𝑇, i.e.,𝑃𝑘−𝑃𝑘−1<𝑇, the estimated trend term for any point 𝑡
+within the segment is given by
+𝜏𝑡=𝑚𝑒𝑎𝑛(𝑦𝑃𝑘−1...𝑃𝑘−1) (16)
+Otherwise, the trend is as follows:
+𝜏𝑡=(
+𝑚𝑒𝑎𝑛(𝑦𝑡...𝑡+𝑇−1)𝑖𝑓 𝑡+𝑇≤𝑃𝑘
+𝑚𝑒𝑎𝑛(𝑦𝑃𝑘−𝑇...𝑃 𝑘−1)𝑖𝑓 𝑡+𝑇>𝑃𝑘(17)
+Next, we employ the non-local seasonal filtering in Section 4.3
+to calculate the seasonality component. If the neighborhood Ωis
+empty, we directly regard the de-trend value 𝑦′
+𝑡as the seasonal
+component. Finally, we obtain the residual by subtracting the trend
+and seasonal component from the original values.
+B Additional Experiments
+B.1 Influence of Window Size
+For online STD algorithms, the choice of window size 𝑊is a pivotal
+factor that influences both the accuracy and time efficiency of the
+approach. Within the BacktrackSTL framework, 𝑊is defined as
+(𝐾+1)𝑇, where𝑇represents the data-driven period length and
+𝐾is a user-adjustable parameter. Thus, similar to the experiments
+in Section 6.5, we perform an evaluation to explore the impact of
+varying window sizes. It is conducted on the synthetic dataset ( 𝑇=
+200) described in Section 6.3, with results illustrated in Figure 11.As illustrated in Figure 11(a), the update latency exhibits a linear
+increase with the increment of 𝐾, which aligns with our theoretical
+analysis provided in Proposition 4.1 Observations from Figure 11(b)
+indicate that the seasonality MAE remains relatively stable across
+the evaluated range. Meanwhile, the trend MAE decreases initially
+and then stabilizes for values of 𝐾≥2, a phenomenon largely
+attributed to inadequate smoothing at smaller window sizes. In light
+of the analysis presented, and to effectively balance time efficiency
+with decomposition accuracy, 𝐾=2is selected for all experiments
+in this proposal.
+B.2 Visual Decomposition Results
+To demonstrate the generalizability of BacktrackSTL, we conduct ex-
+periments on an extended range of datasets. The following datasets
+are utilized for this purpose:
+•TEMPERATURE [ 9,19]: The daily minimum temperature in
+Melbourne, Australia from 1981 to 1990. The series length is
+3650 with𝑇=365.
+•SUNSPOT [ 13]: The monthly count of observed sunspots
+from 1749 to 1983. The series length is 2820 with 𝑇=120.
+•BIKE [ 18]: The daily bike sharing rental totals in Capital
+bike-share system from 2011 to 2012. The series length is
+731 with𝑇=7.
+•BIRTH [ 10]: The daily number of female births in California
+in 1959. The series length is 365 with 𝑇=7.
+•CPU1: The CPU utilization of a certain virtual machine in
+Alibaba Cloud over a week. The sampling interval is one
+minute. The series length is 10080 with 𝑇=1440.
+•CPU2: The CPU utilization of another virtual machine in
+Alibaba Cloud. The series length is also 10080 with 𝑇=1440.
+Figure 12 shows the visual decomposition results of Backtrack-
+STL on above six datasets. Since there are too many periods in BIKE
+and BIRTH datasets, we only display part of the series for clarity.
+As demonstrated in (a), it is not surprising that TEMPERATURE
+dataset, characterized by its distinct periodic patterns, is effectively
+decomposed by BacktrackSTL. In the case of SUNSPOT dataset
+presented in (b), despite the noticeable variation in the amplitude
+of seasonal components, BacktrackSTL maintains its robustness,
+attributed to the adaptability granted by the 𝛿parameter.
+For BIKE dataset in (c) and BIRTH dataset in (d), although their
+periodicities are not as strong as those in the other datasets, the de-
+composition still aligns well with the data characteristics. Especially,
+BacktrackSTL extracts the rising trend in (c) successfully.
+For the two CPU datasets with large period length and long series
+in (e) and (f), BacktrackSTL also exhibits proficient decomposition
+capability. It accurately extracts the smooth trend and the seasonal
+components with shifts, leaving a minimal number of outliers in
+the residual components.
+In summary, BacktrackSTL exhibits great performance across
+datasets from various domains, demonstrating its generalizabil-
+ity. The effectiveness of BacktrackSTL is unaffected by the period
+length or series length of the dataset. Moreover, given that the
+complexity of BacktrackSTL is 𝑂(1), which is independent of the
+period length 𝑇, it is an appropriate solution for periodic time series
+decomposition.
+5858KDD ’24, August 25–29, 2024, Barcelona, Spain. Haoyu Wang et al.
+0 1000 2000 300001020Raw
+Trend
+0 1000 2000 3000−10010 Season
+0 1000 2000 300005Residual
+(a) TEMPERATURE
+0 500 1000 1500 20000100200Raw
+Trend
+0 500 1000 1500 20000100Season
+0 500 1000 1500 2000050100
+Residual (b) SUNSPOT
+400 420 440 460 480 500025005000750010000
+Raw
+Trend
+400 420 440 460 480 500−2000020004000
+Season
+400 420 440 460 480 500−200002000Residual (c) BIKE
+120 130 140 150 160 17020406080
+Raw
+Trend
+120 130 140 150 160 170−10010Season
+120 130 140 150 160 170−505Residual
+(d) BIRTH
+02000 4000 6000 8000 10000204060 Raw
+Trend
+02000 4000 6000 8000 1000002040 Season
+02000 4000 6000 8000 10000010Residual (e) CPU1
+02000 4000 6000 8000 100002040Raw
+Trend
+02000 4000 6000 8000 10000020Season
+02000 4000 6000 8000 1000001020
+Residual (f) CPU2
+Figure 12: Decomposition results on various datasets
+5859

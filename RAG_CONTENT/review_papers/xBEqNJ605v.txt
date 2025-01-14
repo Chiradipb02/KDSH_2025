@@ -1,0 +1,987 @@
+Under review as submission to TMLR
+The Journey, Not the Destination:
+How Data Guides Diffusion Models
+Anonymous authors
+Paper under double-blind review
+Abstract
+Diffusion models trained on large datasets can synthesize photo-realistic images of remarkable
+quality and diversity. However, attributing these images back to the training data—that
+is, identifying specific training examples which causedan image to be generated—remains
+a challenge. In this paper, we propose a framework that: (i) provides a formal notion of
+data attribution in the context of diffusion models, and (ii) allows us to counterfactually
+validate such attributions. Then, we provide a method, Journey- trak, for computing
+these attributions efficiently. Finally, we apply Journey- trakto find (and evaluate) such
+attributions for denoising diffusion probabilistic models trained on CIFAR-10 and latent
+diffusion models trained on MS COCO. We provide code at this https URL.
+1 Introduction
+Diffusion models can generate novel images that are simultaneously photorealistic and highly controllable via
+textual prompting (Ramesh et al., 2022; Rombach et al., 2022). A key driver of diffusion models’ performance
+is training them on massive amounts of data (Schuhmann et al., 2022). Yet, this dependence on data has
+given rise to concerns about how diffusion models use it.
+For example, Carlini et al. (2021); Somepalli et al. (2022) show that diffusion models often memorize training
+images and “regurgitate” them during generation. However, beyond such cases of direct memorization, we
+currently lack a method for attributing generated images back to the most influential training examples—that
+is, identifying examples that causeda given image to be generated. Indeed, such a primitive—a data attribution
+method—would have a number of applications. For example, previous work has shown that attributing model
+outputs back to data can be important for debugging model behavior (Shah et al., 2022), detecting poisoned
+or mislabelled data (Lin et al., 2022), and curating higher quality training datasets (Khanna et al., 2019).
+Within the context of diffusion models, data attribution can also help detect cases of data leakage (i.e.,
+privacy violations), and more broadly, can be a valuable tool in the context of tracing content provenance
+relevant to questions of copyright (Andersen et al., 2023; Images, 2023). Finally, synthetic images generated
+by diffusion models are now increasingly used across the entire machine learning pipeline, including training
+(Azizi et al., 2023) and model evaluation (Kattakinda et al., 2022; Wiles et al., 2022; Vendrow et al., 2023).
+Thus, it is critical to identify (and mitigate) failure modes of these models that stem from training data, such
+as bias propagation (Luccioni et al., 2023; Perera & Patel, 2023) and memorization. Motivated by all the
+above needs, we thus ask:
+How can we reliably attribute images synthesized by diffusion models back to the training data?
+Although data attribution has been extensively studied in the context of supervised learning (Koh & Liang,
+2017; Ghorbani et al., 2019; Jia et al., 2019; Ilyas et al., 2022; Hammoudeh & Lowd, 2022; Park et al., 2023),
+the generative setting poses new challenges. First, it is unclear what particular behavior of these models we
+hope to attribute. For example, given a generated image, certain training images might be responsible for
+the look of the background, while others might be responsible for the choice of an object appearing in the
+foreground. Second, it is not immediately obvious how to verifythe attributions. In supervised settings, a
+standard approach is to compare the outputs of the original model on given inputs with those of a new model
+1Under review as submission to TMLR
+Diffusion Trajectory Positive Inﬂuencers Negative inﬂuencersDarker background Different color Different pot
+Generative (Reverse Diffusion) Process
+Final sample Initial noise  t=T
+  t=0
+Figure 1: Overview of our attribution framework. For a given synthesized image, we apply Journey-
+trak, our attribution method, at individual steps along the diffusion trajectory. At each step t, Journey- trak
+pinpoints the training examples with the highest influence (positive in green, negative in red) on the generative
+process at that step. In particular, positive influencers guide the trajectory towards the final sample, while
+negative influencers guide the trajectory away from it. We observe that negative influencers increasingly
+resemble the final sample (the grey text highlights notable differences with the final sample). For more
+examples, see Appendix E.
+trained on a new dataset after removing the attributed examples. However, in the generative setting it is less
+clear how to make such comparisons.
+Our contributions. In this work, we present a data attribution framework for diffusion models. This
+framework reflects, and is motivated by, the fact that diffusion models iteratively denoise an initial random
+seed to generate the final image. In particular, rather than attributing onlythe final generated image, i.e., the
+“destination,” we attribute each individual step along the (denoising) “journey” taken by diffusion model (see
+Figure 1). This approach shifts our focus from the specific final image to the distribution of possible generated
+images and, in particular, how this distribution evolves across the diffusion process. As we demonstrate, this
+framework also enables us to attribute specific featuresof the final generated image.
+To analyze this framework, we introduce two complementary metrics for evaluating the resulting attributions
+based on their counterfactual impact on the distribution of generated images (rather than on specific samples).
+Finally, we provide an efficient method for computing such attributions, building on data attribution
+approaches developed for the supervised setting (Ilyas et al., 2022; Park et al., 2023). We then apply
+our method Journey- trakto denoising diffusion probabilistic models (DDPM) (Ho et al., 2020) trained
+on CIFAR-10 (Krizhevsky, 2009), and latent diffusion models (LDM) (Rombach et al., 2022) trained on
+MS COCO (Lin et al., 2014). In both of these settings, we obtain attributions that are validated by our
+metrics and also visually interpretable.
+2 Preliminaries
+We first provide background on data attribution. Then, we give a brief overview of diffusion models,
+highlighting the components that we will need to formalize attribution for these models.
+2.1 Data attribution
+Broadly, the goal of training data attribution (Koh & Liang, 2017; Ilyas et al., 2022; Hammoudeh & Lowd,
+2022; Park et al., 2023) is to trace model outputs back to the training data. Intuitively, we want to estimate
+how the presence of each example in the training set impacts a given model output of interest (e.g., the loss
+of a classifier) on a specific input.
+To formalize this, consider a learning algorithm A(e.g., a training recipe for a model), together with an
+input spaceZand a training dataset S= (z1,...,zn)∈Znofndatapoints from that input space. Given a
+datapointz∈Z, we represent the model output via a model output function f(z,θ(S)) :Z×Rd→R, where
+2Under review as submission to TMLR
+θ(S)∈Rddenotes the model parameters resulting from running algorithm Aon the datasetS. For example,
+f(z,θ(S))is the loss on a test sample zof a classifier trained on S. ( Our notation here reflects the fact
+that the parameters are a function of the training dataset S.) We now define a data attribution method as a
+functionτ:Z×Zn→Rnthat assigns a score τ(z,S)i∈Rto each training example zi∈S.1Intuitively,
+we wantτ(z,S)ito capture the change in the model output function f(z,θ(S))induced by adding zito the
+training set.
+More generally, these scores should help us make counterfactual predictions about the model behavior resulting
+from training on an arbitrary subset S′⊆Sof the training datapoints. We can formalize this goal using the
+datamodeling task (Ilyas et al., 2022): given an arbitrary subset S′⊆Sof the training set, the task is to
+predict the resulting model output f(z,θ(S′)). A simple method to use the attribution scores for this task,
+then, is to consider a linearpredictor:f(z,θ(S′))≈/summationtext
+i:zi∈S′τ(z,S)i.2
+This view of the data attribution as a prediction task motivates a natural metric for evaluating attribution
+methods: the agreement between the true output f(z,θ(S′))and the output predicted by the attribution
+methodτ. Park et al. (2023) consider the rank correlation between the true and predicted values of f(z,θ(S′))
+over different random samples S′⊆Sand name the corresponding metric the linear datamodeling score —we
+will adapt it to our setting in Section 3.
+Estimating attribution scores (efficiently). Given the model output function fevaluated at input z, a
+natural way to assign an attribution score τ(z)ifor a training datapoint ziis to consider the marginal effect
+of including that particular example on the model output, i.e., have τ(z)i=f(z,θ(S))−f(z,θ(S\{zi})).
+We can further approximate this difference by decomposing it as:
+τ(z)i= ( θ−θ−i)/bracehtipupleft/bracehtipdownright/bracehtipdownleft/bracehtipupright
+(i) change in model parameters·(ii) change in model output/bracehtipdownleft/bracehtipupright/bracehtipupleft/bracehtipdownright
+∇θf(z,θ), (1)
+whereθ−idenotesθ(S\{i})(Wojnowicz et al., 2016; Koh & Liang, 2017). We can compute the second
+component efficiently, as this only requires taking the gradient of the model output function with respect to
+the parameters; in contrast, computing the first component is not always straightforward. In simpler settings,
+such as linear regression, we can compute the first component explicitly, as there exists a closed-form solution
+for computing the parameters θ(S′)as a function of the training set S′. However, in modern, non-convex
+settings, estimating this component efficiently (i.e., without re-training the model) is challenging. Indeed,
+prior works such as influence functions (Koh & Liang, 2017) and TracIn (Pruthi et al., 2020) estimate the
+change in model parameters using different heuristics, but these approaches can be inaccurate in such settings.
+To address these challenges, trak(Park et al., 2023) observed that for deep neural networks, approximating
+the original model with a model that is linearin its parameters, and averaging the estimates over multiple θ’s
+(to overcome stochasticity in training) yields highly accurate attribution scores. The linearization is motivated
+by the observation that at small learning rates, the trajectory of gradient descent on the original neural
+network is well approximated by that of a corresponding linear model (Long, 2021; Wei et al., 2022; Malladi
+et al., 2022). In this paper, we will leverage the trakframework towards attributing diffusion models.
+2.2 Diffusion models
+Training and sampling from diffusion models. At a high level, diffusion models (and generative models,
+more broadly) learn a distribution pθ(·)meant to approximate a target distribution qdata(·)of interest (e.g.,
+natural images). To perform such learning, given a (training) sample x0∼qdata(·), diffusion models first
+apply a stochastic diffusion process that gradually corrupts x0by adding more noise to it at each step. This
+results in a sequence of intermediate latents {xt}t∈[T]sampled according to xt∼N (αt·xt−1,(1−αt)·I)
+where{αt}tare parameters of the diffusion process (Sohl-Dickstein et al., 2015; Song & Ermon, 2019; Ho
+1Following the literature, we say that an example zihas apositive (respectively, negative) influence ifτ(z,S)i>0(respectively,
+τ(z,S)i<0).
+2Similarly to the prior work (Park et al., 2023), we only consider linear predictors here.
+3Under review as submission to TMLR
+<latexit sha1_base64="xJuaGkHFnxVIz+Saf7528cclJTQ=">AAACEnicbVC5TsNAEF2HK4TLQEljESElTWRHXGUEDWWQyCEllrXerJNV1od2x4jI+Bto+BUaChCipaLjb1gnLkLCk1Z6+96MZua5EWcSTPNHK6ysrq1vFDdLW9s7u3v6/kFbhrEgtEVCHoquiyXlLKAtYMBpNxIU+y6nHXd8nfmdeyokC4M7mETU9vEwYB4jGJTk6NXI6cOIAq70fQwj10seUicx08f5b90006qjl82aOYWxTKyclFGOpqN/9wchiX0aAOFYyp5lRmAnWAAjnKalfixphMkYD2lP0QD7VNrJ9KTUOFHKwPBCoV4AxlSd70iwL+XEd1Vltqhc9DLxP68Xg3dpJyyIYqABmQ3yYm5AaGT5GAMmKAE+UQQTwdSuBhlhgQmoFEsqBGvx5GXSrtes89rZ7Wm5cZXHUURH6BhVkIUuUAPdoCZqIYKe0At6Q+/as/aqfWifs9KClvccoj/Qvn4B+OGeSQ==</latexit>p✓(x0|x200)
+<latexit sha1_base64="bWF/7wVxuRTho9IMc3Jarcx2Pdo=">AAACEnicbVC7TsNAEDyHVwgvAyWNRYSUNJGNIFBG0FAGiTykxLLOl3NyyvmhuzUiMv4GGn6FhgKEaKno+BvOiYuQMNJJczO72t1xI84kmOaPVlhZXVvfKG6WtrZ3dvf0/YO2DGNBaIuEPBRdF0vKWUBbwIDTbiQo9l1OO+74OvM791RIFgZ3MImo7eNhwDxGMCjJ0auR04cRBVzp+xhGrpc8pE5ipo/z37ppplVHL5s1cwpjmVg5KaMcTUf/7g9CEvs0AMKxlD3LjMBOsABGOE1L/VjSCJMxHtKeogH2qbST6UmpcaKUgeGFQr0AjKk635FgX8qJ76rKbFG56GXif14vBu/STlgQxUADMhvkxdyA0MjyMQZMUAJ8oggmgqldDTLCAhNQKZZUCNbiycukfVqz6rXz27Ny4yqPo4iO0DGqIAtdoAa6QU3UQgQ9oRf0ht61Z+1V+9A+Z6UFLe85RH+gff0C/wGeTQ==</latexit>p✓(x0|x600)
+<latexit sha1_base64="X43RzXDLL5Kc7eJLcr6ZYdlSkTg=">AAACEnicbVC5TsNAEF2HK4TLQEljESElTWSjcJQRNJRBIoeUWNZ6s05WWR/aHSMi42+g4VdoKECIloqOv2GduAgJT1rp7XszmpnnRpxJMM0frbCyura+UdwsbW3v7O7p+wdtGcaC0BYJeSi6LpaUs4C2gAGn3UhQ7LucdtzxdeZ37qmQLAzuYBJR28fDgHmMYFCSo1cjpw8jCrjS9zGMXC95SJ3ETB/nv3XTTKuOXjZr5hTGMrFyUkY5mo7+3R+EJPZpAIRjKXuWGYGdYAGMcJqW+rGkESZjPKQ9RQPsU2kn05NS40QpA8MLhXoBGFN1viPBvpQT31WV2aJy0cvE/7xeDN6lnbAgioEGZDbIi7kBoZHlYwyYoAT4RBFMBFO7GmSEBSagUiypEKzFk5dJ+7RmndfObuvlxlUeRxEdoWNUQRa6QA10g5qohQh6Qi/oDb1rz9qr9qF9zkoLWt5ziP5A+/oF+/GeSw==</latexit>p✓(x0|x400)
+<latexit sha1_base64="P1SyGE2b2TfE5gW2EdAh/1DjWu0=">AAACEnicbVC5TsNAEF2HK4TLQEljESElTWQjjpQRNJRBIoeUWNZ6s05WWR/aHSMi42+g4VdoKECIloqOv2GduAgJT1rp7XszmpnnRpxJMM0frbCyura+UdwsbW3v7O7p+wdtGcaC0BYJeSi6LpaUs4C2gAGn3UhQ7LucdtzxdeZ37qmQLAzuYBJR28fDgHmMYFCSo1cjpw8jCrjS9zGMXC95SJ3ETB/nv3XTTKuOXjZr5hTGMrFyUkY5mo7+3R+EJPZpAIRjKXuWGYGdYAGMcJqW+rGkESZjPKQ9RQPsU2kn05NS40QpA8MLhXoBGFN1viPBvpQT31WV2aJy0cvE/7xeDF7dTlgQxUADMhvkxdyA0MjyMQZMUAJ8oggmgqldDTLCAhNQKZZUCNbiycukfVqzLmrnt2flxlUeRxEdoWNUQRa6RA10g5qohQh6Qi/oDb1rz9qr9qF9zkoLWt5ziP5A+/oFAiCeTw==</latexit>p✓(x0|x800)
+<latexit sha1_base64="P8HG0DABSQjFc44h8TZ7YDbK77I=">AAACA3icbVDLSsNAFJ34rPUVdaebYBFclUnxtSy6cVnBPqCNYTKdtEMnkzAzEcsQcOOvuHGhiFt/wp1/46TNQlsPXDiccy/33hMkjEoF4be1sLi0vLJaWiuvb2xubds7uy0ZpwKTJo5ZLDoBkoRRTpqKKkY6iSAoChhpB6Or3G/fEyFpzG/VOCFehAachhQjZSTf3u8NkdK9CKlhEOqHLPM1zO50DcLMtyuwCidw5olbkAoo0PDtr14/xmlEuMIMSdl1YaI8jYSimJGs3EslSRAeoQHpGspRRKSnJz9kzpFR+k4YC1NcORP194RGkZTjKDCd+bFy1svF/7xuqsILT1OepIpwPF0UpsxRsZMH4vSpIFixsSEIC2pudfAQCYSVia1sQnBnX54nrVrVPaue3pxU6pdFHCVwAA7BMXDBOaiDa9AATYDBI3gGr+DNerJerHfrY9q6YBUze+APrM8fVfmX9w==</latexit>
+ˆx200
+0
+<latexit sha1_base64="wHnJJNeyCI9xF02qY730JUEthFY=">AAACA3icbVDLSsNAFJ34rPUVdaebwSK4KhOpj2XRjcsK9gFNDJPppB06mYSZiVhCwI2/4saFIm79CXf+jZO2C209cOFwzr3ce0+QcKY0Qt/WwuLS8spqaa28vrG5tW3v7LZUnEpCmyTmsewEWFHOBG1qpjntJJLiKOC0HQyvCr99T6VisbjVo4R6Ee4LFjKCtZF8e98dYJ25EdaDIMwe8tzPUH6X1RDKfbuCqmgMOE+cKamAKRq+/eX2YpJGVGjCsVJdByXay7DUjHCal91U0QSTIe7TrqECR1R52fiHHB4ZpQfDWJoSGo7V3xMZjpQaRYHpLI5Vs14h/ud1Ux1eeBkTSaqpIJNFYcqhjmERCOwxSYnmI0MwkczcCskAS0y0ia1sQnBmX54nrZOqc1Y9valV6pfTOErgAByCY+CAc1AH16ABmoCAR/AMXsGb9WS9WO/Wx6R1wZrO7IE/sD5/AFkHl/k=</latexit>
+ˆx400
+0
+<latexit sha1_base64="poZTYgC58rvC26PqGLsNsTmHJfo=">AAACA3icbVDLSsNAFJ34rPUVdaebwSK4KhPR6rLoxmUF+4Amhsl00g6dTMLMRCwh4MZfceNCEbf+hDv/xknbhbYeuHA4517uvSdIOFMaoW9rYXFpeWW1tFZe39jc2rZ3dlsqTiWhTRLzWHYCrChngjY105x2EklxFHDaDoZXhd++p1KxWNzqUUK9CPcFCxnB2ki+ve8OsM7cCOtBEGYPee5nKL/Lagjlvl1BVTQGnCfOlFTAFA3f/nJ7MUkjKjThWKmugxLtZVhqRjjNy26qaILJEPdp11CBI6q8bPxDDo+M0oNhLE0JDcfq74kMR0qNosB0FseqWa8Q//O6qQ4vvIyJJNVUkMmiMOVQx7AIBPaYpETzkSGYSGZuhWSAJSbaxFY2ITizL8+T1knVqVXPbk4r9ctpHCVwAA7BMXDAOaiDa9AATUDAI3gGr+DNerJerHfrY9K6YE1n9sAfWJ8/XBWX+w==</latexit>
+ˆx600
+0
+<latexit sha1_base64="44nFlO0uiodMX/GkzZJ4cT9s1YU=">AAACA3icbVDLSsNAFJ34rPUVdaebwSK4KhPx0WXRjcsK9gFNDJPppB06mYSZiVhCwI2/4saFIm79CXf+jZO2C209cOFwzr3ce0+QcKY0Qt/WwuLS8spqaa28vrG5tW3v7LZUnEpCmyTmsewEWFHOBG1qpjntJJLiKOC0HQyvCr99T6VisbjVo4R6Ee4LFjKCtZF8e98dYJ25EdaDIMwe8tzPUH6X1RDKfbuCqmgMOE+cKamAKRq+/eX2YpJGVGjCsVJdByXay7DUjHCal91U0QSTIe7TrqECR1R52fiHHB4ZpQfDWJoSGo7V3xMZjpQaRYHpLI5Vs14h/ud1Ux3WvIyJJNVUkMmiMOVQx7AIBPaYpETzkSGYSGZuhWSAJSbaxFY2ITizL8+T1knVOa+e3ZxW6pfTOErgAByCY+CAC1AH16ABmoCAR/AMXsGb9WS9WO/Wx6R1wZrO7IE/sD5/AF8jl/0=</latexit>
+ˆx800
+0
+<latexit sha1_base64="1ErBDTs/TXrs8Erj0KiJN+uCsXY=">AAAB9XicbVC7TsMwFL0pr1JeAUYWiwqJqUoQr7GChbFI9CG1oXJcp7XqOJHtAFWU/2BhACFW/oWNv8FpM0DLkSwdnXOv7vHxY86Udpxvq7S0vLK6Vl6vbGxube/Yu3stFSWS0CaJeCQ7PlaUM0GbmmlOO7GkOPQ5bfvj69xvP1CpWCTu9CSmXoiHggWMYG2k+16I9cgP0qesnzpZ3646NWcKtEjcglShQKNvf/UGEUlCKjThWKmu68TaS7HUjHCaVXqJojEmYzykXUMFDqny0mnqDB0ZZYCCSJonNJqqvzdSHCo1CX0zmadU814u/ud1Ex1ceikTcaKpILNDQcKRjlBeARowSYnmE0MwkcxkRWSEJSbaFFUxJbjzX14krZOae147uz2t1q+KOspwAIdwDC5cQB1uoAFNICDhGV7hzXq0Xqx362M2WrKKnX34A+vzB/hhktU=</latexit>x0
+<latexit sha1_base64="P4si7T7CqW74fvhQbsQBVqJLHBQ=">AAAB7HicbVBNS8NAEJ34WetX1aOXxSJ4Kknx6yIUvXisYNpCG8pmu2mXbjZhdyKU0t/gxYMiXv1B3vw3btsctPXBwOO9GWbmhakUBl3321lZXVvf2CxsFbd3dvf2SweHDZNkmnGfJTLRrZAaLoXiPgqUvJVqTuNQ8mY4vJv6zSeujUjUI45SHsS0r0QkGEUr+XhTdd1uqexW3BnIMvFyUoYc9W7pq9NLWBZzhUxSY9qem2IwphoFk3xS7GSGp5QNaZ+3LVU05iYYz46dkFOr9EiUaFsKyUz9PTGmsTGjOLSdMcWBWfSm4n9eO8PoOhgLlWbIFZsvijJJMCHTz0lPaM5QjiyhTAt7K2EDqilDm0/RhuAtvrxMGtWKd1m5eDgv127zOApwDCdwBh5cQQ3uoQ4+MBDwDK/w5ijnxXl3PuatK04+cwR/4Hz+ALP6jfk=</latexit>t= 200<latexit sha1_base64="X2h4S8odxPDIpnq8VTZe3K7z3Q4=">AAAB7HicbVBNS8NAEJ3Ur1q/qh69LBbBU0nEr4tQ9OKxgmkLbSib7aZdutmE3YlQSn+DFw+KePUHefPfuG1z0NYHA4/3ZpiZF6ZSGHTdb6ewsrq2vlHcLG1t7+zulfcPGibJNOM+S2SiWyE1XArFfRQoeSvVnMah5M1weDf1m09cG5GoRxylPIhpX4lIMIpW8vHm3HW75YpbdWcgy8TLSQVy1Lvlr04vYVnMFTJJjWl7borBmGoUTPJJqZMZnlI2pH3etlTRmJtgPDt2Qk6s0iNRom0pJDP198SYxsaM4tB2xhQHZtGbiv957Qyj62AsVJohV2y+KMokwYRMPyc9oTlDObKEMi3srYQNqKYMbT4lG4K3+PIyaZxVvcvqxcN5pXabx1GEIziGU/DgCmpwD3XwgYGAZ3iFN0c5L8678zFvLTj5zCH8gfP5A7cGjfs=</latexit>t= 400
+<latexit sha1_base64="3Ia1CIlTK0r1PwjiHQfwk7LkmS0=">AAAB7HicbVBNS8NAEJ3Ur1q/qh69LBbBU0lEqxeh6MVjBdMW2lA22027dLMJuxOhlP4GLx4U8eoP8ua/cdvmoNUHA4/3ZpiZF6ZSGHTdL6ewsrq2vlHcLG1t7+zulfcPmibJNOM+S2Si2yE1XArFfRQoeTvVnMah5K1wdDvzW49cG5GoBxynPIjpQIlIMIpW8vG65rq9csWtunOQv8TLSQVyNHrlz24/YVnMFTJJjel4borBhGoUTPJpqZsZnlI2ogPesVTRmJtgMj92Sk6s0idRom0pJHP158SExsaM49B2xhSHZtmbif95nQyjq2AiVJohV2yxKMokwYTMPid9oTlDObaEMi3srYQNqaYMbT4lG4K3/PJf0jyrerXqxf15pX6Tx1GEIziGU/DgEupwBw3wgYGAJ3iBV0c5z86b875oLTj5zCH8gvPxDboSjf0=</latexit>t= 600
+Figure 2: Samples from a diffusion trajectory. We show samples from pθ(·|xt), i.e., the distribution of
+final images x0conditioned on initializing from the latent xtat stept, and the corresponding approximation
+/hatwidext
+0(a proxy for the expectation of this distribution, i.e., Ex0∼pθ(·|xt)[x0]) for different values of t, together
+with the final generated image x0.
+et al., 2020). Then, based on such sequences of intermediate latents, diffusion models learn a “denoising”
+neural network εθthat attempts to run the diffusion process “in reverse.”
+Once such a diffusion model is trained, one can sample from it by providing that model with an initial
+seedxT∼N (0,1)(i.e., just a sample of random noise), and then applying the (trained) denoising network
+iteratively at each step t(fromt=Ttot= 0) to sample the corresponding diffusion trajectory {xt}t∈[T],
+ultimately leading to a final sample x0∼pθ(·)≈qdata(·).
+Conditioning sampling on partially denoised images. Importantly, in this work, it will be also
+useful to consider the process of sampling a final image x0when “resuming” the diffusion process after
+running it up to some step t—this is equivalent to continuing that process at step tfrom the corresponding
+intermediate latent xt. We denote the distribution arising from sampling an image x0when conditioning
+on the latent xtbypθ(·|xt). Also, it turns out that we can approximate the multi-step denoising process of
+generating samples from pθ(·|xt)in a single step with the formula /hatwidext
+0:=c1(αt)·(xt−c2(αt·εθ(xt,t))),for
+some constants c1(·),c2(·)that depend on the diffusion parameters {αt}t(Ho et al., 2020). In fact, /hatwidext
+0is a
+proxy for the conditional expectation Ex0∼pθ(·|xt)[x0], and under certain conditions /hatwidext
+0is precisely equivalent
+to this expectation (Song et al., 2023; Daras et al., 2023).3See Figure 2 for an illustration of pθ(·|xt)and/hatwidext
+0
+for different values of t.
+Types of diffusion models. Finally, Denoising Diffusion Probabilistic Models (DDPMs) are a popular
+instantiation of diffusion models (Ho et al., 2020). More recently, Rombach et al. (2022) proposed a new class
+of diffusion models called latent diffusion models (LDMs), which perform the above stochastic process in the
+latent space of a pretrained encoder network. Moreover, Song et al. (2021); Ho & Salimans (2022) show that
+one can also condition diffusion models on some additional information, e.g. a text prompt. This way, one
+can control the semantics of the generated images by specifying such a text prompt. In this work, we will
+instantiate our data attribution framework on both unconditional DDPMs and conditional LDMs.
+3 A Data Attribution Framework for Diffusion Models
+In this section, we introduce our framework for attributing samples generated by diffusion models back to
+their training data. To this end, we will specify both whatto attribute as well as how to verifythe attributions.
+Specifically, in Section 3.1 we define data attribution for diffusion models as the task of understanding how
+training data influence the distribution over the final images at each step of the diffusion process. Then, in
+Section 3.2, we describe how to evaluate and verify such attributions.
+3.1 Attributing the diffusion process step by step
+Diffusion models generate images via a multi-step process. We thus decompose the task of attributing a final
+synthesized image into a corresponding series of stages, with each stage providing attributions for a single
+step of the diffusion process. This stage-wise decomposition allows for:
+3This equivalence is referred to as the consistency property.
+4Under review as submission to TMLR
+(b) t = 575(a) t = 650(c) t = 500
+<latexit sha1_base64="1ErBDTs/TXrs8Erj0KiJN+uCsXY=">AAAB9XicbVC7TsMwFL0pr1JeAUYWiwqJqUoQr7GChbFI9CG1oXJcp7XqOJHtAFWU/2BhACFW/oWNv8FpM0DLkSwdnXOv7vHxY86Udpxvq7S0vLK6Vl6vbGxube/Yu3stFSWS0CaJeCQ7PlaUM0GbmmlOO7GkOPQ5bfvj69xvP1CpWCTu9CSmXoiHggWMYG2k+16I9cgP0qesnzpZ3646NWcKtEjcglShQKNvf/UGEUlCKjThWKmu68TaS7HUjHCaVXqJojEmYzykXUMFDqny0mnqDB0ZZYCCSJonNJqqvzdSHCo1CX0zmadU814u/ud1Ex1ceikTcaKpILNDQcKRjlBeARowSYnmE0MwkcxkRWSEJSbaFFUxJbjzX14krZOae147uz2t1q+KOspwAIdwDC5cQB1uoAFNICDhGV7hzXq0Xqx362M2WrKKnX34A+vzB/hhktU=</latexit>x0
+8006004002000Step ( )t (classiﬁed as horse)ℙ1.00.50.0Positive InﬂuencersNegative inﬂuencers
+Samples from 
+Figure 3: Specific features appearing at specific steps. (Left) For a given image of a horse ( x0)
+generated by a CIFAR-10 DDPM model, we plot the likelihood that samples from the distribution pθ(·|xt)
+(see Section 2.2) are classified as a horse according to a CIFAR-10 classifier. This likelihood increases rapidly
+around steps 650to500, suggesting that these steps are most responsible for the formation of this feature.
+(Top) For three steps tin this range, we visualize samples from pθ(·|xt). (Bottom ) At each of these steps,
+we also visualize the training examples with the highest influence (positive in green, negative in red) identified
+by Journey- trak. Note that once the “horse” feature begins to appear (around t= 575), positive influencers
+begin to reflect it; and after this feature is “decided” (around t= 500), negative influencers alsodo so.
+•Fine-grained analysis. Identifying influential training examples at each individual step gives us a
+fine-grained understanding of how data “guides” the diffusion process. This, in turn, allows us to
+capture, for example, that in some cases the same training example might be positively influential at
+early steps but negatively influential at later steps (see Appendix B.2).
+•Computational feasibility. Computing gradients through a single step requires only a single
+backwards pass. So, it becomes feasible to apply existing efficient data attribution methods (Park
+et al., 2023; Pruthi et al., 2020) that involve computing gradients.
+•Feature-level attribution. As we demonstrate below, features tend to form only within a small
+number of steps of the diffusion process. Thus, attributing at an individual step level allows us to
+isolate influences of training points on formation of specific features within the final generated image.
+It remains now to define whatexactly to attribute to the training data at each step. To this end, we first
+motivate studying the conditional distribution pθ(·|xt)(see Section 2.2) as a way to quantify the impact of
+each steptof the diffusion process to the final sample x0. Next, we highlight how analyzing the evolution of
+this distribution over steps tcan connect individual steps to specific features of interest. Finally, building on
+these observations, we formalize our framework as attributing properties of this distribution pθ(·|xt)at each
+steptto the training data.
+Studying the distribution pθ(·|xt).At a given step tof the generative process, the relevant information
+about the process up to that point is contained in the latent xt. Whilextitself might not correspond to a
+natural image, we can use it to directly sample from pθ(·|xt), i.e., the distribution of possible final images
+x0when resuming the diffusion process at step twith latent xt. Whent=T, this distribution is precisely
+the diffusion model’s learned distribution pθ(·), and att= 0it is simply the final sampled image x0. So,
+intuitively, the progression of this conditional distribution over steps tinforms us how the model gradually
+“narrows down” the possible distribution of samples to generate the final sample x0(see Figure 2 for an
+illustration). A natural way to understand (and attribute) the impact of applying the diffusion process at
+each stepton the final image x0is thus to understand how this conditional distribution pθ(·|xt)evolves over
+steps.
+5Under review as submission to TMLR
+Connecting features to specific steps. Given a final generated image, there might be many possible
+featuresof interest within this image. For example, for x0in Figure 2, we might ask: Why is there a grey
+bird? Why is the background white? How can we quantify the impact of a particular step ton a given feature
+in the final image? To answer this question, we simply sample from the conditional distribution pθ(·|xt)
+and measure the fraction of samples that contain the feature of interest. Now, if we treat this (empirical)
+likelihood as a function of t, the steps at which there is the largest increase in (i.e., the steepest slope of)
+likelihood are most responsible for the presence of this feature in the final image.
+In fact, it turns out that such rapid increase in likelihood often happens within only a small interval; we
+observe this phenomenon for both small-scale unconditional models (DDPM trained on CIFAR-10, Figure 3)
+and large-scale text-conditional models (Stable Diffusion v2 trained on LAION-5B, Appendix B.3). As a
+result, we are able to tie the presence of a given feature in the final image back to a small interval of steps t
+in the sampling process. This “phase transition” phenomenon has been observed and studied in concurrent
+work (Li & Chen, 2024; Sclocchi et al., 2024). In Figure E.4, we further explore this phenomenon for both
+different generated images and classifiers.
+Implementing our approach. To implement our step-by-step attribution approach, we need a model
+output function (see Section 2.2) that is specific to a step t. As we motivated above, this function should be
+applied to samples from the conditional distribution pθ(·|xt). To that end, we introduce a step-specific model
+output function ft(pθ(S)(·|xt),θ(S)). The function ftis intended to measure properties of the distribution
+pθ(S)(·|xt). For example, in Section 4 we define a concrete instantiation of ftthat approximates the likelihood
+of the model to generate individual samples from pθ(S)(·|xt). Adapting the general definition of data
+attribution from Section 2.1, we can now define data attribution for diffusion models at a steptas a function
+τtthat assigns a score τt(xt,S)ito each training example zi∈S. This score indicates the change in
+ft(pθ(S)(·|xt),θ(S))induced by adding zitoS.
+3.2 Validating data attribution for diffusion models
+Visual inspection of the attributed training datapoints is a common heuristic for evaluating the quality of
+data attribution. However, visual similarity is not always reliable (Ilyas et al., 2022; Park et al., 2023). In
+particular, applications of data attribution such as data curation or model debugging often require that
+the attributions are causally predictive . Motivated by that, we evaluate attribution scores according to
+how accurately they reflect the corresponding training examples’ counterfactual impact on the conditional
+distribution pθ(·|xt)using two different metrics, defined below.
+Linear datamodeling score. The linear datamodeling score (LDS) is a measure of the effectiveness of a
+data attribution method that was introduced in Ilyas et al. (2022); Park et al. (2023) (see Section 2.1). This
+metric quantifies how well the attribution scores can predict the exact magnitude of change in model output
+induced by (random) variations in the training set. In our setting, we apply it to the step-specific model output
+functionft(pθ(S)(·|xt),θ(S)). Specifically, we use the attribution scores τto predict the diffusion-specific
+model output function ft(pθ(S)(·|xt),θ(S))as
+gτ(pθ(S)(·|xt),S′;S):=/summationdisplay
+i:zi∈S′τ(xt,S)i. (2)
+Then, we can measure the degree to which the predictions gτ(pθ(S)(·|xt),S′;S)are correlated with the true
+outputsft(pθ(S)(·|xt),θ(S′))using the LDS:
+LDS (τ,xt):=ρ({ft(pθ(S)(·|xt),θ(Sj)) :j∈[m]},{gτ(pθ(S)(·|xt),Sj;S) :j∈[m]}),
+where{S1,...,Sm:Si⊂S}are randomly sampled subsets of the training set Sandρdenotes Spearman’s
+rank correlation (Spearman, 1904). To decrease the cost of computing LDS, we use /hatwidext
+0in lieu of samples
+frompθ(S)(·|xt)(see Section 2.2), since, as noted in Section 2.2, /hatwidext
+0turns out to be a good proxy for the the
+latter quantity. In other words, we consider ftandgτas functions of /hatwidext
+0rather than pθ(S)(·|xt).
+6Under review as submission to TMLR
+Retraining without the most influential images. In practice, we may want to use the data attributions
+to intentionally steer the diffusion model’s output. For example, we may want to remove all training examples
+that cause the resulting model to generate a particular style of images. To evaluate the usefulness of a given
+data attribution method in these contexts, we remove from the training set the most influential (i.e., highest
+scoring) images for a given target xt, retrain a new model θ′, then measure the change in the conditional
+distribution pθ(·|xt)(see Section 2.2) when we replace θwithθ′only in the neighborhood of step tin the
+reverse diffusion process. If the data attributions are accurate, we expect the conditional distribution to
+change significantly (as measured in our case using the FID distance for images (Heusel et al., 2017)). As we
+consider data attributions that are specific to each step, in principle we should use the denoising model only
+for the corresponding step t. However, the impact of a single step on the final distribution might be small,
+making it hard to measure. Hence, we assume that attributions change only gradually over steps and replace
+the denoising model for a small interval of steps (i.e., between steps tandt−∆).
+The first metric (LDS) is cheaper to evaluate, as we can re-use the same set of models to evaluate attributions
+for different target images and from different attribution methods. On the other hand, the latter metric more
+directly measures changes in the conditional distribution pθ(·|xt), so we do not need to rely on a specific
+choice of a model output function ft.
+4 Efficiently Computing Attributions for Diffusion Models
+In this section, we describe how we can efficiently estimate data attributions for diffusion models using
+trak(Park et al., 2023). As we described in Section 2.1, we can decompose the task of computing data
+attribution scores into estimating two components: (i) the change in model parameters, and (ii) the induced
+change in model output. Following trak(Park et al., 2023), computing the first component (change in
+model parameters) only requires computing per-example gradients of the training loss (and in particular,
+does not require any re-training per each training datapoint). Similarly, computing the second component
+(change in model output) only requires computing gradients with respect to the model output function of
+choice (see Appendix D, as well as Section 3 of Park et al. (2023) for details). We now describe how we arrive
+at Journey- trakby adapting the estimation of the above two components to the diffusion model setting.
+Estimating the change in model parameters. For diffusion models, the training process is much more
+complicated than the standard supervised settings (e.g., image classification) considered in Park et al. (2023).
+In particular, one challenge is that the diffusion model outputs a high-dimensional vector (an image) as
+opposed to a single scalar (e.g., a label). Even if we approximate the diffusion model as a linearmodel in
+parameters, naively applying trakwould require keeping track of pgradients for each training example
+(wherepis the number of pixels) and thus be computationally infeasible. Nonetheless, it is still the case that
+the presence of a single training example influences the optimization trajectory onlyvia the gradient of the
+loss on that example—specifically, the MSE of the denoising objective. Hence, it suffices to keep track of a
+single gradient for each example. This observation allows us to estimate the change in model parameters
+using the same approach that trakuses (see Section 2.1).
+An additional challenge is that the gradient updates in the diffusion process are highly stochastic due to
+the sampling of random noise. To mitigate this stochasticity, we average the training loss over multiple
+resampling of the noise at randomly chosen steps and compute gradients over this averaged loss.
+A model output function for diffusion models. In Section 3, we motivated why we would like to
+attribute properties of the conditional distribution pθ(S)(·|xt), i.e., the distribution that arises from sampling
+when conditioning on an intermediate latent xt. Specifically, we would like to understand what training data
+causes the model to generate samples from this distribution. Then, one natural model output function ft
+would be to measure the likelihood of the model to generate these samples. Attributing with respect to such
+a choice of ftallows us to understand what training examples increase or decrease this likelihood.
+In order to efficiently implement this model output function, we make two simplifications. First, sampling
+frompθ(S)(·|xt)can be computationally expensive, as this would involve repeatedly resampling parts of
+the diffusion trajectory. Specifically, sampling once from pθ(S)(·|xt)requires applying the diffusion model t
+7Under review as submission to TMLR
+Algorithm 1 Journey- trak, a data attribution method for diffusion models
+1:Input:Model checkpoints {θ⋆
+1,...,θ⋆
+M}, training dataset S={z1,...,zN}, target sequence {x1,...,xT}
+corresponding to Tsteps, projection dimension k∈N.
+2:Output: Attribution scores τ(xt,S)∈RNfor eacht
+3:ftrain(x,θ):=Eε,t/vextenddouble/vextenddoubleε−εθ(S)/parenleftbig√¯αtx+√1−¯αtε,t/parenrightbig/vextenddouble/vextenddouble2
+2▷DDPM training loss
+4:ft(·,θ)defined as in Equation (3) ▷Step-specific model output function ft
+5:form∈{1,...,M}do
+6:P∼N(0,1)p×k▷Sample random projection matrix
+7:fori∈{1,...,N}do
+8:ϕi←P⊤∇θftrain(zi,θ⋆
+m) ▷Compute training loss gradient at θ⋆
+mand project
+9:end for
+10:fort∈{1,...,T}do
+11:/hatwidex(t)
+0←c1(αt)·(xt−c2(αt·εθ⋆m(xt,t)))▷Compute expectation of conditional distribution
+12:gi←P⊤∇θft(/hatwidex(t)
+0,θ⋆
+m) ▷Compute model output gradient at θ⋆
+mand project
+13:end for
+14: Φm←[ϕ1;···;ϕN]⊤
+15:Gm←[g1;···;gT]⊤
+16:end for
+17:[τ(x1,S);···;τ(xT,S)]←1
+mM/summationtext
+m=1Φm(Φ⊤
+mΦm)−1Gm ▷Average scores over checkpoints
+18:return{τ(xt,S)}
+times—in practice, tcan often be as large as 1000. Fortunately, as we described in Section 2.2, we can use
+the one-step estimate /hatwidext
+0as a proxy for samples from pθ(S)(·|xt), since it approximates this distribution’s
+expectation Ex0∼pθ(·|xt)[x0].
+Second, it is computationally expensive to compute gradients with respect to the exact likelihood of generating
+an image. So, as a more tractable proxy for this likelihood, we measure the reconstruction loss4(i.e., how
+well the diffusion model is able to denoise a noisy image) when adding noise to /hatwidext
+0with magnitude matching
+the sampling process at step t. Specifically, we compute the Monte Carlo estimate
+ft/parenleftig
+/hatwidext
+0,θ(S)/parenrightig
+=k/summationdisplay
+i=1/vextenddouble/vextenddouble/vextenddoubleεi−εθ(S)/parenleftig√¯αt/hatwidex(t)
+0+√1−¯αtεi,t/parenrightig/vextenddouble/vextenddouble/vextenddouble2
+2, (3)
+where ¯αtis the DDPM5variance schedule (Ho et al., 2020), εi∼N(0,1)for alli∈[k], andkis the number
+of resampling rounds of the random noise ε. Now that we have chosen our model output function, we can
+simply compute gradients with respect to this output to obtain the second component in Equation (1).
+The final algorithm. We summarize our algorithm Journey- trakfor computing attribution scores in
+Algorithm 1. We approximate the training loss (line 3) with different samples of noise εand stept. Note
+that to attribute a new target sequence, we only have to recompute lines 10-12.
+Comparison with trak. Our method Journey- trakis inspired by trak, an attribution method for
+supervised settings. The main difference comes from the diffusion-specific model output function ft(·,θ). In
+particular, it is not immediately clear how to design such a function for the multi-step, sampling process in
+diffusion models in a way that is both computationally efficient and counterfactually predictive. We show that
+our choice for ftdescribed in Equation (3) gives us an efficient proxy for samples from pθ(S)(·|xt), leading to
+a fast and effective data attribution method.
+8Under review as submission to TMLR
+900 800 700 600 500 400 300 200 100
+Step t0.00.10.20.3Correlation (LDS)
+DDPM on CIFAR-10
+900 800 700 600 500 400 300 200 100
+Step t0.00.10.2
+LDM on MS COCOTRAK 10 Checkpoints (Ours) TRAK 50 Checkpoints (Ours) CLIP-sim Pixel-sim
+Figure 4: Predicting model behavior. The counterfactual predictiveness of attributions measured using
+the LDS score along the diffusion trajectory (at every 100 steps) for three different methods: Journey- trak
+(computed using 10 and 50 model checkpoints), CLIP similarity, and pixel similarity. Smaller steps are closer
+to the final sample. Shaded areas represent standard error.
+k=200 k=500 k=1000 k=40000.02.55.07.510.0FID Score (Above Baseline)DDPM on CIFAR10
+method
+CLIP-sim
+Pixel-sim
+TRAK (Ours)
+k=200 k=500 k=1000 k=4000LDM on MS COCO
+Number of training examples removed
+Figure 5: Retraining without top influencers. Change in the distribution of generated images pθ(·|x400)
+when substituting the original model with a new model only between steps 400and300. The new model is
+trained without the ktop influencers of x400according to attributions from Journey- trak(computed at step
+400), CLIP similarity, or pixel similarity. To evaluate the change in distribution, we measure the increase in
+FID score over a baseline of models trained on the full dataset (see Section 3.2 for details). Bars represent
+standard error.
+5 Experiments
+To evaluate our data attribution method, we apply it to DDPMs trained on CIFAR-10 and LDMs trained on
+MS COCO. First, in Section 5.2, we visually inspect and interpet our attributions, and then in Section 5.3 we
+evaluate their counterfactual significance using the metrics we introduced in Section 3.2. In Section 5.4, we
+further explore how our data attributions can be localized to patches in pixel space. Finally, in Section 5.5,
+we investigate the value of our step-specific attributions for attributing the full diffusion trajectory.
+4The reconstruction loss is a proxy for the likelihood of the generated image, as it is proportional to the evidence lower bound
+(ELBO) (Sohl-Dickstein et al., 2015; Song et al., 2023).
+5We only consider DDPM schedulers in this work. The above derivation can be easily extended to other schedulers.
+9Under review as submission to TMLR
+5.1 Experimental setup
+We compute our data attribution scores using 100 DDPM checkpoints trained on CIFAR-10 and 50 LDM
+checkpoints trained MS COCO (see Appendix A for training details.). As baselines, we compare our
+attributions to two common image similarity metrics—CLIP similarity (i.e., cosine similarity in the CLIP
+embedding space) and cosine similarity in pixel space.
+5.2 Qualitative analysis of attributions
+In Figure 1, we visualize the sampling trajectory for an image generated by an MS COCO model, along
+with the most positive and negative influencers identified by Journey- trak(see Appendix E for additional
+visualizations of identified attributions on CIFAR-10 and MS COCO ). We find that positive influencers tend
+to resemble the generated image throughout, while negative influencers tend to differ from the generated
+image along specific attributes (e.g., class, background, color) depending on the step. Interestingly, the
+negative influencers increasingly resemble the generated image towards the end of the diffusion trajectory.
+Intuitively, we might expect that negative influencers would not resemble the final generated image, as
+they should to steer the trajectory away from that image. So, why do they in fact reflect features of the
+final generated image? To answer this question, we study the relationship between the top (positive and
+negative) influencers and the distribution pθ(·|xt)towards which we target our attributions. In Figure 3, for
+a given image of a horse generated by our CIFAR-10 DDPM, we plot the likelihood that images from pθ(·|xt)
+containing a horse (according to a classifier trained on CIFAR-10) as a function of the step t(left). We
+also show the top and bottom influencers at three points along the trajectory (right). We find that the top
+influencers begin to reflect the feature of interest once the likelihood of this feature begins to grow. Yet, once
+the likelihood of the feature reaches near certain, the negative influencers alsobegin to reflect this feature.
+This behavior has the following intuitive explanation: after this point, it would be impossible to “steer” the
+trajectory away from presenting this feature. So, the negative influencers at later steps might now steer the
+trajectory away from other features of the final image (e.g., the color of horse) that has not yet been decided
+at that step. Additionally, images that do not reflect the “decided” features might no longer be relevant to
+steering the trajectory of the diffusion process.
+Generated Image
+Attribution Region
+Positive InﬂuencersPrompt: “A motorcycle and a stop sign” Prompt: “A giraffe in snow”
+Figure 6: Patch-based attribution. We adapt Journey- trakto restrict attribution to user-specified
+patches of a generated image. We show examples of attributing patches capturing individual concepts in
+images synthesized by a latent diffusion model trained on MS COCO. Attributions are computed at step
+t= 400.
+5.3 Counterfactually validating the attributions
+We now evaluate our attributions using the metrics introduced in Section 3.2 to validate their counterfactual
+significance.
+LDS.We sample 100 random 50%subsets of CIFAR-10 and MS COCO, and train five models per mask.
+Given a set of attribution scores, we then compute the Spearman rank correlation (Spearman, 1904) between
+the predicted model outputs gτ(·)(see Eq. (2)) on each training data subset according to the attributions
+and the (averaged) actual model outputs. To evaluate the counterfactual significance of our attributions over
+10Under review as submission to TMLR
+the course of the diffusion trajectory, we measure LDS scores at every 100steps over the 1000step sampling
+process.
+In Figure 4, we plot LDS scores for CIFAR-10 (left) and MS COCO (right) over a range of steps for our
+attribution scores as well as the two similarity baselines. Unlike in many computer vision settings (Zhang
+et al., 2018), we find that for CIFAR-10, similarity in pixel space achieves competitive performance, especially
+towards the start of the diffusion trajectory. However, for both CIFAR-10 and MS COCO, only Journey- trak
+is counterfactually predictive across the entire trajectory.
+Retraining without the most influential images. We compute attribution scores on 50 samples from
+our CIFAR-10 and MS COCO models at step t= 400. Given the attribution scores for each sample, we then
+retrain the model after removing the corresponding top kinfluencers for k∈{200,500,1000}. We sample
+5000images from two distributions: (1) the distribution arising from repeatedly initializing at x400and
+sampling the final 400 steps from the original model; and (2) the distribution arising from repeating the above
+process but using the retrained model only for steps t= 400tot= 300. We then compute FID distance
+between these distributions, and repeat this process for each sample at each value of k.
+In Figure 5, we display the average FID scores (a measure of distance from the original model) after removing
+thekmost influential images for a given sample across possible values of k. We notice that, for all values of
+k, removing the top influencers identified by our attribution method has a greater impact than removing the
+most similar images according to CLIP or pixel space similarities.
+5.4 Localizing our attributions to patches in pixel space
+In Section 3, we discussed how step-by-step attribution allows us to attribute particular features appearing
+within a particular interval of steps. However, some features may appear together within a small interval,
+making it hard to isolate them only based on the step. Here we explore one possible approach for better
+isolating individual features: selecting a region of pixels (i.e., a patch) in a generated sample corresponding
+to a feature of interest, and restricting our model output function to this region. This way, we can restrict
+attributions only to the selected patch, which can be useful for understanding what caused a specific feature
+to appear (see Figure 6). To implement this model output function, we simply apply a pixel-wise binary
+mask to Equation (3) and ignore the output outside of the masked region. To test this approach, we generate
+images containing multiple features with an MS COCO-trained LDM. We then manually create per-feature
+masks for which we compute attribution scores with Journey- trak(see Figure 6). The resulting attributions
+for different masks surface training examples relevant onlyto the corresponding features in that region.
+5.5 “Forgetting” how to generate an image
+Our attribution scores and evaluation metrics are all step-specific. However, in practice we might care about
+identifying training images that impact the fulldiffusion pipeline. In particular, we might be interested in
+whether removing the important training images for a given synthesized image causes the diffusion model to
+“forget” how to generate this image.
+Specifically, given a set of attribution scores for a synthesized image, we remove the top kinfluencers (at
+stept= 300), retrain the model, and generate new images from scratch using the same random seed. Here,
+we leverage the fact that two diffusion models trained on the same dataset tend to generate similar images
+given the same random seed (Song et al., 2021); see Appendix B.1 for more details. We then compare the
+change in pixel space between the original and newly generated image. This process is distinct from our
+second evaluation metric, as (1) we directly compare two images rather than measure the distance between
+distributions, and (2) we re-generate images with our new model from scratch rather than restarting from
+some intermediate latent xtand substituting the new model for only a small interval of steps (between tand
+t−∆).
+We perform this process for our attribution scores on CIFAR-10 as well as the two similarity baselines (see
+Figure 7). Our results suggest that Journey- trakis able to identify influential images that have a significant
+impact on the full diffusion trajectory of the diffusion model.
+11Under review as submission to TMLR
+Original generated image
+TRAKPixel-simCLIP-sim
+Generated Images After Removing Top Inﬂuencers
+: Different from original
+k=500 k=1000 k=4000
+Number of samples removed from train set0.00.51.01.5change (in ℓ2 distance) method
+CLIP-sim
+Pixel-sim
+TRAK (ours)
+Figure 7: “Forgetting” an image. We quantify the impact of removing the highest scoring training
+examples according to Journey- trak, CLIP similarity, and pixel similarity (and re-training). (Left)We
+compare the original synthesized samples to those generated from the same random seed with the re-trained
+models.(Right) To quantify the impact of removing these images, we measure the ℓ2distance between 60
+synthesized samples and corresponding images generated by the re-trained models. Black bars represent
+standard error.
+6 Related Work
+While most prior works on data attribution focus on the supervised setting, some more recent works study
+attribution in generative settings, e.g. audio models Deng & Ma (2023). For diffusion models, recently Wang
+et al. (2023) propose a method for efficiently evaluating data attribution methods for generative models by
+creating custom datasets with known ground-truth attributions.
+Concurrently to this work, Zheng et al. (2023) use Journey- trakto attribute diffusion models across timesteps ,
+i.e., they provide global attributions; they rely on heuristic design choices to design ft. Lin et al. (2024) also
+propose a globalattribution method; their method is based on Shapley values, a concept from economics;
+and Wang et al. (2024) propose a method based on approximate unlearning. Dai & Gifford (2023) employ
+ensembling techniques to attribute diffusion models, again on a global scale. We discuss additional related
+work in Appendix C.
+7 Conclusion
+In this work, we introduce a framework for data attribution for diffusion models and provide an efficient
+method for computing such attributions. In particular, we formalize data attribution in this setting as task
+of quantifying how individual training datapoints influences the distribution over final images at each step of
+the diffusion process. We demonstrate the efficacy of our approach on DDPMs trained on CIFAR-10 and
+LDMs trained on MS COCO. Our framework also constitutes a step towards better understanding of how
+training data influences diffusion models.
+There are several directions for potential improvements and future work. First, our particular instantiation
+of the framework relies on proxies for the distribution pθ(·|xt)of final generated images conditioned on a
+given stept, as well as for the likelihood of generating a given image. So, identifying more accurate proxies
+could help improve the quality of the resulting attributions. More broadly, we evaluate our framework on
+two academic-size datasets, but the most popular diffusion models (such as Stable Diffusion) are larger and
+trained on significantly larger datasets. Thus, while feasible in principle, scaling our framework to such
+settings is important. Finally, while we study the task of attributing individual steps, it would be valuable to
+perform data attribution for the full diffusion process.
+12Under review as submission to TMLR
+References
+Alessandro Achille, Aditya Golatkar, Avinash Ravichandran, Marzia Polito, and Stefano Soatto. Lqf: Linear
+quadratic fine-tuning. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition , 2021.
+Sarah Andersen, Kelly McKernan, and Karla Ortiz. Class-action complaint against stability ai, 2023. URL
+https://stablediffusionlitigation.com/pdf/00201/1-1-stable-diffusion-complaint.pdf . Case
+3:23-cv-00201.
+Shekoofeh Azizi, Simon Kornblith, Chitwan Saharia, Mohammad Norouzi, and David J Fleet. Synthetic data
+from diffusion models improves imagenet classification. arXiv preprint arXiv:2304.08466 , 2023.
+Juhan Bae, Nathan Ng, Alston Lo, Marzyeh Ghassemi, and Roger Grosse. If influence functions are the
+answer, then what is the question? In ArXiv preprint arXiv:2209.05364 , 2022.
+Samyadeep Basu, Xuchen You, and Soheil Feizi. Second-order group influence functions for black-box
+predictions. In International Conference on Machine Learning (ICML) , 2019.
+Nicholas Carlini, Florian Tramer, Eric Wallace, Matthew Jagielski, Ariel Herbert-Voss, Katherine Lee, Adam
+Roberts, Tom Brown, Dawn Song, Ulfar Erlingsson, et al. Extracting training data from large language
+models. In 30th USENIX Security Symposium (USENIX Security 21) , 2021.
+Nicholas Carlini, Jamie Hayes, Milad Nasr, Matthew Jagielski, Vikash Sehwag, Florian Tramer, Borja Balle,
+Daphne Ippolito, and Eric Wallace. Extracting training data from diffusion models. arXiv preprint
+arXiv:2301.13188 , 2023.
+Zheng Dai and David K Gifford. Training data attribution for diffusion models. arXiv preprint
+arXiv:2306.02174 , 2023.
+Giannis Daras, Yuval Dagan, Alexandros G Dimakis, and Constantinos Daskalakis. Consistent diffusion
+models: Mitigating sampling drift by learning to be consistent. arXiv preprint arXiv:2302.09057 , 2023.
+Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale hierarchical
+image database. In Computer Vision and Pattern Recognition (CVPR) , 2009.
+Junwei Deng and Jiaqi Ma. Computational copyright: Towards a royalty model for ai music generation
+platforms. arXiv preprint arXiv:2312.06646 , 2023.
+Vitaly Feldman and Chiyuan Zhang. What neural networks memorize and why: Discovering the long tail via
+influence estimation. In Advances in Neural Information Processing Systems (NeurIPS) , volume 33, pp.
+2881–2891, 2020.
+Qianli Feng, Chenqi Guo, Fabian Benitez-Quiroz, and Aleix M Martinez. When do gans replicate? on the
+choice of dataset size. In Proceedings of the IEEE/CVF International Conference on Computer Vision , pp.
+6701–6710, 2021.
+Amirata Ghorbani and James Zou. Data shapley: Equitable valuation of data for machine learning. In
+International Conference on Machine Learning (ICML) , 2019.
+Amirata Ghorbani, James Wexler, James Zou, and Been Kim. Towards automatic concept-based explanations.
+arXiv preprint arXiv:1902.03129 , 2019.
+Zayd Hammoudeh and Daniel Lowd. Training data influence analysis and estimation: A survey. In arXiv
+preprint arXiv:2212.04612 , 2022.
+Frank R Hampel, Elvezio M Ronchetti, Peter J Rousseeuw, and Werner A Stahel. Robust statistics: the
+approach based on influence functions , volume 196. John Wiley & Sons, 2011.
+13Under review as submission to TMLR
+Martin Heusel, Hubert Ramsauer, Thomas Unterthiner, Bernhard Nessler, and Sepp Hochreiter. Gans trained
+by a two time-scale update rule converge to a local nash equilibrium. In Neural Information Processing
+Systems (NeurIPS) , 2017.
+Jonathan Ho and Tim Salimans. Classifier-free diffusion guidance. arXiv preprint arXiv:2207.12598 , 2022.
+Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. In Neural Information
+Processing Systems (NeurIPS) , 2020.
+Andrew Ilyas, Sung Min Park, Logan Engstrom, Guillaume Leclerc, and Aleksander Madry. Datamodels:
+Predicting predictions from training data. In International Conference on Machine Learning (ICML) , 2022.
+Getty Images. Getty images (us), inc. v. stability ai, inc, 2023. URL https://fingfx.thomsonreuters.
+com/gfx/legaldocs/byvrlkmwnve/GETTY%20IMAGES%20AI%20LAWSUIT%20complaint.pdf . Case 1:23-cv-
+00135-UNA.
+Ruoxi Jia, David Dao, Boxin Wang, Frances Ann Hubis, Nick Hynes, Nezihe Merve Gürel, Bo Li, Ce Zhang,
+Dawn Song, and Costas J. Spanos. Towards efficient data valuation based on the shapley value. In
+Proceedings of the Twenty-Second International Conference on Artificial Intelligence and Statistics , 2019.
+Ruoxi Jia, Fan Wu, Xuehui Sun, Jiacen Xu, David Dao, Bhavya Kailkhura, Ce Zhang, Bo Li, and Dawn
+Song. Scalability vs. utility: Do we have to sacrifice one for the other in data importance quantification?
+InProceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition , 2021.
+Zahra Kadkhodaie, Florentin Guth, Eero P Simoncelli, and Stéphane Mallat. Generalization in diffusion
+models arises from geometry-adaptive harmonic representation. arXiv preprint arXiv:2310.02557 , 2023.
+Priyatham Kattakinda, Alexander Levine, and Soheil Feizi. Invariant learning via diffusion dreamed
+distribution shifts. arXiv preprint arXiv:2211.10370 , 2022.
+Rajiv Khanna, Been Kim, Joydeep Ghosh, and Sanmi Koyejo. Interpreting black box predictions using fisher
+kernels. In The 22nd International Conference on Artificial Intelligence and Statistics , 2019.
+Valentin Khrulkov, Gleb Ryzhakov, Andrei Chertkov, and Ivan Oseledets. Understanding ddpm latent codes
+through optimal transport. arXiv preprint arXiv:2202.07477 , 2022.
+Pang Wei Koh and Percy Liang. Understanding black-box predictions via influence functions. In International
+Conference on Machine Learning , 2017.
+Alex Krizhevsky. Learning multiple layers of features from tiny images. In Technical report , 2009.
+Marvin Li and Sitan Chen. Critical windows: non-asymptotic theory for feature emergence in diffusion
+models.arXiv preprint arXiv:2403.01633 , 2024.
+Chris Lin, Mingyu Lu, Chanwoo Kim, and Su-In Lee. Efficient shapley values for attributing global properties
+of diffusion models to data group. arXiv preprint arXiv:2407.03153 , 2024.
+Jinkun Lin, Anqi Zhang, Mathias Lecuyer, Jinyang Li, Aurojit Panda, and Siddhartha Sen. Measuring
+the effect of training data on deep learning predictions via randomized experiments. arXiv preprint
+arXiv:2206.10013 , 2022.
+Tsung-Yi Lin, Michael Maire, Serge Belongie, James Hays, Pietro Perona, Deva Ramanan, Piotr Dollár, and
+C Lawrence Zitnick. Microsoft coco: Common objects in context. In European conference on computer
+vision (ECCV) , 2014.
+Philip M Long. Properties of the after kernel. In arXiv preprint arXiv:2105.10585 , 2021.
+Alexandra Sasha Luccioni, Christopher Akiki, Margaret Mitchell, and Yacine Jernite. Stable bias: Analyzing
+societal representations in diffusion models. In arXiv preprint arXiv:2303.11408 , 2023.
+14Under review as submission to TMLR
+Sadhika Malladi, Alexander Wettig, Dingli Yu, Danqi Chen, and Sanjeev Arora. A kernel-based view of
+language model fine-tuning. In arXiv preprint arXiv:2210.05643 , 2022.
+Alex Nichol, Aditya Ramesh, Pamela Mishkin, Prafulla Dariwal, Joanne Jang, and Mark Chen. Dalle 2
+pre-training mitigations. 2022.
+SungMinPark, KristianGeorgiev, AndrewIlyas, GuillaumeLeclerc, andAleksanderMadry. Trak: Attributing
+model behavior at scale. In Arxiv preprint arXiv:2303.14186 , 2023.
+Malsha V Perera and Vishal M Patel. Analyzing bias in diffusion-based face generation models. In arXiv
+preprint arXiv:2305.06402 , 2023.
+Daryl Pregibon. Logistic regression diagnostics. In The Annals of Statistics , 1981.
+Garima Pruthi, Frederick Liu, Mukund Sundararajan, and Satyen Kale. Estimating training data influence
+by tracing gradient descent. In Neural Information Processing Systems (NeurIPS) , 2020.
+Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry,
+Amanda Askell, Pamela Mishkin, Jack Clark, et al. Learning transferable visual models from natural
+language supervision. In arXiv preprint arXiv:2103.00020 , 2021.
+Aditya Ramesh, Prafulla Dhariwal, Alex Nichol, Casey Chu, and Mark Chen. Hierarchical text-conditional
+image generation with clip latents. arXiv preprint arXiv:2204.06125 , 2022.
+Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Björn Ommer. High-resolution
+image synthesis with latent diffusion models. In Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition , pp. 10684–10695, 2022.
+Andrea Schioppa, Polina Zablotskaia, David Vilar, and Artem Sokolov. Scaling up influence functions. In
+Proceedings of the AAAI Conference on Artificial Intelligence , volume 36, pp. 8179–8186, 2022.
+Christoph Schuhmann, Romain Beaumont, Richard Vencu, Cade Gordon, Ross Wightman, Mehdi Cherti,
+Theo Coombes, Aarush Katta, Clayton Mullis, Mitchell Wortsman, et al. Laion-5b: An open large-scale
+dataset for training next generation image-text models. In arXiv preprint arXiv:2210.08402 , 2022.
+Antonio Sclocchi, Alessandro Favero, and Matthieu Wyart. A phase transition in diffusion models reveals the
+hierarchical nature of data. arXiv preprint arXiv:2402.16991 , 2024.
+Harshay Shah, Sung Min Park, Andrew Ilyas, and Aleksander Madry. Modeldiff: A framework for comparing
+learning algorithms. In arXiv preprint arXiv:2211.12491 , 2022.
+Jascha Sohl-Dickstein, Eric A. Weiss, Niru Maheswaranathan, and Surya Ganguli. Deep unsupervised learning
+using nonequilibrium thermodynamics. In International Conference on Machine Learning , 2015.
+Gowthami Somepalli, Vasu Singla, Micah Goldblum, Jonas Geiping, and Tom Goldstein. Diffusion art or
+digital forgery? investigating data replication in diffusion models. arXiv preprint arXiv:2212.03860 , 2022.
+Yang Song and Stefano Ermon. Generative modeling by estimating gradients of the data distribution. In
+Neural Information Processing Systems (NeurIPS) , 2019.
+Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole.
+Score-based generative modeling through stochastic differential equations. In International Conference on
+Learning Representations , 2021. URL https://openreview.net/forum?id=PxTIG12RRHS .
+Yang Song, Prafulla Dhariwal, Mark Chen, and Ilya Sutskever. Consistency models. arXiv preprint
+arXiv:2303.01469 , 2023.
+Charles Spearman. The proof and measurement of association between two things. In The American Journal
+of Psychology , 1904.
+15Under review as submission to TMLR
+Gerrit van den Burg and Chris Williams. On memorization in probabilistic deep generative models. Advances
+in Neural Information Processing Systems , 34:27916–27928, 2021.
+Joshua Vendrow, Saachi Jain, Logan Engstrom, and Aleksander Madry. Dataset interfaces: Diagnosing model
+failures using controllable counterfactual generation. arXiv preprint arXiv:2302.07865 , 2023.
+Sheng-Yu Wang, Alexei A Efros, Jun-Yan Zhu, and Richard Zhang. Evaluating data attribution for text-to-
+image models. arXiv preprint arXiv:2306.09345 , 2023.
+Sheng-Yu Wang, Aaron Hertzmann, Alexei A Efros, Jun-Yan Zhu, and Richard Zhang. Data attribution for
+text-to-image models by unlearning synthesized images. arXiv preprint arXiv:2406.09408 , 2024.
+Alexander Wei, Wei Hu, and Jacob Steinhardt. More than a toy: Random matrix models predict how
+real-world neural representations generalize. In ICML, 2022.
+Olivia Wiles, Isabela Albuquerque, and Sven Gowal. Discovering bugs in vision models using off-the-shelf
+image generation and captioning. arXiv preprint arXiv:2208.08831 , 2022.
+Mike Wojnowicz, Ben Cruz, Xuan Zhao, Brian Wallace, Matt Wolff, Jay Luan, and Caleb Crable. Influence
+sketching: Finding influential samples in large-scale regressions. In 2016 IEEE International Conference
+on Big Data (Big Data) , 2016.
+Chih-Kuan Yeh, Joon Sik Kim, Ian E. H. Yen, and Pradeep Ravikumar. Representer point selection for
+explaining deep neural networks. In Neural Information Processing Systems (NeurIPS) , 2018.
+Huijie Zhang, Jinfan Zhou, Yifu Lu, Minzhe Guo, Peng Wang, Liyue Shen, and Qing Qu. The emergence of
+reproducibility and consistency in diffusion models. In Forty-first International Conference on Machine
+Learning , 2023.
+Richard Zhang, Phillip Isola, Alexei A Efros, Eli Shechtman, and Oliver Wang. The unreasonable effectiveness
+of deep features as a perceptual metric. In Computer Vision and Pattern Recognition (CVPR) , 2018.
+Xiaosen Zheng, Tianyu Pang, Chao Du, Jing Jiang, and Min Lin. Intriguing properties of data attribution
+on diffusion models. arXiv preprint arXiv:2311.00500 , 2023.
+16Under review as submission to TMLR
+A Experimental details
+Throughout our paper, we train various diffusion models on CIFAR-10 and MS COCO.
+DDPM training on CIFAR-10. We train 100 DDPMs (Ho et al., 2020) on the CIFAR-10 dataset
+for 200 epochs using a cosine annealing learning rate schedule that starts at 1e-4. We used the DDPM
+architecture that match the original implementation (Ho et al., 2020), which can be found here https:
+//huggingface.co/google/ddpm-cifar10-32 . At inference time we sample using a DDPM scheduler with
+50 inference steps.
+LDM training on MS COCO. We train 20 text-conditional latent diffusion models (LDMs) (Rombach
+et al., 2022) on the MS COCO dataset for 200 epochs using a cosine annealing learning rate schedule that
+ståarts at 2e-4. We use the exact CLIP and VAE used in Stable Diffusion v2, but use a custom (smaller) UNet,
+which we describe in our code. These models can be found here https://huggingface.co/stabilityai/
+stable-diffusion-2-1 . At inference time, we sample using a DDPM scheduler with 1000 inference steps.
+LDS.We sample 100 random 50%subsets of CIFAR-10 and MS COCO, and train 5 models per mask.
+Given a set of attribution scores, we then compute the Spearman rank correlation (Spearman, 1904) between
+the predicted model outputs gτ(·)(see Eq. (2)) on each subset according to the attributions and the (averaged)
+actual model outputs. Because our model output and attributions are specific to a step, we compute LDS
+separately for each step. To evaluate the counterfactual significance of our attributions over the course of the
+diffusion trajectory, we measure LDS scores at each 100steps over the 1000step sampling process.
+Retraining without the most influential images. For our counterfactual evaluation in Section 5.3, we
+compute attribution scores on 50 samples from our CIFAR-10 and MS COCO models at step t= 400. Given
+the attribution scores for each sample, we then retrain the model after removing the corresponding top k
+influencers for k= 200,500,1000. We compute FID based on 5000images from each distribution, and repeat
+this process for each sample at each value of k.
+Journey-trak hyperparameters In the random projection step of Journey- trak, we use a projection
+dimension of d= 4096for CIFAR-10 and d= 16384 for MS COCO. As in Park et al. (2023), we use multiple
+model checkpoints in order to compute the attribution scores. For CIFAR-10, we use 100 checkpoints, and
+for MS COCO, we use 20 checkpoints. In our code repository (github.com/MadryLab/journey-TRAK), we
+release the pre-computed Journey- trakfeatures for all of our models, allowing for a quick computation of
+Journey- trakscores on new synthesized images. In Equation (3), we use k= 20for both CIFAR-10 and
+MS COCO.
+17Under review as submission to TMLR
+B Additional Analysis and Results
+B.1 Diffusion models are consistent across seeds
+Song et al. (2021) show that in the limit of infinite capacity and training data, as well as perfect optimization,
+the embedding xTobtained by diffusion models is uniquely identifiable. In other words, two independently
+trained diffusion models trained on the same dataset will embed an image x0to the same embedding x0.
+They also provide empirical evidence that this phenomenon holds approximately in non-idealized settings.
+Zhang et al. (2023) and Kadkhodaie et al. (2023) show empirically that the latent spaces of diffusion models
+we attribute are indeed highly aligned; i.e., two independently trained diffusion models will generate similar
+images given a shared embedding x0. We refer to this property as seed consistency .
+Additionally, Khrulkov et al. (2022) provide an optimal transport perspective on this phenomenon.
+The seed consistency property is critical for our attribution method Journey- trak, so we experimentally
+verify it. In fact, we find that images generated by many independently trained DDPMs on CIFAR-10 from
+the same random seed and nearly indistinguishable (see Figure B.1, right). To evaluate seed consistency
+quantitatively, we measure the ℓ2distance between images generated by two models when using identical or
+distinct noise sequences, and find that matching the noise sequences leads to a far smaller ℓ2distances (see
+Figure B.1, left).
+We additionally evaluate seed consistency on multiple checkpoints of Stable Diffusion (we use check-
+points provided at https://huggingface.co/CompVis/stable-diffusion andhttps://huggingface.co/
+runwayml/stable-diffusion-v1-5 ) and find that images generated across these models with a fixed seed
+share significantly more visual similarity that those generated from independent random seeds (see Figure
+B.2.)
+We take advantage of this property when evaluating the counterfactual impact of removing the training
+examples relevant to a given generated image (see Section 5.5). Specifically, we now expect that retraining a
+model on the full training set and then sampling from the same seed should produce a highly similar image
+to the generated image of interest. Thus, we can evaluate the counterfactual significance of removing the
+training examples with the top attribution scores for a given generated image by retraining and measuring
+the distance (in pixel space) of an image synthesized with the same seed to the original generated image.
+0 10 20 30 40 50 60 70
+l2 distance between images generated from two checkpoints0.000.050.100.150.200.250.30Fixed Seed
+Random Seed
+Various Diffusion ModelsVarious Fixed Seeds
+Figure B.1: Seed consistency of CIFAR-10 DDPMs . We find that across DDPMs trained independently
+on CIFAR-10, when using a fixed random seed during sampling, the resulting synthesized images are very
+similar, and often visually indistinguishable (Right). Quantitatively, we find that the ℓ2distance between
+images generated from two different models is significantly smaller when we fix the noise sequence (Left).
+18Under review as submission to TMLR
+Random Seed Fixed Seed
+Model 1 Model 2 Model 3 Model 4 Model 5 Model 1 Model 2 Model 3 Model 4 Model 5“A horse on grass”
+“A man in a coffee shop”
+“A bear in New York city 
+on a skateboard”
+“An astronaut eating 
+donuts in the kitchen”
+“A bird with a cowboy 
+hat ﬂying in France”
+Figure B.2: Seed consistency holds for Stable Diffusion models. We find that seed consistency holds
+even for large, text conditioned model, specifically for Stable Diffusion models that are trained on LAION-5B.
+We compare multiple checkpoints of Stable Diffusion provided by Stability AI, and find that fixing the
+noise sequence during sampling surfaces very similar images (in comparison to using independent noising
+sequences).
+19Under review as submission to TMLR
+B.2 Attribution scores can drastically change over the course of the diffusion process
+As additional motivation for performing attribution at individual steps rather than the entire diffusion
+trajectory, we highlight the following phenomena: the same training image can be both positively influential
+and negatively influential for a generated sample at different steps . For example, consider an image of a red
+car on a grey background generated by our DDPM trained on CIFAR-10 (See Figure B.3, top). We find that
+a specific training example of a red car on grass is the single most positively influential image according to
+Journey- trakat the early stages of the generative process (as it is forming the shape of the car), but is later
+the single most negatively influential image (possibly due to the difference in background, which could steer
+the model in a different direction). If we were to create an aggregate attribution score for the entire diffusion
+trajectory, it is unclear what the attribution score would signify for this training example.
+To evaluate this phenomena quantitatively, we measure the percentage of generated images for which, for a
+givenK, there exists a training example that is one of the top Khighest scoring images at some step and
+one of the top Klowest scoring images at another step (according to Journey- trak). In Figure B.4, we show
+how this percentage varies with K. As a baseline, we also include the probability of such a training example
+existing given completely random attribution scores. We find that our observed probabilities match those
+expected with random scores, signifying that an image being highly positively influential at a given step does
+notdecrease the probability that it is highly negatively influential at a different step.
+To more broadly analyze the relationship between attributions at different steps, we additionally measure the
+Spearman’s rank correlation (Spearman, 1904) between attribution scores for the same generated sample at
+different steps (see Figure B.5). We find that for steps that are sufficiently far from each other (around 500
+steps), the attribution scores are nearly uncorrelated.
+20Under review as submission to TMLR
+Pos + Neg Inﬂuencers
+Negative InﬂuencersPositive Inﬂuencers
+Figure B.3: Overlap between positive and negative influencers. Here, we visualize the generative
+process for two images generated by a DDPM on CIFAR for which there exists a training image that is both
+positively and negatively influential at different steps. If we consider an aggregate attribution score across all
+time-steps of the diffusion trajectory, we might lose the significance of such training examples which alternate
+between being positively and negatively influential during the sampling process.
+21Under review as submission to TMLR
+0 20 40 60 80 100
+K (We compare Top K and Bottom K Influencers)0%20%40%60%80%100%Percentage of Generated Images with OverlapTRAK
+Random Baseline
+Figure B.4: The relationship between positive and negative influencers. Here, we plot the probability
+that within the attribution scores for a given generated image, there exists a training example that is one of
+theKmost positive influencers at some step and one of the bottom Kmost negative influencers at another
+step. We compute this probability empirically with the attribution scores from Journey- trakand find that
+it closely aligns with the hypothetical baseline of completely random attribution scores. This signifies that
+being a top positive influencer at some step does not decrease the likelihood of being a top negative influencer
+at a different step.
+100 200 300 400 500 600 700
+Distance between steps0.00.10.20.30.40.50.6CorrelationCIFAR-10
+MS COCO
+Figure B.5: Correlation between attribution scores over steps. Here, we plot the Spearman’s rank
+correlation (Spearman, 1904) between the attribution scores for a given image generated by either our
+CIFAR-10 or MS COCO models at different steps, as a function of the distance between steps (results are
+averaged over 100 generated samples). As expected, steps that are closer in proximity have more closely
+aligned attribution scores. Interestingly, when we compute attributions at steps of distance 500 or more
+apart, the resulting scores are nearly uncorrelated.
+22Under review as submission to TMLR
+B.3 Feature analysis for Stable Diffusion
+We analyze how the likelihood of different features in the final image varies over steps for images generated by
+a Stable Diffusion model,6similarly as we did for CIFAR-10 in Figure 3. In Figure B.6, we analyze an image
+generated using the prompt, “A woman sitting on a unique chair beside a vase.” To measure the relative
+likelihood between two features (e.g., “white blouse” vs. “dark blouse”), we use a pre-trained CLIP model
+and measure whether the CLIP embedding of the generated image is closer to the text embedding of the first
+feature or the second feature. We sample 60 images at each step and report the average likelihood. We use
+300 denoising steps to speed up the generation.
+Figure B.6: Features appear at specific steps for Stable Diffusion. (Left) For each pair of features, we
+plot the evolution in the relative likelihood of the two features (according to CLIP text-image similarity) in
+the conditional distribution pθ(·|xt). Features differ in when they appear, but usually rapidly appear within
+a short interval of steps. ( Right) The generated image x0, sampled using T= 300denoising steps.
+6We use the stabilityai/stable-diffusion-2 pre-trained checkpoint.
+23Under review as submission to TMLR
+C Additional Related Work
+Data attribution. A long line of work has studied the problem of training data attribution, or tracing
+model behavior back to training data; we focus here on works done in the context of modern machine learning
+algorithms. Prior approaches include those based on the influence function and its variants (Hampel et al.,
+2011; Wojnowicz et al., 2016; Koh & Liang, 2017; Basu et al., 2019; Khanna et al., 2019; Achille et al., 2021;
+Schioppa et al., 2022; Bae et al., 2022), sampling-based methods that leverage models trained on different
+subsets of data (Ghorbani & Zou, 2019; Jia et al., 2019; Feldman & Zhang, 2020; Ilyas et al., 2022; Lin et al.,
+2022), and various other heuristic approaches (Yeh et al., 2018; Pruthi et al., 2020). These methods generally
+exhibit a strong tradeoff between predictiveness or effectiveness and computational efficiency Jia et al. (2021).
+The recent method of Park et al. (2023) significantly improves upon these tradeoffs by leveraging the empirical
+kernel structure of differentiable models. While most prior work primarily focus on the supervised setting,
+more recent works study attribution in generative settings, including to language models (Park et al., 2023)
+and to diffusion models (Wang et al., 2023). Concurrently to this work, Zheng et al. (2023) use Journey- trak
+to attribute diffusion models, but rely on heuristic design choices to design ft. In addition, Dai & Gifford
+(2023) employ ensembling to attribute diffusion models.
+In a recent work, Wang et al. (2023) propose a method for efficiently evaluating data attribution methods for
+generative models by creating custom datasets with known ground-truth attributions.
+Memorization in generative models. We can view memorization as a special case of data attribution
+where only few, nearly identical images in the training set are responsible for the generation of a corresponding
+image. Prior to the increasing popularity of diffusion models, a number of previous works studied memorization
+in other generative models. For example, Feng et al. (2021) study the impact of properties of a dataset
+(size, complexity) on training data replication in Generative Adversarial Networks (GANs), and van den
+Burg & Williams (2021) introduce a memorization score for Variational Autoencoders (VAEs) that can be
+additionally applied to arbitrary generative models. Following the release of large text-to-image diffusion
+models, the creators of one of these models (DALL ·E 2) investigated memorization issues themselves and
+found that memorization could be significantly decreased through de-duplication of the training data (Nichol
+et al., 2022). Recently, Somepalli et al. (2022) explore the data replication behavior of diffusion models from
+the lens of “digital forgery,” and identify many cases where, even when Stable Diffusion produces “unique”
+images, it directly copies style and semantic structure from individual images in the training set. On the
+other hand, Carlini et al. (2023) investigate memorization from the perspective of privacy, and show that
+query access to diffusion models can enable an adversary to directly extract the models’ training data.
+24Under review as submission to TMLR
+D TRAK details
+In this section, given the close connection between our method Journey- trakandtrak(Park et al., 2023),
+we provide a detailed description of the trakmethod.
+Using our notation from Section 2.1, we have a learning algorithm Aproducing model parameters θ(S)when
+trained on a training set S= (z1,...,zn). Additionally, we define a model output function f(z,θ(S))of
+interest. Next, let use define a “feature map” g:Z→Rkas
+g(z):=P⊤∇θf(z;θ⋆), (4)
+i.e., a function taking an example zto its corresponding gradient with respect to θof the model output
+functionf, projected with a random matrix P∼N(0,1)p×kfork≪p. Finally, for brevity, let use define
+G= [g(z1),...,g (zn)]for allziin the training set S.
+Park et al. (2023) consider supervised learning settings (e.g., image classification). In short, they develop a
+method that attributes scalaroutput functions f. By large, they consider the “classification margin” output
+function, defined as log/parenleftig
+p
+1−p/parenrightig
+wherepis the classfier’s softmax probability of the correct class.
+It turns out that for the above choice of model output function, one can write the attribution scores for a
+target sample zas
+τ(z,S):=g(z)⊤(G⊤G)−1G⊤Q, (5)
+for a diagonal matrix Qdefined as Q=diag/parenleftbig/braceleftbig
+(1 + exp(yi·f(zi;θ⋆)))−1/bracerightbig/parenrightbig
+.
+While convenient, this notation obfuscates the decomposition of this estimator into “change in parameters”
+and “change in output” which we outlined in Section 2.1 and Section 4. In particular, another way to write
+the estimator from Equation (5) is to define
+ϕ(z):=P⊤∇θL(z,θ⋆), (6)
+whereLis the training loss. And again, we can define
+Φ = [ϕ(z1),...,ϕ (zn)]. (7)
+With this new notation, we can write Equation (5) as
+τ(z,S):=g(z)⊤(G⊤G)−1Φ⊤. (8)
+Note that (G⊤G)−1remains intact, which is in divergence with the influence function derivations outlined in
+Pregibon (1981). This is due to an ablation study performed in Park et al. (2023).
+D.1 Differences between trak and Journey- trak
+In Journey- trak, we donotuse the simplification in Equation (8) and instead implement an estimator which
+follows Pregibon (1981) more closely:
+τ(z,S):=g(z)⊤(Φ⊤Φ)−1Φ⊤, (9)
+as expressed on line 17 in Algorithm 1. This is critical, since unlike in the classification setting, we can no
+longer make a simple decomposition similar to Equation (5), and using this simplified estimator would result
+in an overly biased estimator.
+A key innovation in Park et al. (2023) is the reduction of the multi-class classification problems to binary
+classification via the “classification margin” output function. This choice makes the trakestimator much
+more tractable, especially when the number of classes is large (as in, e.g., ImageNet (Deng et al., 2009)).
+Similarly, when attributing steps of the diffusion process, “natural” output functions ftlike the latent xt
+itself are also high-dimensional. Thus, one of the key design choices for Journey- trakis the model output
+functionft, which is diffusion-specific.
+Another way to observe the key role that ftplays is to analyze the concurrent work of Zheng et al. (2023). In
+their paper, they adapt Journey- trakto develop a timestep-global attribution method by only making a
+change toft.
+25Under review as submission to TMLR
+E Omitted plots
+In this section, we present additional visualizations extending upon the figures in the main text. In Figure E.1
+and Figure E.2, we visualize the most influential training examples identified by Journey- trakfor a sample
+generated with a DDPM trained on CIFAR-10 and a LDM trained on MS COCO, respectively. In Figure E.3,
+we more concisely display attributions for additional samples generated by a CIFAR-10 DDPM. Finally, in
+Figure E.4 we display additional examples of the appearance of features over steps, and confirm that our
+findings in the main text hold across when different classification models are used for identifying a given
+feature.
+Diffusion Trajectory Positive Inﬂuencers Negative inﬂuencersDifferent class Different class/color Different backgroundGenerative (Reverse Diffusion) Process
+Final sample Initial noise   t=T   t= 0
+Figure E.1: An example of step-dependent attribution scores for a sample generated by a DDPM trained on
+CIFAR-10. At each step t, Journey- trakpinpoints the training examples with the highest influence (positive
+in green, negative in red) on the generative process at this step. In particular, positive influencers guide the
+trajectory towards the final sample, while negative influencers guide the trajectory away from it.
+Diffusion Trajectory Positive Inﬂuencers Negative inﬂuencersMore zoomed in More zoomed out No fenceGenerative (Reverse Diffusion) Process
+Final sample Initial noise   t=T   t= 0
+Figure E.2: An additional example of step-dependent attribution scores for a sample generated by a LDM
+trained on MS COCO. At each step t, Journey- trakpinpoints the training examples with the highest
+influence (positive in green, negative in red) on the generative process at this step. In particular, positive
+influencers guide the trajectory towards the final sample, while negative influencers guide the trajectory away
+from it.
+26Under review as submission to TMLR
+Figure E.3: Additional examples our attributions identified by Journey- trak. Here, we visualize the diffusion
+trajectory for generated images along with the most positively (green) and negatively (red) influential images
+at individual steps throughout the diffusion trajectory.
+800 600 400 200 0
+Step (t)0.00.20.40.60.81.0(classified as horse)
+ResNet (robust)
+ResNet
+CLIP zero-shot
+800 600 400 200 0
+Step (t)0.00.20.40.60.81.0(classified as automobile)
+ResNet (robust)
+ResNet
+CLIP zero-shot
+800 600 400 200 0
+Step (t)0.00.20.40.60.81.0(classified as airplane)
+ResNet (robust)
+ResNet
+CLIP zero-shot
+Final Sample
+ Final Sample
+ Final Sample
+Figure E.4: Additional examples of the appearance of features over steps, similar to the analysis in Figure 3.
+In each plot, we show the likelihood that a sample generated from the distribution pθ(·|xt)contains a the
+feature of interest (in this case, the CIFAR-10 class of the final image) according to three different classifiers:
+a ResNet trained on the CIFAR-10 dataset with either standard or robust training, and zero-shot CLIP-H/14
+model (Radford et al., 2021). Note that in each example, the likelihood that the final image contains the
+given feature increases rapidly in a short interval of steps, and that this phenomena is consistent across
+different classifiers.
+27

@@ -1,0 +1,2038 @@
+Under review as submission to TMLR
+Sample, estimate, aggregate:
+A recipe for causal discovery foundation models
+Anonymous authors
+Paper under double-blind review
+Abstract
+Causal discovery, the task of inferring causal structure from data, has the potential to uncover
+mechanistic insights from biological experiments, especially those involving perturbations.
+However, causal discovery algorithms over larger sets of variables tend to be brittle against
+misspecification or when data are limited. For example, single-cell transcriptomics measures
+thousands of genes, but the nature of their relationships is not known, and there may be
+as few as tens of cells per intervention setting. To mitigate these challenges, we propose a
+foundation model-inspired approach: a supervised model trained on large-scale, synthetic
+data to predict causal graphs from summary statistics — like the outputs of classical causal
+discovery algorithms run over subsets of variables and other statistical hints like inverse
+covariance. Our approach is enabled by the observation that typical errors in the outputs
+of classical methods remain comparable across datasets. Theoretically, we show that the
+model architecture is well-specified in terms of computational capacity. Empirically, we
+train the model to be robust to misspecification and distribution shift using diverse datasets.
+Experiments on biological and synthetic data confirm that this model generalizes well beyond
+its training set, runs on graphs with hundreds of variables in seconds, and can be adapted
+(zero-shot or finetuned) to different underlying data assumptions.1
+1 Introduction
+A fundamental aspect of scientific research is to discover and validate causal hypotheses involving variables
+of interest. Given observations of these variables, the goal of causal discovery algorithms is to extract
+such hypotheses in the form of directed graphs, in which edges denote causal relationships (Spirtes et al.,
+2001). There are several challenges to their widespread adoption in basic science. The core issue is that
+the correctness of these algorithms is tied to their assumptions on the data-generating processes, which are
+unknown in real applications. In principle, one could circumvent this issue by exhaustively running discovery
+algorithms with different assumptions and comparing their outputs with surrogate measures that reflect graph
+quality (Faller et al., 2023). However, this search would be costly: current algorithms must be optimized
+from scratch each time, and they scale poorly to the graph and dataset sizes present in modern scientific big
+data (Replogle et al., 2022).
+Causal discovery algorithms follow two primary approaches that differ in their treatment of the causal graph.
+Discrete optimization algorithms explore the super-exponential space of graphs by proposing and evaluating
+changes to a working graph (Glymour et al., 2019). While these methods are fast on small graphs, the
+combinatorial space renders them intractable for exploring larger structures. Furthermore, these algorithms
+are driven by hypothesis tests, which necessarily impose functional assumptions on the data-generating
+process, and whose results can be erroneous, especially as the number of variables increases. An alternative is
+to frame causal discovery as a continuous optimization over weighted adjacency matrices. These algorithms
+either fit a generative model to the data and extract the causal graph as a parameter (Zheng et al., 2018),
+or train a supervised learning model on simulated data (Lorch et al., 2022). However, the former must be
+trained from scratch per-dataset, and latter are not easily extensible to causal mechanisms beyond those in
+the training set.
+1Our code is available in the supplement.
+1Under review as submission to TMLR
+In this work, we present Sea: Sample, Estimate, Aggregate, a supervised causal discovery framework that
+aims to perform well even when data-generating processes are unknown, and to easily incorporate prior
+knowledge when it is available. We train a deep learning model to predict causal graphs from two types of
+statistical descriptors: the estimates of classical discovery algorithms over small subsets, and graph-level
+statistics. Classical discovery algorithms output a representation of a graph’s equivalency class, whose format
+is largely consistent across algorithms, and whose errors are comparable across datasets. Statistics like
+correlation or inverse covariance are strong indicators for a graph’s overall connectivity and can reduce the
+number of subsets on which we must run discovery algorithms. Theoretically, we show that our model can
+implement a combinatorial algorithm that recovers larger causal graphs that are consistent with smaller,
+marginal subgraphs. Empirically, our training procedure forces the model to predict causal graphs across
+diverse synthetic data, including on datasets that are misaligned with the discovery algorithms’ assumptions,
+or when insufficient subsets are provided.
+Ourexperimentsprobethreequalitiesthatweviewafoundationmodelshouldfulfill, withthoroughcomparison
+to three classical baselines and five deep learning approaches. Specifically, we assess the framework’s ability
+to generalize to unseen and out-of-distribution data; to steer predictions based on prior knowledge; and
+to perform well in low-data regimes. Seaattains the state-of-the-art results on synthetic and real causal
+discovery tasks, while providing 10-1000x faster inference. To incorporate domain knowledge, we show that it
+is possible to swap classic discovery algorithms at inference time, for significant improvements on datasets
+that match the assumptions of the new algorithm. Our models can also be finetuned at a fraction of the
+training cost to accommodate new graph-level statistics that capture different (e.g. nonlinear) relationships.
+We extensively analyze Seain terms of low-data performance, scalability, causal identifiability, and other
+design choices. To conclude, while our experiments focus on specific algorithms and architectures, this work
+presents a blueprint for designing causal discovery foundation models, in which sampling heuristics, classical
+causal discovery algorithms, and summary statistics are the fundamental building blocks.
+2 Background and related work
+2.1 Causal structure learning
+Acausal graphical model is a directed, acyclic graph G= (V,E), where each node i∈Vcorresponds to a
+random variable Xi∈Xand each edge (i,j)∈Erepresents a causal relationship from Xi→Xj. There are
+a number of assumptions that relate data distribution PXtoG(Spirtes et al., 2001; Hauser & Bühlmann,
+2012), which determine whether Gis identifiable Causal graphical models allow us to perform interventions
+on nodesiby setting conditional P(Xi|Xπi)to a different distribution ˜P(Xi|Xπi). In this paper, our
+experiments cover the observational case (no interventions) and the case with perfect interventions on each
+node, i.e. ˜P(Xi|Xπi) =˜P(Xi).
+Given a dataset D∼PX, the goal of causal structure learning (causal discovery) is to recover G. There
+are two main challenges. First, the number of possible graphs is super-exponential in the number of nodes N,
+so algorithms must navigate this combinatorial search space efficiently. Second, depending on data availability
+and the underlying data generation process, causal discovery algorithms may or may not be able to recover
+Gin practice. In fact, many algorithms are only analyzed in the infinite-data regime and require at least
+thousands of data samples for reasonable empirical performance (Spirtes et al., 2001; Brouillard et al., 2020).
+Discrete optimization methods make atomic changes to a proposal graph until a stopping criterion is met.
+Constraint-based algorithms identify edges based on conditional independence tests, and their correctness is
+inseparable from the empirical results of those tests (Glymour et al., 2019), whose statistical power depends
+directly on dataset size. These include the observational FCI and PC algorithms (Spirtes et al., 1995), and
+the interventional JCI algorithm (Mooij et al., 2020). Score-based methods also make iterative modifications
+to a working graph, but their goal is to maximize a continuous score over the discrete space of all valid graphs,
+with the true graph at the optimum. Due to the intractable search space, these methods often make decisions
+based on greedy heuristics. Classic examples include GES (Chickering, 2002), GIES (Hauser & Bühlmann,
+2012), CAM (Bühlmann et al., 2014), LiNGAM (Shimizu et al., 2006), and IGSP (Wang et al., 2017).
+2Under review as submission to TMLR
+aligned estimates E' align marginal estimates E't
+global statistics ρ
+dataset D N nodes M examples batches D1 … DT
+Sample subsets of data 
+and variablesEstimate local structures and 
+global summary statisticsbatch D0
+Aggregate  statistical 
+features into causal graphsgraph 
+prediction ÊInputOutputb examples 
+N ⨉ NT ⨉ K N ⨉ NFM
+high quality 
+graph prediction(A) Design objectives for a causal 
+discovery foundation model
+1) Outperform dataset-specific algorithms, even 
+on real, out-of-distribution, or misspecified data 
+dataset with 
+unknown 
+assumptions ???
+2) Incorporate domain knowledge at 
+inference time, or via low-cost finetuning 
+dataset data assumptions 
+"prompt": 
+"non-linear" 
+"non-Gaussian" FM
+prediction incorporates 
+assumptions
+3) Scaling up → robust low-data performance 
+FMhigh quality 
+predictionsmall 
+dataset (B) Our approach: Sample, Estimate, Aggregate (SEA)
+Inference framework:  Featurize datasets via summary statistics and outputs of classical discovery 
+algorithms over small subsets, whose errors are comparable across datasets → Pretrained, 
+supervised model predicts causal graph. 
+(C) Training procedure 
+Aggregator Sub-sample nodes 
+and batches with 
+varying T Large-scale, 
+synthetic datasetsCompute statistics, 
+marginal estimates 
+graph 
+predictionsground truth 
+(synthetic)Pretrained 
+Aggregator 
+Model 
+Update 
+Aggregator
+Figure 1: Overview of our goals and approach. (A) Criteria we aim to fulfill. (B-C) Inference and training
+procedure. Green: raw data. Blue: graph / features. Yellow: Learned. Gray: Stochastic, but not learned.
+Continuous optimization approaches recast the combinatorial space of graphs into a continuous space
+of weighted adjacency matrices. Many of these works train a generative model to learn the empirical data
+distribution, which is parameterized through the adjacency matrix (Zheng et al., 2018; Lachapelle et al.,
+2020; Brouillard et al., 2020). Others focus on properties related to the empirical data distribution, such
+as a relationship between the underlying graph and the Jacobian of the learned model (Reizinger et al.,
+2023), or between the Hessian of the data log-likelihood and the topological order (Sanchez et al., 2023).
+Finally, most similar to this work, amortized inference approaches (Ke et al., 2022; Lorch et al., 2022) frame
+causal discovery as a supervised learning problem of predicting (synthetic) graphs from (synthetic) datasets.
+However, to incorporate new information, they must simulate new datasets and re-train the models. Since
+they operate on raw observations, they also scale poorly to larger datasets.
+2.2 Foundation models
+The concept of foundation models has revolutionized the machine learning workflow in a variety of disci-
+plines: instead of training domain-specific models from scratch, we start from a pretrained, general-purpose
+model (Bommasani et al., 2021). This work describes a blueprint for designing “foundation models” in the
+context of causal discovery. The precise definition of a foundation model varies by application, but we aim to
+fulfill the following properties (Figure 1A), enjoyed by modern text and image foundation models (Radford
+et al., 2021; Brown et al., 2020).
+1.A foundation model should enable us to outperform domain-specific models trained from scratch,
+even if the former has never seen similar tasks during training (Radford et al., 2019). In the context
+of causal discovery, we would like to train a model that outperforms any individual algorithm on real,
+misspecified, and/or out-of-distribution datasets.
+2.It should be possible to explicitly steer a foundation model’s behavior towards better performance on
+new tasks, either directly at inference time, e.g. “prompting” (Reynolds & McDonell, 2021), or at
+low cost compared to pretraining (Ouyang et al., 2022). Here, we would like to easily change our
+causal discovery algorithm’s “assumptions” regarding the data, e.g. by incorporating the knowledge
+of non-linearity, non-Gaussianity.
+3.Scaling up a foundation model should lead to improved performance in few-shot or data-poor
+regimes (Brown et al., 2020). This aspect we analyze empirically.
+In the following sections, we will revisit these desiderata from both the design and experimental perspectives.
+3Under review as submission to TMLR
+3 Methods
+3.1 Inference procedure
+Seais a causal discovery framework that learns to resolve statistical features and estimates of marginal
+graphs into a global causal graph. The inference procedure is depicted in Figure 1B. Specifically, given a new
+datasetD∈RM×Nfaithful to graph G= (V,E), we apply the following stages.
+Sample: takesasinputdataset D; andoutputsdatabatches {D0,D1,...,DT}andnodesubsets{S1,...,ST}.
+1. SampleT+ 1batches ofb≪Mobservations uniformly at random from D.
+2. Compute selection scores α∈(0,1)N×NoverD0(e.g. correlation or inverse covariance).
+3.SampleTnode subsets of size k. Each subset St⊆Vis constructed iteratively, where nodes are
+added with probability proportional to/summationtext
+j∈Stαi,j(details and alternatives in B.6).
+Estimate: takes as inputs data batches, node subsets, and (optionally) intervention targets; and outputs
+global statistics ρand marginal estimates {E′
+1,...,E′
+T}.
+1. Compute global statistics ρ∈RN×NoverD0(e.g. correlation or inverse covariance).
+2. Run discovery algorithm fto obtain marginal estimates f(Dt[St]) =E′
+tfort= 1...T.
+We useDt[St]to denote the observations in Dtthat correspond only to the variables in St. Each estimate E′
+t
+is ak×kadjacency matrix, corresponding to the knodes inSt.
+Aggregate: takes as inputs global statistics, marginal estimates, and node subsets. A pretrained aggregator
+model outputs the predicted global causal graph ˆE∈(0,1)N×N(Section 3.3).
+3.2 Training procedure
+Thetrainingproceduremirrorstheinferenceprocedure(Figure1C).Eachinputisawholedataset(summarized
+into global statistics and a set of marginal estimates), and the supervised output is the ground truth graph.
+Sampling and estimation are run in parallel on CPU, while aggregation is run on GPU.
+We trained two aggregator models, which employed the Fcialgorithm with the Fisherz test and Gies
+algorithm with the Bayesian information criterion (Schwarz, 1978). Both estimation algorithms were chosen
+for speed, and they differ in the types of edges they output (e.g. Fcireports ancestral relations). Note that
+the algorithm used for inference can differ from the one used during training, as long as their outputs are the
+same format, e.g. a CPDAG (Andersson et al., 1997) (experiments in Section 5.2). The training dataset
+contains both data that are correctly and incorrectly specified (details in Section 4.1), so the aggregator
+is forced to predict the correct graph regardless. In addition, each training instance is provided a random
+number of marginal estimates, which might not cover every edge. As a result, the aggregator must extrapolate
+to unseen edges using the available estimates and the global statistics. For example, if two variables have
+low correlation, and they are located in different neighborhoods of the already-identified graph, it may be
+reasonable to assume that they are unconnected.
+3.3 Model architecture
+The aggregator is a neural network that takes as input: global statistics ρ∈RN×N, marginal estimates
+E′
+1...T∈ET×k×k, and node subsets S1...T∈[N]T×k(Figure 2), where Eis the set of output edge types for
+the causal discovery algorithm f.2
+We project global statistics into the model dimension via a learned linear projection matrix Wρ:R→Rd,
+and we embed edge types via a learned embedding ebdE:E→Rd. To collect estimates of the same edge over
+all subsets, we align entries of E′
+1...TintoE′align
+T∈ET×K
+E′align
+t,e=(i,j)=/braceleftigg
+E′
+t,i,jifi∈St,j∈St
+0otherwise(1)
+2E.g. “no relationship,” “ XcausesY,” “Xis not a descendent of Y”
+4Under review as submission to TMLR
+Embedding FFN
+Axial attention 
+block Axial attention 
+block 
+… 
+marginal estimate 
+embeddings hE,ℓ-1 marginal estimate Ealign ∈ ƐT ⨉K
+global features ρ ∈ ℝN ⨉Ngraph prediction 
+Ê ∈ (0,1)N ⨉N
+Row AttnFFN
+Col AttnRow AttnFFN
+Col Attn+ 
+Linear Wℓ
+global feature 
+embeddings hρ,ℓ-1 concat. 
+message 
+E → ρ message 
+ρ → E sum
+LNRow Attn Dropout LNCol Attn Dropout LNFFNDropout + 
++ + 
+Axial Attention LayerAxial Attention Block2D inputhE,ℓ
+hρ,ℓ
+NTKN
+Model Overview⨉ LEmbed timeEmbed node
+t (i, j)FFN
+Embed node
+{i, j} Linear Wρ
+ρi,j+ 
++ i
+jEmbed type
+E't,e=+ 
+ij
+Marginal Estimate Embedding
+Global Feature Embeddinghρ,0
+i,jhE,0
+t,e
+Figure 2: Aggregator architecture. Marginal graph estimates and global statistics are embedded into the
+model dimension. 1D positional embeddings are added along both rows and columns. Embedded features
+pass through a series of axial attention blocks, which attend to the marginal and global features. Final layer
+global features pass through a feedforward network to predict the causal graph.
+wheretindexes into the subsets, eindexes into the set of unique edges, and Kis the number of unique edges.
+We add learned 1D positional embeddings along both dimensions of each input,
+pos-ebd (ρi,j) =ebdnode(i′) +ebdnode(j′)
+pos-ebd (E′align
+t,e) =ebdtime(t) +FFN([ebdnode(i′),ebdnode(j′)])
+wherei′,j′index into a random permutation on Vfor invariance to node permutation and graph size.3Due
+to the (a)symmetries of their inputs, pos-ebd (ρi,j)is symmetric, while pos-ebd (E′align
+t,e)considers the node
+ordering. In summary, the inputs to our axial attention blocks are
+hρ
+i,j= (Wρρ)i,j+pos-ebd (ρi,j) (2)
+hE
+t,e=ebdE(E′align
+t,e) +pos-ebd (E′align
+t,e) (3)
+fori,j∈[N]2,t∈[T],e∈[K]. Note that attention is permutation invariant, so positional embeddings
+arerequired for the model to know which edges belong to the same subset, or what each edge’s endpoints
+endpoints are.
+Axial attention An axial attention block contains two axial attention layers (marginal estimates, global
+statistics) and a feed-forward network (Figure 2, right). Given a 2D input, an axial attention layer attends
+first along the rows, then along the columns. For example, on a matrix of size (R,C,d), one pass of the axial
+attention layer is equivalent to running standard self-attention along Cwith batch size R, followed by the
+reverse. For marginal estimates, Ris the number of subsets T, and Cis the number of unique edges K. For
+global statistics, RandCare both the total number of vertices N.
+Following Rao et al. (2021), each self-attention mechanism is preceded by layer normalization and followed by
+dropout, with residual connections to the input,
+x=x+Dropout (Attn(LayerNorm (x))). (4)
+3The random permutation i′=σ(V)iallows us to avoid updating positional embeddings of lower order positions more than
+higher order ones, due to the mixing of graph sizes during training.
+5Under review as submission to TMLR
+We pass messages between the marginal and global layers to propagate information. Let ϕE,ℓbe marginal
+layerℓ, letϕρ,ℓbe global layer ℓ, and leth·,ℓdenote the hidden representations out of layer ℓ. The marginal
+to global message mE→ρ∈RN×N×dcontains representations of each edge averaged over subsets,
+mE→ρ,ℓ
+i,j =/braceleftigg
+1
+Te/summationtext
+thE,ℓ
+t,e=(i,j)if∃St,i,j∈St
+ϵ otherwise.(5)
+whereTeis the number of Stcontaininge, and missing entries are padded to learned constant ϵ. The global
+to marginal message mρ→E∈RK×dis simply the hidden representation itself,
+mρ→E,ℓ
+t,e=(i,j)=hρ,ℓ
+i,j. (6)
+We update representations based on these messages as follows.
+hE,ℓ=ϕE,ℓ(hE,ℓ−1) (marginal feature) (7)
+hρ,ℓ−1←Wℓ/bracketleftbig
+hρ,ℓ−1,mE→ρ,ℓ/bracketrightbig
+(marginal to global) (8)
+hρ,ℓ=ϕρ,ℓ(hρ,ℓ−1) (global feature) (9)
+hE,ℓ←hE,ℓ+mρ→E,ℓ(global to marginal) (10)
+Wℓ∈R2d×dis a learned linear projection, and [·]denotes concatenation.
+Graph prediction For each pair of vertices i̸=j∈V, we predict e= 0,1, or2for no edge, i→j, and
+j→i. We do not additionally enforce that our predicted graphs are acyclic, similar in spirit to Lippe et al.
+(2022). Given the output of the final axial attention block hρ, we compute logits
+z{i,j}=FFN/parenleftbig/bracketleftbig
+hρ
+i,j,hρ
+j,i/bracketrightbig/parenrightbig
+∈R3(11)
+which correspond to probabilities after softmax normalization. The overall output ˆE∈{0,1}N×Nis supervised
+by the ground truth E. Our model is trained with cross entropy loss and L2 regularization.
+Implementation details Unless otherwise noted, inverse covariance is used for the global statistic and
+selection score, due to its relationship to partial correlation. We sample batches of size b= 500overk= 5
+nodes each (analysis in 5.4). Our model was implemented with 4 layers with 8 attention heads and hidden
+dimension 64. Our model was trained using the AdamW optimizer with a learning rate of 1e-4 (Loshchilov &
+Hutter, 2019). See B.3 for additional details about hyperparameters.
+Complexity The aggregator should be be invariant to node labeling, while maintaining the order of sampled
+subsets, so attention-based architectures were a natural choice (Vaswani et al., 2017). If we concatenated ρ
+andE′
+1...Tinto a length N2Tinput, quadratic-scaling attention would cost O(N4T2). Instead, we opted for
+axial attention blocks, which attend along each of the three axes separately in O(N3T+N2T2). Both are
+parallelizable on GPU, but the latter is more efficient, especially on larger N.
+3.4 Theoretical interpretation
+Marginal graph resolution It is well-established that estimates of causal graphs over subsets of variables
+can be “merged” into consistent graphs over their union (Faller et al., 2023), and various algorithms have
+been proposed towards this task (Tillman et al., 2008; Huang et al., 2020). Our main theoretical contribution
+is demonstrating that our axial attention model can implement such an algorithm under realistic conditions
+(description of algorithm and all proofs in Appendix A).
+Theorem 3.1. LetG= (V,E)be a directed acyclic graph with maximum degree d. ForS⊆V, letE′
+S
+denote the marginal estimate over S. LetSddenote the superset that contains all subsets S⊆Vof size at
+mostd. Given{E′
+S}S∈Sd+2, a stack of Laxial attention blocks has the capacity to recover G’s skeleton and
+v-structures in O(N)width, and propagate orientations on paths of O(L)length.
+6Under review as submission to TMLR
+There are two practical considerations that motivate a framework like Sea, instead of directly running
+these reconciliation algorithms. First, many of these algorithms rely on specific characterizations of the
+data-generating process, e.g. linear non-Gaussian (Huang et al., 2020). While our proof does not constrain the
+causal mechanisms or exogenous noise, it assumes that the marginal estimates are correct. These assumptions
+may not hold on real data. However, the failure modes of causal discovery algorithms may be similar across
+datasets and can be corrected using statistics that capture richer information. For example, an algorithm
+that assumes linearity will make (predictably) asymmetric mistakes on non-linear data and underestimate
+the presence of edges. However, we may be able to recover nonlinear relationships with statistics like distance
+correlation (Sz’ekely et al., 2007). By training a deep learning model to reconcile marginal estimates and
+interpret global statistics, we are less sensitive to artifacts of sampling and discretization (e.g. p-value
+thresholds, statistics ≶0). The second consideration is that checking a combinatorial number of subsets is
+wasteful on smaller graphs and infeasible on larger graphs. In fact, if we only leverage marginal estimates, we
+must check at least O(N2)subsets to cover each edge at least once. To this end, the classical Independence
+Graph algorithm (Spirtes et al., 2001) motivates statistics such as inverse covariance to initialize the undirected
+skeleton and reduce the number of independence tests required. This allows us to use marginal estimates
+more efficiently, towards answering orientation questions. We verify this latter consideration in Section 5.4,
+where we empirically quantify the number of estimates a global statistic is “worth.”
+On identifiability The goal of this paper is a principled, yet practical framework for causal discovery.
+Instead of focusing on the identifiability of any particular setting, we provide these interpretations of our
+model’s outputs, and show empirically that our model respects classic identifiability theory (Section 5.3).
+When all assumptions are upheld, and infinite data are available, the model has the capacity to infer a
+sound graph, as far as its (Markov/interventional) equivalence class. In practice, the model will output an
+orientation for all edges, but the graph can be interpreted as one member of an equivalence class. When data
+do not match a causal discovery algorithm’s assumptions, its performance is inherently an empirical question,
+and we show empirically that our model still does well (Section 5.1). Finally, recent work (Montagna et al.,
+2024) has specifically studied the identifiability of amortized causal discovery algorithms in depth, and their
+findings are complementary to our own.
+4 Experimental setup
+Our experiments aim to address the three desiderata proposed in Section 2.2 – namely, generalization,
+adaptability, and emergent few-shot behavior. These experiments span both real and synthetic data. Real
+experiments quantify the practical utility of this framework, while synthetic experiments allow us to probe
+and compare each design choice in a controlled setting.
+4.1 Datasets
+We pretrained Seamodels on 6,480 synthetic datasets, which constitute approximately 280 million individual
+observations, each of 10-100 variables.4To assess generalization and robustness, we evaluate on unseen
+in-distribution and out-of-distribution synthetic datasets, as well as two real biological datasets (Sachs et al.,
+2005; Replogle et al., 2022), using the versions from Wang et al. (2017); Chevalley et al. (2022). To probe for
+emergent few-shot behavior, we down-sample both the training and testing sets. We also include experiments
+on simulated mRNA datasets with unseen datasets in Appendix C.2 (Dibaeinia & Sinha, 2020).
+The training datasets were constructed by 1) sampling Erdős-Rényi and scale free graphs with N= 10,20,100
+nodes and E=N,2N,3N,4Nexpected edges; 2) sampling random instantiations of causal mechanisms
+(Linear, NN with additive/non-additive Gaussian noise); and 3) iteratively sampling observations in topological
+order (details in Appendix B.1). For each graph, we generated both observational and interventional datasets
+with 1000Npoints, either all observational or split equally among observational and perfect single-node
+interventions. We generated 90 training, 5 validation, and 5 testing datasets for each combination. For testing,
+43 mechanisms, 3 graph sizes, 4 sparsities, 2 topologies, 1000Nexamples, 90 datasets →280,800,000 examples. For a sense of
+scale, single cell foundation models are trained on 300K (Rosen et al., 2024) to 30M cells (Cui et al., 2024).
+7Under review as submission to TMLR
+we also sampled out-of-distribution datasets with 1) Sigmoid and Polynomial mechanisms with Gaussian
+noise; and 2) Linear with additive non-Gaussian noise.
+4.2 Metrics
+We report standard causal discovery metrics (Lorch et al., 2022), computed with respect to the ground truth
+graph. In the observational setting, the “oracle” value of each metric will vary depending on the size of the
+equivalence class (e.g. if multiple graphs are observationally equivalent, the expected accuracy is <1; see
+Section 5.3 for more analysis). For all continuous metrics, we exclude the diagonal since several baselines
+manually set it to zero (Brouillard et al., 2020; Lopez et al., 2022).
+SHD:Structural Hamming distance is the minimum number of edge edits required to match two
+graphs (Tsamardinos et al., 2006). Discretization thresholds are as published or default to 0.5.
+mAP:Mean average precision computes the area under precision-recall curve per edge and averages over the
+graph. The random guessing baseline depends on the positive rate.
+AUC:Area under the ROC curve (Bradley, 1997) computed per edge (binary prediction) and averaged over
+the graph. For each edge, 0.5 indicates random guessing, while 1 indicates perfect performance.
+Orientation accuracy: We compute the accuracy of edge orientations as
+OA=/summationtext
+(i,j)∈E1{P(i,j)>P(j,i)}
+∥E∥. (12)
+Since OA is normalized by ∥E∥, it is invariant to the positive rate. In contrast to orientation F1 (Geffner
+et al., 2022), it is also invariant to the assignment of forward/reverse edges as 1/0.
+4.3 Baselines
+We compare against several deep learning and classical baselines. All baselines were trained and/or run
+from scratch on each testing dataset using their published code and hyperparameters, except Avici(their
+recommended checkpoint was trained on their synthetic train and test sets after publication, Appendix B.2).
+DCDI(Brouillard et al., 2020) extracts the causal graph as a parameter of a generative model. The Gand
+Dsfvariants use Gaussian or deep sigmoidal flow likelihoods, respectively. DCD-FG (Lopez et al., 2022)
+follows DCDI-G , but factorizes the graph into a product of two low-rank matrices for scalability. DiffAn
+(Sanchez et al., 2023) uses the trained model’s Hessian to obtain a topological ordering, followed by a classical
+pruning algorithm. AVICI(Lorch et al., 2022) uses an amortized inference approach to estimate P(G|D)
+over a class of data-generating mechanisms via variational inference. Both DCD-* andAVICIwere run
+with full knowledge of intervention targets. VarSort (a.k.a. “sort and regress”) (Reisach et al., 2021) sorts
+nodes by marginal variance and sparsely regresses nodes based on their predecessors. This naive baseline is
+intended to reveal artifacts of synthetic data generation. FCI, GIES run the FCI and GIES algorithms over
+allnodes. VarSort ,Fci, and Gieswere run using non-parametric bootstrapping (Friedman et al., 1999),
+with 100 subsets of 500 examples each.
+5 Results
+We highlight representative results in each section, with additional experiments and analyses in Appendix C.
+1.Section 5.1 examines the case where we have no prior knowledge about the data. Our models achieve
+high performance out-of-the-box, even when the data are misspecified or out-of-domain.
+2. Section 5.2 focuses on the case where we do know (or can estimate) the class of causal mechanisms
+or exogenous noise. We show that adapting our pretrained models with this information at zero/low
+cost leads to substantial improvement and exceeds the best baseline trained from scratch.
+3.Section 5.3 analyzes Seapredictions in context of classic identifiability theory. In particular, we
+focus on the linear Gaussian case, and show that Seaapproaches “oracle” performance (with respect
+to the MEC), while simply running a classic discovery algorithm cannot, on our finite datasets.
+8Under review as submission to TMLR
+Table 1: Causal discovery on synthetic datasets. Mean/std over 5 distinct Erdős-Rényi graphs. †indicates
+o.o.d. setting.∗indicates non-parametric bootstrapping. Runtimes based on 1 CPU and 1 V100 GPU.
+Baseline implementation details in B.2. Additional baselines and ablations in Appendix C.
+N E Model Linear NN add. Sigmoid†Polynomial†Overall
+mAP↑SHD↓mAP↑SHD↓mAP↑SHD↓mAP↑SHD↓Time(s)↓
+20 20Dcdi-G 0.59±.12 6.4±.90.78±.07 3.0±.70.36±.06 42.7±.30.42±.08 10.4±.44735.7
+Dcdi-Dsf 0.66±.16 5.2±.30.69±.18 4.2±.50.37±.04 43.2±.40.26±.08 15.7±.23569.1
+DiffAn 0.19±.0940.2±4.40.16±.10 38.6±3.10.29±.11 19.2±.60.09±.0349.7±4.6434.3
+Avici 0.48±.17 17.2±.10.59±.09 10.8±.10.42±.13 17.2±.80.24±.08 18.4±.1 2.0
+VarSort* 0.81±.08 10.0±.40.81±.15 6.6±.70.50±.13 16.1±.70.33±.13 17.1±.1 0.4
+Fci* 0.66±.07 19.0±.30.42±.19 17.4±.20.56±.08 18.5±.50.41±.14 18.9±.322.2
+Gies* 0.84±.08 7.4±.00.79±.07 9.0±.10.71±.10 12.5±.70.62±.09 13.7±.7482.1
+Sea (Fci) 0.96±.03 3.2±.60.91±.04 5.0±.80.85±.09 6.7±.10.69±.09 9.8±.2 4.2
+Sea (Gies) 0.97±.02 3.0±.90.94±.03 3.4±.40.84±.07 8.1±.80.69±.12 10.1±.9 3.0
+100 400Dcd-Fg 0.05±.00 3068±131 0.07±.00 3428±154 0.13±.02 3601±272 0.12±.03 3316±6981838.2
+Avici 0.12±.02 391±80.17±.01 407±19 0.10±.02 398±11 0.03±.00 402±19 9.3
+VarSort* 0.80±.02 224±10 0.18±.031139±269 0.51±.05 350±15 0.27±.04 380±17 5.1
+Sea (Fci) 0.84±.02 162±12 0.04±.00 403±16 0.63±.03 247±17 0.34±.04325±22 19.2
+Sea (Gies) 0.91±.01 116±70.27±.10 364±340.69±.03218±210.38±.04 328±22 3.1
+4.Section 5.4 contains a variety of ablation studies. In particular, Seaexhibits impressive low-data
+performance, requiring only 400 samples to perform well on N= 100datasets. We also ablate
+estimation hyperparameters and the contribution of marginal/global features.
+5.1 SEA generalizes to out-of-distribution, misspecified, and real datasets
+Table 1 summarizes our controlled experiments on synthetic data. Seaexceeds all baselines in the Linear
+case, which matches the models’ assumptions exactly (causal discovery algorithms and inverse covariance).
+In the misspecified (NN) or misspecified andout-of-distribution settings (Sigmoid, Polynomial), Seaalso
+attains the best performance in the vast majority of cases, even though DcdiandAviciboth have access to
+the raw data. Furthermore, our models outperform VarSort in every single setting, while most baselines
+are unable to do so consistently. This indicates that our models do not simply overfit to spurious features of
+the synthetic data generation process.
+Table 2 illustrates that we exceed baselines on single cell gene expression data from CausalBench (Chevalley
+et al., 2022; Replogle et al., 2022). Furthermore, when we increase the subset size to b= 2000, we achieve
+very high precision (0.838) over 2834 predicted edges. Searuns within 5s on this dataset of 162k cells and
+N= 622genes, while the fastest naive baseline takes 5 minutes and the slowest deep learning baseline takes 9
+hours (run in parallel on subsets of genes).
+5.2 SEA adapts to new data assumptions with zero to minimal finetuning
+We illustrate two strategies that allow us to use pretrained Seamodels with different implicit assumptions.
+First, if two causal discovery algorithms share the same output format, they can be used interchangeably
+for marginal estimation. On observational, linear non-Gaussian data, replacing the Gesalgorithm with
+Lingam (Shimizu et al., 2006) is beneficial without any other change (Table 4). The same improvement
+can be observed on Polynomial and Sigmoid non-additive data, when running Fciwith a polynomial kernel
+conditional independence test ( Kci, Zhang et al. (2011)) instead of the Fisherz test, which assumes linearity
+(Table 5). In principle, different algorithms might make different mistakes, so this strategy could lead
+to out-of-distribution inputs for the pretrained aggregator. However, we find empirically (Table 7) that
+performance remains similar for multiple unseen discovery algorithms, even those of an entirely different class
+(permutation-based GRaSP (Lam et al., 2022), instead of constraint/score-based).
+9Under review as submission to TMLR
+Table 2: Results on K562 single cell data, with
+STRING database (physical) as ground truth. Base-
+lines taken from Chevalley et al. (2022).
+Model P ↑R↑F1↑Time(s)↓
+GRNboost 0.070 0.7100.127 316
+Gies 0.190 0.020 0.036 2350
+NoTears 0.080 0.620 0.142 32883
+Dcdi-G 0.180 0.030 0.051 16561
+Dcdi-Dsf 0.140 0.040 0.062 5709
+Dcd-Fg 0.110 0.070 0.086 6368
+Sea (G)+Corr 0.491 0.109 0.179 4
+withb= 2000 0.8380.093 0.167 5Table 3: Performance on Sachs (C.4) varies depend-
+ing on implicit ( Avicitraining set) and explicit ( Sea
+variants) assumptions.
+Model mAP ↑AUC↑SHD↓
+Dcdi-Dsf 0.20 0.59 20.0
+Avici-L 0.35 0.78 20.0
+Avici-R 0.29 0.65 18.0
+Avici-L+R 0.59 0.83 14.0
+Sea (F) 0.23 0.54 24.0
++Kci 0.33 0.63 14.0
++Corr 0.41 0.70 15.0
++Kci+Corr 0.49 0.71 13.0
+Table 4: Adapting Seato linear non-Gaussian
+(Uniform) noise. Lingam run without finetuning;
+Sea(G) finetuned for distance correlation.
+Model N=10, E=10 N=20, E=20
+mAP↑SHD↓mAP↑SHD↓
+Dcdi-Dsf 0.34 22.3 0.32 63.0
+Lingam* 0.34 7.2 0.30 18.8
+Sea (G) 0.26 12.7 0.12 46.6
++lingam 0.52 10.1 0.22 39.7
++dcor 0.44 8.0 0.21 33.1
++ling+dcor 0.76 4.6 0.67 14.2Table 5: Adapting Seato polynomial, sigmoid non-
+additive (N=10, E=10). Fcirun with Kcitest;
+Sea(F)finetuned for distance correlation.
+Model Polynomial Sigmoid
+mAP↑SHD↓mAP↑SHD↓
+Dcdi-Dsf 0.39 9.8 0.81 13.6
+Fci* 0.12 10.6 0.53 8.1
+Sea (F) 0.22 10.6 0.59 4.8
++kci 0.30 10.6 0.59 5.5
++dcor 0.45 9.6 0.90 2.1
++kci+dcor 0.52 8.2 0.86 3.4
+Another strategy is to “finetune” the aggregator, either fully or using low-cost methods like LoRA (Hu
+et al., 2022). Specifically, we keep the same training set and classification objective, while changing the
+input’s featurization, e.g. a different global statistic. Here, we show that finetuning our models for distance
+correlation ( Dcor) is beneficial in both Tables 4 and 5, and the combination of strategies results in the
+highest performance overall, surpassing the best baseline trained from scratch ( Dcdi-Dsf ).
+On real data from unknown distributions, these two strategies enable the ability to run causal discovery
+with different assumptions, which may be coupled with unsupervised methods for model selection (Faller
+et al., 2023). Table 3 illustrates this idea using the Sachs proteomics dataset. Seacan be run directly with a
+different estimation algorithm (FCI with polynomial kernel “ Kci”), or finetuned for around 4-6 hours on 1
+A6000 and <4GB of GPU memory (correlation “ Corr”). In contrast, methods like Avicimust simulate
+new datasets based on each new assumption and re-train/finetune on these data (reportedly around 4 days).
+5.3 SEA respects identifiability theory
+While the identifiability of specific causal models is not a primary focus of this work, we show that Seastill
+respects classic identifiability theory. Specifically, while linear Gaussian models are known to be unidentifiable,
+Table 1 might suggest that both SeaandDcdiperform quite well on these data – better than would be
+expected if graphs were only identifiable up to their Markov equivalence classes. This empirical “identifiability”
+may be the consequence of two findings. Common synthetic data generation schemes tend to result in
+marginal variances that reflect topological order (Reisach et al., 2021), and in additive noise models, it has
+been shown that marginal variances that are the “same or weakly monotone increasing in the [topological]
+ordering” result in uniquely identifiable graphs (Park, 2020). Data standardization can eliminate these
+artifacts of synthetic data generation. In Table 5.3, we see that after standardizing linear Gaussian data, our
+model performs no better than randomly selecting a graph from the Markov equivalence class (enumerated
+10Under review as submission to TMLR
+Table 6: Searespects identifiability theory. Observational setting, standardized (-std)N= 10,E= 10linear
+Gaussian test datasets with >1graph in Markov equivalence class (MEC). Top: oracle performance based
+on true MEC (see left). Bottom: trained Seaapproaches oracle performance, while FCI is very noisy.
+"metric over 
+mean MEC""mean metric over MEC""true" 
+graph 1
+23mean over 
+adjacency 
+matrices
+Model mAP( ↑) AUC(↑) SHD(↓) OA(↑)
+metric over mean MEC 0.88±.100.98±.032.0±1.00.74±.22
+mean metric over MEC 0.74±.210.91±.071.2±.690.84±.13
+Sea(Fci) -std 0.83±.160.97±.043.3±2.30.69±.21
+Sea(Fci)+Corr -std 0.84±.140.96±.035.0±4.50.85±.14
+Fci-std 0.49±.280.75±.169.3±2.80.49±.29
+Table7: Seaisgenerallyinsensitivetoswappingestima-
+tion algorithms at inference time. Results on N= 10
+observational setting, all other parameters default. Fci
+cannot be used with Sea(g) since it outputs edge types
+beyond those of Gies.
+Inference
+estimatorSea(Fci) Sea(Gies)
+Lin. NN Sig. Poly. Lin. NN Sig. Poly.
+FCI 0.98 0.88 0.83 0.62— — — —
+PC 0.93 0.85 0.86 0.64 0.96 0.89 0.82 0.58
+GES 0.94 0.85 0.80 0.60 0.95 0.88 0.81 0.57
+GRaSP 0.93 0.85 0.80 0.61 0.95 0.88 0.81 0.57
+Lin NN Sig Poly0.000.500.751.00mAPSEA
+Lin NN Sig PolyTiny SEA
+T=50
+T=10Figure 3: Few-shot learning behavior emerges as train-
+ing set increases. “Tiny” Seatrained on 1/4 of the
+data is comparable to the full model on N= 10
+datasets when given T= 50batches, but is less robust
+with onlyT= 10.
+viapcalg(Kalisch et al., 2012)). The classic FCI algorithm is unable to reach this upper bound, suggesting
+that the amortized inference framework allows us to perform better in finite datasets.
+5.4 Ablation studies
+In addition to high performance and flexibility, one of the hallmarks of foundation models is their ability to act
+as few-shot learners when scaling up (Brown et al., 2020). We first confirm that Seais indeed data-efficient,
+requiring only around 300-400 examples for performance to converge on datasets of N= 100variables, and
+outperforms inverse covariance (computed with 500 examples) at only 200 examples (Figure 4A). To probe
+for how this behavior emerges, we trained a “tiny” version of Sea(Gies) on approximately a quarter of the
+training data ( N= 10,20datasets, 64.8 million examples). The tiny model performs nearly as well as the
+original on N= 10datasets when provided T= 50batches, but exhibits much poorer few-shot behavior with
+onlyT= 10batches (Figure 3). This demonstrates that Seais able to ingest large amounts of data, leading
+to promising few-shot behavior.5
+We also ablate each parameter of the estimation step to inform best practices. The trade-off between the
+number and size of batches may be relevant to estimation algorithms that scale poorly with the number
+of examples, e.g. kernel-based methods (Zhang et al., 2011). When given T= 100batches, Seareaches
+reasonable performance at around 250-300 examples per batch (Figure 4B). Figure 4C further illustrates
+that on the harder Sigmoid datasets, 5 batches of size b= 500are roughly equivalent to 100 batches of size
+b= 300. Finally, increasing the number of variables in each subset has minimal impact (Figure 4D), which is
+encouraging, as there is no need to incur the exponentially-scaling runtimes associated with larger subsets.
+Finally, we analyze the impact of removing marginal estimates or global statistics (Table 8). First, we take a
+fully pretrained Sea (Gies) and set the corresponding hidden representations to 0. Performance drops more
+whenhρis set to 0, indicating that our pretrained aggregator relies more on global statistics, though a sizable
+gap emerges in both situations. Then, we re-train Sea (Gies) on theN= 10datasets, with and without
+global statistics, so that lack of ρis in-distribution for the latter model, and the training sets are comparable.
+5Due to computational limitations, we were unable to train larger models, as our existing training set requires several hundred
+GB in memory, and our file system does not support fast dynamic loading.
+11Under review as submission to TMLR
+100 200 300 400 1000 2000
+dataset size (M)0.00.51.0mAP
+(A) mAP vs. dataset size
+Linear
+Sigmoid
+50100 150 200 300 500
+batch size (b)0.00.51.0
+(B) mAP vs. batch size
+Linear
+Sigmoid
+251020304050100
+number of batches (T)0.00.51.0
+(C) mAP vs. # batches
+Linear,b=500
+Linear,b=300Sigmoid,b=500
+Sigmoid,b=300
+345678910
+# variables / subset (k)0.00.51.0
+(D) mAP vs. subset size
+Linear
+Sigmoid
+Figure 4: Ablations with Sea(Gies) for estimation parameters on N= 100,E= 100. Error bars indicate 95%
+confidence interval across the 5 datasets of each setting. All parameters are set to the defaults (Section 3.3)
+unless otherwise noted. (A) Dashed: inverse covariance at M= 500. (C) Variance is unusually high for
+Sigmoidb= 300untilT= 100, indicating that larger batches result in more stable results.
+Table 8: Ablating marginal and global features on Sea (Gies) . Top: We set marginal and global represen-
+tations to 0 (lack of E′/ρis out-of-distribution) and observe that the pretrained model is more robust to
+removingE′, perhaps since we sample varying Tduring training. Bottom: Re-train Sea (Gies) onN= 10
+datasets, with and without global features (lack of ρis in-distribution). We observe that global features are
+“worth”T≈40estimates of k= 5variables each.
+Model Linear NN add. NN. Sigmoid Polynomial
+mAP↑SHD↓mAP↑SHD↓mAP↑SHD↓mAP↑SHD↓mAP↑SHD↓
+Sea (Gies) 0.99±.01 1.2±.70.94±.06 2.6±.80.91±.07 3.2±.30.85±.12 4.0±.50.70±.11 5.8±.6
+hρ←0 0.30±.1729.2±.40.27±.1829.4±.80.19±.0929.0±.00.35±.1727.4±.40.31±.1527.1±.9
+hE←0 0.85±.09 6.4±.70.82±.1110.2±.90.78±.0713.2±.20.63±.2110.2±.80.55±.1913.4±.6
+T= 2 0 .20±.0431.2±.50.25±.0629.2±.40.33±.1027.8±.10.19±.0730.2±.90.24±.0928.1±.9
+T= 10 0 .62±.16 8.0±.80.69±.11 9.6±.60.66±.1311.2±.90.62±.20 9.2±.60.50±.22 8.9±.2
+T= 50, noρ0.63±.13 6.8±.10.53±.07 6.2±.90.68±.20 6.0±.10.58±.15 7.1±.10.50±.14 7.1±.5
+Here, we see that the “no ρ” version with T= 50estimates is on par with the original architecture with
+T= 10estimates, so the global statistic is equivalent to ∼40estimates. This roughly aligns with the theory
+that global statistics can expedite the skeleton discovery process (Section 3.4), as the number of estimates
+required to discover the skeleton of a N= 10graph is approximately/parenleftbig10
+2/parenrightbig
+= 45(Prop. A.9).
+6 Conclusion
+Interventional experiments have formed the basis of scientific discovery throughout history, and in recent years,
+advances in the life sciences have led to datasets of unprecedented scale and resolution (Replogle et al., 2022;
+Nadig et al., 2024). The goal of these perturbation experiments is to extract causal relationships between
+biological entities, such as genes or proteins. However, the sheer size, sparsity, and noise level of these data
+pose significant challenges to existing causal discovery algorithms. Moreover, these real datasets do not fit
+cleanly into causal frameworks that are designed around fixed sets of data assumptions, either explicit (Spirtes
+et al., 1995) or implicit (Lorch et al., 2022). In this work, we approached these challenges through a causal
+discovery “foundation model.” Central to this concept were three goals. First, this model should generalize to
+unseen datasets whose data-generating mechanisms are unknown, and potentially out-of-distribution. Second,
+it should be easy to steer the model’s predictions with inductive biases about the data. Finally, scaling
+up the model should lead to data-efficiency. We proposed Sea, a framework that yields causal discovery
+foundation models. Seawas motivated by the idea that classical statistics and discovery algorithms provide
+powerful descriptors of data that are fast to compute and robust across datasets. Given these statistics, we
+trained a deep learning model to reproduce faithful causal graphs. Theoretically, we demonstrated that it is
+possible to produce sound causal graphs from marginal estimates, and that our model has the capacity to do
+so. Empirically, we implemented two proofs of concept of Seathat perform well across a variety of causal
+discovery tasks, easily incorporate inductive biases when they are available, and exhibit excellent few-shot
+behavior when scaled up. In summary, we hope that this work will inspire a new avenue of research into
+causal discovery algorithms that are applicable to and informed by real applications.
+12Under review as submission to TMLR
+References
+Steen A. Andersson, David Madigan, and Michael D. Perlman. A characterization of Markov equivalence
+classes for acyclic digraphs. The Annals of Statistics , 25(2):505 – 541, 1997. doi: 10.1214/aos/1031833662.
+Rishi Bommasani, Drew A Hudson, Ehsan Adeli, Russ Altman, Simran Arora, Sydney von Arx, Michael S
+Bernstein, Jeannette Bohg, Antoine Bosselut, Emma Brunskill, et al. On the opportunities and risks of
+foundation models. arXiv preprint arXiv:2108.07258 , 2021.
+Andrew P. Bradley. The use of the area under the roc curve in the evaluation of machine learning algorithms.
+Pattern Recognition , 30(7):1145–1159, 1997. ISSN 0031-3203. doi: https://doi.org/10.1016/S0031-3203(96)
+00142-2.
+Philippe Brouillard, Sébastien Lachapelle, Alexandre Lacoste, Simon Lacoste-Julien, and Alexandre Drouin.
+Differentiable causal discovery from interventional data, 2020.
+Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind
+Neelakantan, PranavShyam, GirishSastry, AmandaAskell, SandhiniAgarwal, ArielHerbert-Voss, Gretchen
+Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel M. Ziegler, Jeffrey Wu, Clemens Winter,
+Christopher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark,
+Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever, and Dario Amodei. Language models
+are few-shot learners, 2020.
+Peter Bühlmann, Jonas Peters, and Jan Ernest. CAM: Causal additive models, high-dimensional order search
+and penalized regression. The Annals of Statistics , 42(6):2526 – 2556, 2014. doi: 10.1214/14-AOS1260.
+Mathieu Chevalley, Yusuf Roohani, Arash Mehrjou, Jure Leskovec, and Patrick Schwab. CausalBench:
+A Large-scale Benchmark for Network Inference from Single-cell Perturbation Data. arXiv preprint
+arXiv:2210.17283 , 2022.
+David Maxwell Chickering. Optimal structure identification with greedy search. Journal of Machine Learning
+Research , 3:507–554, November 2002.
+Haotian Cui, Chloe Wang, Hassaan Maan, Kuan Pang, Fengning Luo, Nan Duan, and Bo Wang. scgpt:
+toward building a foundation model for single-cell multi-omics using generative ai. Nature Methods , pp.
+1–11, 2024.
+Payam Dibaeinia and Saurabh Sinha. Sergio: A single-cell expression simulator guided by gene regulatory
+networks. Cell Systems , 11(3):252–271.e11, 2020. ISSN 2405-4712. doi: https://doi.org/10.1016/j.cels.2020.
+08.003.
+Philipp M. Faller, Leena Chennuru Vankadara, Atalanti A. Mastakouri, Francesco Locatello, Dominik Janzing
+Karlsruhe Institute of Technology, and Amazon Research Tuebingen. Self-compatibility: Evaluating causal
+discovery without ground truth. International Conference on Artificial Intelligence and Statistics , 2023.
+Nir Friedman, Moisés Goldszmidt, and Abraham J. Wyner. Data analysis with bayesian networks: A
+bootstrap approach. Proceedings of the Fifteenth Conference on Uncertainty in Artificial Intelligence,
+UAI’99, pp. 196–205, 1999.
+Tomas Geffner, Javier Antoran, Adam Foster, Wenbo Gong, Chao Ma, Emre Kiciman, Amit Sharma, Angus
+Lamb, Martin Kukla, Nick Pawlowski, Miltiadis Allamanis, and Cheng Zhang. Deep end-to-end causal
+inference, 2022.
+Clark Glymour, Kun Zhang, and Peter Spirtes. Review of causal discovery methods based on graphical
+models.Frontiers in Genetics , 10, 2019. ISSN 1664-8021. doi: 10.3389/fgene.2019.00524.
+Alain Hauser and Peter Bühlmann. Characterization and greedy learning of interventional markov equivalence
+classes of directed acyclic graphs. Journal of Machine Learning Research , 13(79):2409–2464, 2012.
+13Under review as submission to TMLR
+Alain Hauser and Peter Bühlmann. Characterization and greedy learning of interventional markov equivalence
+classes of directed acyclic graphs. arXiv, 2012.
+Kurt Hornik, Maxwell Stinchcombe, and Halbert White. Multilayer feedforward networks are universal
+approximators. Neural Networks , 2(5):359–366, 1989. ISSN 0893-6080. doi: https://doi.org/10.1016/
+0893-6080(89)90020-8.
+Edward J Hu, yelong shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu
+Chen. LoRA: Low-rank adaptation of large language models. In International Conference on Learning
+Representations , 2022. URL https://openreview.net/forum?id=nZeVKeeFYf9 .
+Biwei Huang, Kun Zhang, Mingming Gong, and Clark Glymour. Causal discovery from multiple data sets
+with non-identical variable sets. Proceedings of the AAAI Conference on Artificial Intelligence , 34(06):
+10153–10161, Apr. 2020. doi: 10.1609/aaai.v34i06.6575.
+Diviyan Kalainathan, Olivier Goudet, and Ritik Dutta. Causal discovery toolbox: Uncovering causal
+relationships in python. Journal of Machine Learning Research , 21(37):1–5, 2020.
+Markus Kalisch, Martin Mächler, Diego Colombo, Marloes H Maathuis, and Peter Bühlmann. Causal
+inference using graphical models with the r package pcalg. Journal of statistical software , 47:1–26, 2012.
+Nan Rosemary Ke, Silvia Chiappa, Jane Wang, Anirudh Goyal, Jorg Bornschein, Melanie Rey, Theophane
+Weber, Matthew Botvinic, Michael Mozer, and Danilo Jimenez Rezende. Learning to induce causal
+structure, 2022.
+Sébastien Lachapelle, Philippe Brouillard, Tristan Deleu, and Simon Lacoste-Julien. Gradient-based neural
+dag learning, 2020.
+Wai-Yin Lam, Bryan Andrews, and Joseph Ramsey. Greedy relaxations of the sparsest permutation algorithm.
+In James Cussens and Kun Zhang (eds.), Proceedings of the Thirty-Eighth Conference on Uncertainty in
+Artificial Intelligence , volume 180 of Proceedings of Machine Learning Research , pp. 1052–1062. PMLR,
+01–05 Aug 2022.
+Olivier Ledoit and Michael Wolf. A well-conditioned estimator for large-dimensional covariance matrices.
+Journal of Multivariate Analysis , 88(2):365–411, 2004. ISSN 0047-259X. doi: https://doi.org/10.1016/
+S0047-259X(03)00096-4.
+Phillip Lippe, Taco Cohen, and Efstratios Gavves. Efficient neural causal discovery without acyclicity
+constraints. In International Conference on Learning Representations , 2022.
+Romain Lopez, Jan-Christian Hütter, Jonathan K. Pritchard, and Aviv Regev. Large-scale differentiable
+causal discovery of factor graphs. In Advances in Neural Information Processing Systems , 2022.
+Lars Lorch, Scott Sussex, Jonas Rothfuss, Andreas Krause, and Bernhard Schölkopf. Amortized inference for
+causal structure learning, 2022.
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization, 2019.
+Francesco Montagna, Max Cairney-Leeming, Dhanya Sridhar, and Francesco Locatello. Demystifying
+amortized causal discovery with transformers. arXiv preprint arXiv:2405.16924 , 2024.
+Joris M. Mooij, Sara Magliacane, and Tom Claassen. Joint causal inference from multiple contexts. arXiv,
+2020.
+Ajay Nadig, Joseph M. Replogle, Angela N. Pogson, Steven A McCarroll, Jonathan S. Weissman, Elise B.
+Robinson, and Luke J. O’Connor. Transcriptome-wide characterization of genetic perturbations. bioRxiv,
+2024. doi: 10.1101/2024.07.03.601903.
+Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela Mishkin, Chong Zhang,
+Sandhini Agarwal, Katarina Slama, Alex Ray, et al. Training language models to follow instructions with
+human feedback. Advances in neural information processing systems , 35:27730–27744, 2022.
+14Under review as submission to TMLR
+Gunwoong Park. Identifiability of additive noise models using conditional variances. Journal of Machine
+Learning Research , 21(75):1–34, 2020. URL http://jmlr.org/papers/v21/19-664.html .
+Jorge Pérez, Javier Marinković, and Pablo Barceló. On the turing completeness of modern neural network
+architectures. In International Conference on Learning Representations , 2019.
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language models
+are unsupervised multitask learners. OpenAI blog , 1(8):9, 2019.
+Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry,
+Amanda Askell, Pamela Mishkin, Jack Clark, Gretchen Krueger, and Ilya Sutskever. Learning transferable
+visual models from natural language supervision, 2021.
+Roshan M Rao, Jason Liu, Robert Verkuil, Joshua Meier, John Canny, Pieter Abbeel, Tom Sercu, and
+Alexander Rives. Msa transformer. In Marina Meila and Tong Zhang (eds.), Proceedings of the 38th
+International Conference on Machine Learning , volume 139 of Proceedings of Machine Learning Research ,
+pp. 8844–8856. PMLR, 18–24 Jul 2021.
+Alexander G. Reisach, Christof Seiler, and Sebastian Weichwald. Beware of the simulated dag! causal
+discovery benchmarks may be easy to game. Advances in Neural Information Processing Systems , 34, 2021.
+Patrik Reizinger, Yash Sharma, Matthias Bethge, Bernhard Schölkopf, Ferenc Huszár, and Wieland Brendel.
+Jacobian-based causal discovery with nonlinear ICA. Transactions on Machine Learning Research , 2023.
+ISSN 2835-8856.
+J. M. Replogle, R. A. Saunders, A. N. Pogson, J. A. Hussmann, A. Lenail, A. Guna, L. Mascibroda, E. J.
+Wagner, K. Adelman, G. Lithwick-Yanai, N. Iremadze, F. Oberstrass, D. Lipson, J. L. Bonnar, M. Jost,
+T. M. Norman, and J. S. Weissman. Mapping information-rich genotype-phenotype landscapes with
+genome-scale Perturb-seq. Cell, 185(14):2559–2575, Jul 2022.
+Laria Reynolds and Kyle McDonell. Prompt programming for large language models: Beyond the few-shot
+paradigm. In Extended abstracts of the 2021 CHI conference on human factors in computing systems , pp.
+1–7, 2021.
+Yanay Rosen, Maria Brbić, Yusuf Roohani, Kyle Swanson, Ziang Li, and Jure Leskovec. Toward universal
+cell embeddings: integrating single-cell rna-seq datasets across species with saturn. Nature Methods , pp.
+1–9, 2024.
+Karen Sachs, Omar Perez, Dana Pe’er, Douglas A. Lauffenburger, and Garry P. Nolan. Causal protein-
+signaling networks derived from multiparameter single-cell data. Science, 308(5721):523–529, 2005. doi:
+10.1126/science.1105809.
+Pedro Sanchez, Xiao Liu, Alison Q. O’Neil, and Sotirios A. Tsaftaris. Diffusion models for causal discovery
+via topological ordering. In The Eleventh International Conference on Learning Representations, ICLR
+2023, Kigali, Rwanda, May 1-5, 2023 . OpenReview.net, 2023.
+Gideon Schwarz. Estimating the Dimension of a Model. The Annals of Statistics , 6(2):461 – 464, 1978. doi:
+10.1214/aos/1176344136.
+Shohei Shimizu, Patrik O. Hoyer, Aapo Hyvarinen, and Antti Kerminen. A linear non-gaussian acyclic model
+for causal discovery. Journal of Machine Learning Research , 7(72):2003–2030, 2006.
+Peter Spirtes, Clark Glymour, and Richard Scheines. Causality from probability. In Conference Proceedings:
+Advanced Computing for the Social Sciences , 1990.
+Peter Spirtes, Christopher Meek, and Thomas Richardson. Causal inference in the presence of latent variables
+and selection bias. In Proceedings of the Eleventh Conference on Uncertainty in Artificial Intelligence ,
+UAI’95, pp. 499–506, San Francisco, CA, USA, 1995. Morgan Kaufmann Publishers Inc. ISBN 1558603859.
+15Under review as submission to TMLR
+Peter Spirtes, Clark Glymour, and Richard Scheines. Causation, Prediction, and Search . MIT Press, 2001.
+doi: https://doi.org/10.7551/mitpress/1754.001.0001.
+G’abor J. Sz’ekely, Maria L. Rizzo, and Nail K. Bakirov. Measuring and testing dependence by correlation of
+distances. Annals of Statistics , 35:2769–2794, 2007.
+Robert Tillman, David Danks, and Clark Glymour. Integrating locally learned causal structures with
+overlapping variables. Advances in Neural Information Processing Systems , 21:1665–1672, 01 2008.
+Ioannis Tsamardinos, Laura E Brown, and Constantin F Aliferis. The max-min hill-climbing bayesian network
+structure learning algorithm. Machine learning , 65(1):31–78, 2006.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Ł ukasz Kaiser,
+and Illia Polosukhin. Attention is all you need. In I. Guyon, U. Von Luxburg, S. Bengio, H. Wallach,
+R. Fergus, S. Vishwanathan, and R. Garnett (eds.), Advances in Neural Information Processing Systems ,
+volume 30. Curran Associates, Inc., 2017.
+Tom S. Verma and Judea Pearl. On the equivalence of causal models. In Proceedings of the Sixth Conference
+on Uncertainty in Artificial Intelligence , 1990.
+Yuhao Wang, Liam Solus, Karren Yang, and Caroline Uhler. Permutation-based causal inference algorithms
+with interventions. In I. Guyon, U. Von Luxburg, S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and
+R. Garnett (eds.), Advances in Neural Information Processing Systems , volume 30. Curran Associates, Inc.,
+2017.
+Chulhee Yun, Srinadh Bhojanapalli, Ankit Singh Rawat, Sashank J. Reddi, and Sanjiv Kumar. Are
+transformers universal approximators of sequence-to-sequence functions? CoRR, abs/1912.10077, 2019.
+Kun Zhang, J. Peters, Dominik Janzing, and Bernhard Scholkopf. Kernel-based conditional independence
+test and application in causal discovery. Conference on Uncertainty in Artificial Intelligence , 2011.
+Xun Zheng, Bryon Aragam, Pradeep Ravikumar, and Eric P. Xing. Dags with no tears: Continuous
+optimization for structure learning, 2018.
+Yujia Zheng, Biwei Huang, Wei Chen, Joseph Ramsey, Mingming Gong, Ruichu Cai, Shohei Shimizu, Peter
+Spirtes, and Kun Zhang. Causal-learn: Causal discovery in python. arXiv preprint arXiv:2307.16405 , 2023.
+16Under review as submission to TMLR
+A Proofs and derivations
+Our theoretical contributions focus on two primary directions.
+1.We formalize the notion of marginal estimates used in this paper, and prove that given sufficient
+marginal estimates, it is possible to recover a pattern faithful to the global causal graph. We provide
+lower bounds on the number of marginal estimates required for such a task, and motivate global
+statistics as an efficient means to reduce this bound.
+2.We show that our proposed axial attention has the capacity to recapitulate the reasoning required
+for marginal estimate resolution. We provide realistic, finite bounds on the width and depth required
+for this task.
+Before these formal discussions, we start with a toy example to provide intuition regarding marginal estimates
+and constraint-based causal discovery algorithms.
+A.1 Toy example: Resolving marginal graphs
+Consider the Y-shaped graph with four nodes in Figure 5. Suppose we run the PC algorithm on all subsets of
+three nodes, and we would like to recover the result of the PC algorithm on the full graph. We illustrate how
+one might resolve the marginal graph estimates. The PC algorithm consists of the following steps (Spirtes
+et al., 2001).
+1. Start from the fully connected, undirected graph on Nnodes.
+2. Remove all edges (i,j)whereXi⊥ ⊥Xj.
+3.For each edge (i,j)and subsets S⊆[N]\{i,j}of increasing size n= 1,2,...,d, wheredis the
+maximum degree in G, and allk∈Sare connected to either iorj: ifXi⊥ ⊥Xj|S, remove edge
+(i,j).
+4.For each triplet (i,j,k ), such that only edges (i,k)and(j,k)remain, ifkwas not in the set Sthat
+eliminated edge (i,j), then orient the “v-structure” as i→k←j.
+5.(Orientation propagation) If i→j, edge (j,k)remains, and edge (i,k)has been removed, orient
+j→k. If there is a directed path i⇝jand an undirected edge (i,j), then orient i→j.
+X
+YZ WX
+YZ WX
+YZ WX
+YZ WX
+YZ W
+X
+YZ WX
+YZX
+YWX
+Z W
+YZ WNodes 
+available 
+PC algorithm 
+output Ground truth (A) (B) (C) (D)
+Figure 5: Resolving marginal graphs. Subsets of nodes revealed to the PC algorithm (circled in row 1) and
+its outputs (row 2).
+In each of the four cases, the PC algorithm estimates the respective graphs as follows.
+(A) We remove edge (X,Y )via (2) and orient the v-structure.
+(B) We remove edge (X,Y )via (2) and orient the v-structure.
+(C)We remove edge (X,W )via (3) by conditioning on Z. There are no v-structures, so the edges remain
+undirected.
+(D)We remove edge (Y,W )via (3) by conditioning on Z. There are no v-structures, so the edges remain
+undirected.
+17Under review as submission to TMLR
+The outputs (A-D) admit the full PC algorithm output as the only consistent graph on four nodes.
+•XandYare unconditionally independent, so no subset will reveal an edge between (X,Y ).
+•There are no edges between (X,W )and(Y,W ). Otherwise, (C) and (D) would yield the undirected
+triangle.
+•X,Y,Zmust be oriented as X→Z←Y. PathsX→Z→YandX←Z←Ywould induce an
+(X,Y )edge in (B). Reversing orientations X←Z→Ywould contradict (A).
+•(Y,Z)must be oriented as Y→Z. Otherwise, (A) would remain unoriented.
+A.2 Resolving marginal estimates into global graphs
+Classical results have characterized the Markov equivalency class of directed acyclic graphs. Two graphs are
+observationally equivalent if they have the same skeleton and v-structures (Verma & Pearl, 1990). Thus, a
+patternPisfaithfulto a graphGif and only if they share the same skeletons and v-structures (Spirtes et al.,
+1990).
+Definition A.1. LetG= (V,E)be a directed acyclic graph. A patternPis a set of directed and undirected
+edges overV.
+Definition A.2 (Theorem 3.4 from Spirtes et al. (2001)) .If patternPisfaithfulto some directed acyclic
+graph, then Pis faithful to Gif and only if
+1.for all vertices X,YofG,XandYare adjacent if and only if XandYare dependent conditional
+on every set of vertices of Gthat does not include XorY; and
+2.for all vertices X,Y,Z, such that Xis adjacent to YandYis adjacent to ZandXandZare not
+adjacent,X→Y←Zis a subgraph of Gif and only if X,Zare dependent conditional on every set
+containingYbut notXorZ.
+Given data faithful to G, a number of classical constraint-based algorithms produce patterns that are faithful
+toG. We denote this set of algorithms as F.
+Theorem A.3 (Theorem 5.1 from Spirtes et al. (2001)) .If the input to the PC, SGS, PC-1, PC-2, PC∗,
+or IG algorithms faithful to directed acyclic graph G, the output is a pattern that represents the faithful
+indistinguishability class of G.
+The algorithms in Fare sound and complete ifthere are no unobserved confounders.
+LetPVbe a probability distribution that is Markov, minimal, and faithful to G. LetD∈RM×N∼PVbe a
+dataset ofMobservations over all N=|V|nodes.
+Consider a subset S⊆V. LetD[S]denote the subset of DoverS,
+D[S] ={xi,v:v∈S}N
+i=1, (13)
+and letG[S]denote the subgraph of Ginduced by S
+G[S] = (S,{(i,j) :i,j∈S,(i,j)∈E}. (14)
+If we apply any f∈FtoD[S], the results are notnecessarily faithful to G[S], as now there may be latent
+confounders in V\S(by construction). We introduce the term marginal estimate to denote the resultant
+pattern that, while not faithful to G[S], is still informative.
+Definition A.4 (Marginal estimate) .A patternE′is amarginal estimate ofG[S]if and only if
+1.for all vertices X,YofS,XandYare adjacent if and only if XandYare dependent conditional
+on every set of vertices of Sthat does not include XorY; and
+2.for all vertices X,Y,Z, such that Xis adjacent to YandYis adjacent to ZandXandZare not
+adjacent,X→Y←Zis a subgraph of Sif and only if X,Zare dependent conditional on every set
+containingYbut notXorZ.
+18Under review as submission to TMLR
+Algorithm 1 Resolve marginal estimates of f∈F
+1:Input:DataDGfaithful toG
+2:InitializeE′←KNas the complete undirected graph on Nnodes.
+3:forS∈Sd+2do
+4:ComputeE′
+S=f(DG[S])
+5:for(i,j)̸∈E′
+Sdo
+6:Remove (i,j)fromE′
+7:end for
+8:end for
+9:forE′
+S∈{E′
+S}Sd+2do
+10:forv-structure i→j←kinE′
+Sdo
+11:if{i,j},{j,k}∈E′and{i,k}̸∈E′then
+12: Assign orientation i→j←kinE′
+13:end if
+14:end for
+15:end for
+16:Propagate orientations in E′(optional).
+Proposition A.5. LetG= (V,E)be a directed acyclic graph with maximum degree d. ForS⊆V, letE′
+S
+denote the marginal estimate over S. LetSddenote the superset that contains all subsets S⊆Vof size at
+mostd. Algorithm 1 maps {E′
+S}S∈Sd+2to a pattern E′faithful toG.
+On a high level, lines 3-8 recover the undirected “skeleton” graph of E∗, lines 9-15 recover the v-structures,
+and line 16 references step 5 in Section A.1.
+Remark A.6.In the PC algorithm (Spirtes et al. (2001), A.1), its derivatives, and Algorithm 1, there is no
+need to consider separating sets with cardinality greater than maximum degree d, since the maximum number
+of independence tests required to separate any node from the rest of the graph is equal to number of its
+parents plus its children (due to the Markov assumption).
+Lemma A.7. The undirected skeleton of E∗is equivalent to the undirected skeleton of E′
+C∗:={{i,j}|(i,j)∈E∗or(j,i)∈E∗}={{i,j}|(i,j)∈E′or(j,i)∈E′}:=C′. (15)
+That is,{i,j}∈C∗⇐⇒ {i,j}∈C′.
+Proof.It is equivalent to show that {i,j}̸∈C∗⇐⇒ {i,j}̸∈C′
+⇒If{i,j}̸∈C∗, then there must exist a separating set SinGof at most size dsuch thati⊥ ⊥j|S. Then
+S∪{i,j}is a set of at most size d+ 2, where{i,j}̸∈C′
+S∪{i,j}. Thus,{i,j}would have been removed from
+C′in line 6 of Algorithm 1.
+⇐If{i,j}̸∈C′, letSbe a separating set in Sd+2such that{i,j}̸∈C′
+S∪{i,j}andi⊥ ⊥j|S.Sis also a
+separating set in G, and conditioning on Sremoves{i,j}fromC∗.
+Lemma A.8. A v-structure i→j←kexists inE∗if and only if there exists the same v-structure in E′.
+Proof.The PCI algorithm orients v-structures i→j←kinE∗if there is an edge between {i,j}and{j,k}
+but not{i,k}; and ifjwas not in the conditioning set that removed {i,k}. Algorithm 1 orients v-structures
+i→j←kinE′if they are oriented as such in any E′
+S; and if{i,j},{j,k}∈E′,{i,k}̸∈E′
+⇒Suppose for contradiction that i→j←kis oriented as a v-structure in E∗, but not in E′. There are two
+cases.
+1.NoE′
+Scontains the undirected path i−j−k. If eitheri−jorj−kare missing from any E′
+S, then
+E∗would not contain (i,j)or(k,j). Otherwise, if all Scontain{i,k}, thenE∗would not be missing
+{i,k}(Lemma A.7).
+19Under review as submission to TMLR
+2.In everyE′
+Sthat contains i−j−k,jis in the conditioning set that removed {i,k}, i.e.i⊥ ⊥k|S,S∋j.
+This would violate the faithfulness property, as jis neither a parent of iorkinE∗, and the outputs
+of the PC algorithm are faithful to the equivalence class of G(Theorem 5.1 Spirtes et al. (2001)).
+⇐Suppose for contradiction that i→j←kis oriented as a v-structure in E′, but not in E∗. By Lemma A.7,
+the pathi−j−kmust exist in E∗. There are two cases.
+1.Ifi→j→kori←j←k, thenjmust be in the conditioning set that removes {i,k}, so noE′
+S
+containing{i,j,k}would orient them as v-structures.
+2.Ifjis the root of a fork i←j→k, then as the parent of both iandk,jmust be in the conditioning
+set that removes {i,k}, so noE′
+Scontaining{i,j,k}would orient them as v-structures.
+Therefore, all v-structures in E′are also v-structures in E∗.
+Proof of Proposition A.5. Given data that is faithful to G, Algorithm 1 produces a pattern E′with the same
+connectivity and v-structures as E∗. Any additional orientations in both patterns are propagated using
+identical, deterministic procedures, so E′=E∗.
+This proof presents a deterministic but inefficient algorithm for resolving marginal subgraph estimates. In
+reality, it is possible to recover the undirected skeleton and the v-structures of Gwithout checking all subsets
+S∈Sd+2.
+Proposition A.9 (Skeleton bounds) .LetG= (V,E)be a directed acyclic graph with maximum degree d. It
+takesO(N2)marginal estimates over subsets of size d+ 2to recover the undirected skeleton of G.
+Proof.Following Lemma A.7, an edge (i,j)is not present in Cif it is not present in any of the size d+ 2
+estimates. Therefore, every pair of nodes {i,j}requires only a single estimate of size d+ 2, so it is possible
+to recoverCin/parenleftbigN
+2/parenrightbig
+estimates.
+Proposition A.10 (V-structures bounds) .LetG= (V,E)be a directed acyclic graph with maximum degree
+dandνv-structures. It is possible to identify all v-structures in O(ν)estimates over subsets of at most size
+d+ 2.
+Proof.Each v-structure i→j←kfalls under two cases.
+1.i⊥ ⊥kunconditionally. Then an estimate over {i,j,k}will identify the v-structure.
+2.i⊥ ⊥k|S, wherej̸∈S⊂V. Then an estimate over S∪{i,j,k}will identify the v-structure. Note
+that|S|≤d+ 2since the degree of iis at least|S|+ 1.
+Therefore, each v-structure only requires one estimate, and it is possible to identify all v-structures in O(ν)
+estimates.
+There are three takeaways from this section.
+1.If we exhaustively run a constraint-based algorithm on all subsets of size d+ 2, it is trivial to recover
+the estimate of the full graph. However, this is no more efficient than running the causal discovery
+algorithm on the full graph.
+2.In theory, it is possible to recover the undirected graph in O(N2)estimates, and the v-structures in
+O(ν)estimates. However, we may not know the appropriate subsets ahead of time.
+3.In practice, if we have a surrogate for connectivity, such as the global statistics used in Sea, then
+we can vastly reduce the number of estimates used to eliminate edges from consideration, and more
+effectively focus on sampling subsets for orientation determination.
+A.3 Computational power of the axial attention model
+Existing literature on the universality and computational power of vanilla Transformers (Yun et al., 2019;
+Pérez et al., 2019) rely on generous assumptions regarding depth or precision. Here, we show that our axial
+20Under review as submission to TMLR
+attention-based model can implement the specific reasoning required to resolve marginal estimates under
+realistic conditions. In particular, we show that three blocks can recover the skeleton and v-structures in
+O(N)width, and additional blocks have the capacity to propagate orientations. We first formalize the notion
+of a neural network architecture’s capacity to “implement” an algorithm. Then we prove Theorem 3.1 by
+construction.
+Definition A.11. Letfbe a map from finite sets QtoF, and letϕbe a map from finite sets QΦtoFΦ.
+We sayϕimplements fif there exists injection gin:Q→QΦand surjection gout:FΦ→Fsuch that
+∀q∈Q,gout(ϕ(gin(q))) =f(q). (16)
+Definition A.12. LetQ,F,Q Φ,FΦbe finite sets. Let fbe a map from QtoF, and let Φbe a finite set
+of maps{ϕ:QΦ→FΦ}. We say Φhas thecapacity to implement fif and only if there exists at least one
+elementϕ∈Φthat implements f.
+Theorem 3.1. LetG= (V,E)be a directed acyclic graph with maximum degree d. ForS⊆V, letE′
+S
+denote the marginal estimate over S. LetSddenote the superset that contains all subsets S⊆Vof size at
+mostd. Given{E′
+S}S∈Sd+2, a stack of Laxial attention blocks has the capacity to recover G’s skeleton and
+v-structures in O(N)width, and propagate orientations on paths of O(L)length.
+Proof.We consider axial attention blocks with dot-product attention and omit layer normalization from our
+analysis, as is common in the Transformer universality literature Yun et al. (2019). Our inputs X∈Rd×R×C
+consist ofd-dimension embeddings over Rrows andCcolumns. Since our axial attention only operates over
+one dimension at a time, we use X·,cto denote a 1D sequence of length R, given a fixed column c, andXr,·to
+denote a 1D sequence of length C, given a fixed row r. A single axial attention layer (with one head) consists
+of two attention layers and a feedforward network,
+Attn row(X·,c) =X·,c+WOWVX·,c·σ/bracketleftbig
+(WKX·,c)TWQX·,c/bracketrightbig
+, (17)
+X←Attn row(X)
+Attn col(Xr,·) =Xr,·+WOWVXr,··σ/bracketleftbig
+(WKXr,·)TWQXr,·/bracketrightbig
+, (18)
+X←Attn col(X)
+FFN(X) =X+W2·ReLU (W1·X+b11T
+L) +b21T
+L, (19)
+whereWO∈Rd×d,WV,WK,WQ∈Rd×d,W2∈Rd×m,W1∈Rm×d,b2∈Rd,b1∈Rm, andmis the hidden
+layer size of the feedforward network. For concision, we have omitted the randcsubscripts on the Ws,
+but the row and column attentions use different parameters. Any row or column attention can take on the
+identity mapping by setting WO,WV,WK,WQtod×dmatrices of zeros.
+A single axial attention blockconsists of two axial attention layers ϕEandϕρ, connected via messages (Section
+3.3)
+hE,ℓ=ϕE,ℓ(hE,ℓ−1)
+hρ,ℓ−1←Wρ,ℓ/bracketleftbig
+hρ,ℓ−1,mE→ρ,ℓ/bracketrightbig
+hρ,ℓ=ϕρ,ℓ(hρ,ℓ−1)
+hE,ℓ←hE,ℓ+mρ→E,ℓ
+wherehℓdenote the hidden representations of Eandρat layerℓ, and the outputs of the axial attention block
+arehρ,ℓ,hE,ℓ.
+We construct a stack of L≥3axial attention blocks that implement Algorithm 1.
+Model inputs Consider edge estimate E′
+i,j∈Ein a graph of size N. Letei,ejdenote the endpoints of
+(i,j). Outputs of the PC algorithm can be expressed by three endpoints: {∅,•,▶}. A directed edge from
+i→jhas endpoints (•,▶), the reversed edge i←jhas endpoints (▶,•), an undirected edge has endpoints
+(•,•), and the lack of any edge between i,jhas endpoints (∅,∅).
+21Under review as submission to TMLR
+Letone-hotN(i)denote the N-dimensional one-hot column vector where element iis 1. We define the
+embedding of (i,j)as ad= 2N+ 6dimensional vector,
+gin(Et,(i,j)) =hE,0
+(i,j)=
+one-hot 3(ei)
+one-hot 3(ej)
+one-hotN(i)
+one-hotN(j)
+. (20)
+To recover graph structures from hE, we simply read off the indices of non-zero entries ( gout). We can set hρ,0
+to any Rd×N×Nmatrix, as we do not consider its values in this analysis and discard it during the first step.
+Claim A.13. (Consistency) The outputs of each step
+1. are consistent with (20), and
+2. are equivariant to the ordering of nodes in edges.
+For example, if (i,j)is oriented as (▶,•), then we expect (j,i)to be oriented (•,▶).
+Step 1: Undirected skeleton We use the first axial attention block to recover the undirected skeleton
+C′. We set all attentions to the identity, set Wρ,1∈R2d×dto ad×dzeros matrix, stacked on top of a d×d
+identity matrix (discard ρ), and set FFN Eto the identity (inputs are positive). This yields
+hρ,0
+i,j=mE→ρ,1
+i,j =
+Pei(∅)
+Pei(•)
+Pei(▶)
+...
+one-hotN(i)
+one-hotN(j)
+, (21)
+wherePei(·)is the frequency that endpoint ei=·within the subsets sampled. FFNs with 1 hidden layer are
+universal approximators of continuous functions (Hornik et al., 1989), so we use FFN ρto map
+FFNρ(Xi,u,v) =
+
+0i≤6
+0i>6,X1,u,v= 0
+−Xi,u,votherwise,(22)
+wherei∈[2N+ 6]indexes into the feature dimension, and u,vindex into the rows and columns. This allows
+us to remove edges not present in C′from consideration:
+mρ→E,1=hρ,1
+hE,1
+i,j←hE,1
+i,j+mρ→E,1
+i,j =/braceleftigg
+0 (i,j)̸∈C′
+hE,0
+i,jotherwise.(23)
+This yields (i,j)∈C′if and only if hρ,1
+i,j̸=0. We satisfy A.13 since our inputs are valid PC algorithm outputs
+for whichPei(∅) =Pej(∅).
+Step 2: V-structures The second and third axial attention blocks recover v-structures. We run the same
+procedure twice, once to capture v-structures that point towards the first node in an ordered pair, and one to
+capture v-structures that point towards the latter node.
+We start with the first row attention over edge estimates, given a fixed subset t. We set the key and query
+attention matrices
+WK=k·
+0 0 1
+0 1 0
+...
+IN
+−IN
+WQ=k·
+0 0 1
+0 1 0
+...
+IN
+IN
+(24)
+22Under review as submission to TMLR
+wherekis a large constant, INdenotes the size Nidentity matrix, and all unmarked entries are 0s.
+Recall that a v-structure is a pair of directed edges that share a target node. We claim that two edges
+(i,j),(u,v)form a v-structure in E′, pointing towards i=u, if this inner product takes on the maximum
+value/angbracketleftbig
+(WKhE,1)i,j,(WQhE,1)u,v/angbracketrightbig
+= 3. (25)
+Suppose both edges (i,j)and(u,v)still remain in C′. There are two components to consider.
+1.Ifi=u, then their shared node contributes +1to the inner product (prior to scaling by k). Ifj=v,
+then the inner product accrues −1.
+2.Nodes that do not share the same endpoint contribute 0 to the inner product. Of edges that share
+one node, only endpoints that match ▶at the starting node, or •at the ending node contribute +1
+to the inner product each. We provide some examples below.
+(ei,ej) (eu,ev)contribution note
+(▶,•) (•,▶) 0 no shared node
+(•,▶) (•,▶) 0 wrong endpoints
+(•,•) (•,•) 1 one correct endpoint
+(▶,•) (▶,•) 2 v-structure
+All edges with endpoints ∅were “removed” in step 1, resulting in an inner product of zero, since their node
+embeddings were set to zero. We set kto some large constant (empirically, k2= 1000is more than enough)
+to ensure that after softmax scaling, σe,e′>0only ife,e′form a v-structure.
+Given ordered pair e= (i,j), letVi⊂Vdenote the set of nodes that form a v-structure with ewith shared
+nodei. Note that Viexcludesjitself, since setting of WK,WQexclude edges that share both nodes. We set
+WVto the identity, and we multiply by attention weights σto obtain
+(WVhE,1σ)e=(i,j)=
+...
+one-hotN(i)
+αj·binaryN(Vj)
+ (26)
+wherebinaryN(S)denotes the N-dimensional binary vector with ones at elements in S, and the scaling factor
+αj= (1/∥Vj∥)· 1{∥Vj∥>0}∈[0,1] (27)
+results from softmax normalization. We set
+WO=/bracketleftbigg0N+6
+0.5·IN/bracketrightbigg
+(28)
+to preserve the original endpoint values, and to distinguish between the edge’s own node identity and newly
+recognized v-structures. To summarize, the output of this row attention layer is
+Attn row(X·,c) =X·,c+WOWVX·,c·σ,
+which is equal to its input hE,1plus additional positive values ∈(0,0.5)in the lastNpositions that indicate
+the presence of v-structures that exist in the overall E′.
+Our final step is to “copy” newly assigned edge directions into all the edges. We set the ϕEcolumn attention,
+FFNEand theϕρattentions to the identity mapping. We also set Wρ,2to ad×dzeros matrix, stacked on
+top of ad×didentity matrix. This passes the output of the ϕErow attention, aggregated over subsets,
+directly to FFN ϕ,2.
+For endpoint dimensions e= [6], we let FFN ϕ,2implement
+FFNρ,2(Xe,u,v) =/braceleftigg
+[0,0,1,0,1,0]T−Xe,u,v 0</summationtext
+i>N+6Xi,u,v<0.5
+0 otherwise.(29)
+23Under review as submission to TMLR
+Subtracting Xe,u,v“erases” the original endpoints and replaces them with (▶,•)after the update
+hE,1
+i,j←hE,1
+i,j+mρ→E,1
+i,j.
+The overall operation translates to checking whether anyv-structure points towards i, and if so, assigning
+edge directions accordingly. For dimensions i>6,
+FFNρ,2(Xi,u,v) =/braceleftigg
+−Xi,u,vXi,u,v≤0.5
+0 otherwise,(30)
+effectively erasing the stored v-structures from the representation and remaining consistent to (20).
+At this point, we have copied all v-structures once. However, our orientations are not necessarily symmetric.
+For example, given v-structure i→j←k, our model orients edges (j,i)and(j,k), but not (i,j)or(k,j).
+The simplest way to symmetrize these edges (for the writer and the reader) is to run another axial attention
+block, in which we focus on v-structures that point towards the second node of a pair. The only changes are
+as follows.
+•ForWKandWQ, we swap columns 1-3 with 4-6, and columns 7 to N+ 6with the last Ncolumns.
+•(hE,2σ)i,jsees the third and fourth blocks swapped.
+•WOswaps theN×Nblocks that correspond to iandj’s node embeddings.
+•FFNρ,3sets the endpoint embedding to [0,1,0,0,0,1]T−Xe,u,vifi= 7,...,N + 6sum to a value
+between 0 and 0.5.
+The result is hE,3with all v-structures oriented symmetrically, satisfying A.13.
+Step 3: Orientation propagation To propagate orientations, we would like to identify cases (i,j),(i,k)∈
+E′,(j,k)̸∈E′with shared node iand corresponding endpoints (▶,•),(•,•). We useϕEto identify triangles,
+andϕρto identify edges (i,j),(i,k)∈E′with the desired endpoints, while ignoring triangles.
+Marginal layer The row attention in ϕEfixes a subset tand varies the edge (i,j).
+Given edge (i,j), we want to extract all (i,k)that share node i. We set the key and query attention matrices
+to
+WK,WQ=k·
+0 1 1 0 1 1
+...
+IN
+±IN
+. (31)
+We setWVto the identity to obtain
+(WVhEσ)e=(i,k)=
+...
+...
+one-hotN(i)
+αk·binaryN(Vk)
+, (32)
+whereVkis the set of nodes kthat share any edge with i. To distinguish between kandVk, we again set Wo
+to the same as in (28). Finally, we set FFNEto the identity and pass hEdirectly toϕρ. To summarize, we
+havehEequal to its input, with values ∈(0,0.5)in the lastNlocations indicating 1-hop neighbors of each
+edge.
+24Under review as submission to TMLR
+Global layer Now we would like to identify cases (i,k),(j,k)with corresponding endpoints (•,▶),(•,•).
+We set the key and query attention matrices
+WK=k·
+0 0 1
+...
+IN
+IN
+WQ=k·
+0 1−1 0 1−1
+...
+IN
+−IN
+.(33)
+The key allows us to check that endpoint iis directed, and the query allows us to check that (i,k)exists in
+C′, and does not already point elsewhere. After softmax normalization, for sufficiently large k, we obtain
+σ(i,j),(i,k)>0if and only if (i,k)should be oriented (•,▶), and the inner product attains the maximum
+possible value
+⟨(WKhρ)i,j,(WQhρ)i,k⟩= 2. (34)
+We consider two components.
+1. If the endpoints match our desired endpoints, we gain a +1contribution to the inner product.
+2.A match between the first nodes contributes +1. If the second node shares any overlap (either same
+edge, or a triangle), then a negative value would be added to the overall inner product.
+Therefore, we can only attain the maximal inner product if only one edge is directed, and if there exists no
+triangle.
+We setWoto the same as in (28), and we add hρto the input of the next ϕE. To summarize, we have hρ
+equal to its input, with values ∈(0,0.5)in the lastNlocations indicating incoming edges.
+Orientation assignment Our final step is to assign our new edge orientations. Let the column attention
+take on the identity mapping. For endpoint dimensions e= (4,5,6), we let FFN ρimplement
+FFNρ(Xe,u,v) =/braceleftigg
+[0,0,1]T−Xe,u,v 0</summationtext
+i>N+6Xi,u,v<0.5
+0 otherwise.(35)
+This translates to checking whether any incoming edge points towards v, and if so, assigning the new edge
+direction accordingly. For dimensions i>6,
+FFNρ(Xi,u,v) =/braceleftigg
+0Xi,u,v≤0.5
+Xi,u,votherwise,(36)
+effectively erasing the stored assignments from the representation. Thus, we are left with hE,ℓthat conforms
+to the same format as the initial embedding in (20).
+To symmetrize these edges, we run another axial attention block, in which we focus on paths that point
+towards the second node of a pair. The only changes are as follows.
+•ForϕElayerWKandWQ(31), we swap INand±IN.
+•ForϕρlayerWKandWQ(33), we swap INand±IN.
+•WOswaps theN×Nblocks that correspond to iandj’s node embeddings.
+•For FFNρ(35), we let e= (1,2,3)instead.
+The result is hEwith symmetric 1-hop orientation propagation, satisfying A.13. We may repeat this procedure
+ktimes to capture k-hop paths.
+To summarize, we used axial attention block 1 to recover the undirected skeleton C′, blocks 2-3 to identify and
+copy v-structures in E′, and all subsequent L−3layers to propagate orientations on paths up to ⌊(L−3)/2⌋
+length. Overall, this particular construction requires O(N)width forO(L)paths.
+25Under review as submission to TMLR
+Final remarks Information theoretically, it should be possible to encode the same information in logN
+space, and achieve O(logN)width. For ease of construction, we have allowed for wider networks than optimal.
+On the other hand, if we increase the width and encode each edge symmetrically, e.g. (ei,ej,ej,ei|i,j,j,i ),
+we can reduce the number of blocks by half, since we no longer need to run each operation twice. However,
+attention weights scale quadratically, so we opted for an asymmetric construction.
+Finally, a strict limitation of our model is that it only considers 1D pairwise interactions. In the graph layer,
+we cannot compare different edges’ estimates at different times in a single step. In the feature layer, we cannot
+compare (i,j)to(j,i)in a single step either. However, the graph layer does enable us to compare all edges at
+once (sparsely), and the feature layer looks at a time-collapsed version of the whole graph. Therefore, though
+we opted for this design for computational efficiency, we have shown that it is able to capture significant
+graph reasoning.
+A.4 Robustness and stability
+We discuss the notion of stability informally, in the context of Spirtes et al. (2001). There are two cases in
+which our framework may receive erroneous inputs: low/noisy data settings, and functionally misspecified
+situations. We consider our framework’s empirical robustness to these cases, in terms of recovering the
+skeleton and orienting edges.
+In the case of noisy data, edges may be erroneously added, removed, or misdirected from marginal estimates
+E′. Our framework provides two avenues to mitigating such noise.
+1.We observe that global statistics can be estimated reliably in low data scenarios. For example,
+Figure 4 suggests that 250 examples suffice to provide a robust estimate over 100 variables in our
+synthetic settings. Therefore, even if the marginal estimates are erroneous, the neural network can
+learn the skeleton from the global statistics.
+2.Most classical causal discovery algorithms are not stable with respect to edge orientation assignment.
+That is, an error in a single edge may propagate throughout the graph. Empirically, we observe that
+the majority vote of Giesachieves reasonable accuracy even without any training, while Fcisuffers
+in this assessment (Table 10). However both Sea (Gies) andSea (Fci) achieve high edge accuracy.
+Therefore, while the underlying algorithms may not be stable with respect to edge orientation, our
+pretrained aggregator seems to be robust.
+It is also possible that our global statistics and marginal estimates make misspecified assumptions regarding
+the data generating mechanisms. The degree of misspecification can vary case by case, so it is hard to
+provide any broad guarantees about the performance of our algorithm, in general. However, we can make the
+following observation.
+If two variables are independent, Xi⊥ ⊥Xj, they are independent, e.g. under linear Gaussian assumptions.
+IfXi,Xjexhibit more complex functional dependencies, they may be erroneously deemed independent.
+Therefore, any systematic errors are necessarily one-sided, and the model can learn to recover the connectivity
+based on global statistics.
+B Experimental details
+B.1 Synthetic data generation
+Synthetic datasets were generated using code from Dcdi(Brouillard et al., 2020), which extended the Causal
+Discovery Toolkit data generators to interventional data (Kalainathan et al., 2020).
+We considered the following causal mechanisms. Let ybe the node in question, let Xbe its parents, let Ebe
+an independent noise variable (details below), and let Wbe randomly initialized weight matrices.
+•Linear:y=XW +E.
+•Polynomial: y=W0+XW 1+X2W2+×E
+26Under review as submission to TMLR
+•Sigmoid:y=/summationtextd
+i=1Wi·sigmoid (Xi) +×E
+•Randomly initialized neural network (NN): y=Tanh ((X,E )Win)Wout
+•Randomly initialized neural network, additive (NN additive): y=Tanh (XW in)Wout+E
+Root causal mechanisms, noise variables, and interventional distributions maintained the Dcdidefaults.
+•Root causal mechanisms were set to Uniform (−2,2).
+•Noise was set to E∼0.4·N(0,σ2)whereσ2∼Uniform (1,2).
+•Interventions were applied to all nodes (one at a time) by setting their causal mechanisms to N(0,1).
+Ablation datasets with N > 100nodes contained 100,000 points each (same as N= 100). We set random
+seeds for each dataset using the hash of the output filename.
+B.2 Baseline details
+We considered the following baselines. All baselines were run using official implementations published by the
+authors.
+Dcdi(Brouillard et al., 2020) was trained on each of the N= 10,20datasets using their published
+hyperparameters. We denote the Gaussian and Deep Sigmoidal Flow versions as DCDI-G andDCDI-DSF
+respectively. DCDIcould not scale to graphs with N= 100due to memory constraints (did not fit on a
+32GB V100 GPU).
+DCD-FG (Lopez et al., 2022) was trained on all of the test datasets using their published hyperparameters.
+We set the number of factors to 5,10,20for each of N= 10,20,100, based on their ablation studies. Due to
+numerical instability on N= 100, we clamped augmented Lagrangian multipliers µandγto 10 and stopped
+training if elements of the learned adjacency matrix reached NaNvalues. After discussion with the authors,
+we also tried adjusting the µmultiplier from 2 to 1.1, but the model did not converge within 48 hours.
+DECI(Geffner et al., 2022) was trained on all of the test datasets using their published hyperparameters.
+However, on all N= 100cases, the model failed to produce any meaningful results (adjacency matrices nearly
+all remained 0s with AUCs of 0.5). Thus, we only report results on N= 10,20.
+DiffAN (Sanchez et al., 2023) was trained on the each of the N= 10,20datasets using their published
+hyperparameters. The authors write that “most hyperparameters are hard-coded into [the] constructor of
+theDiffAN class and we verified they work across a wide set of datasets.” We used the original, non-
+approximation version of their algorithm by maintaining residue=True in their codebase. We were unable
+to consistently run DiffAN with both R and GPU support within a Docker container, and the authors did
+not respond to questions regarding reproducibility, so all models were trained on the CPU only. We observed
+approximately a 10x speedup in the <5cases that were able to complete running on the GPU.
+AVICI (Lorch et al., 2022) was run on all test datasets using the authors’ pretrained scm-v0model,
+recommended for “arbitrary real-valued data.” Note that this model is different from the models described in
+their paper (denoted Avici-L andAvici-R), as it was trained on allof their synthetic data, including test
+sets. We sampled 1000 observations per dataset uniformly at random, with their respective interventions (the
+maximum number of synthetic samples used in their original paper), except for Sachs, which used the entire
+dataset (as in their paper). Though the authors provided separate weights for synthetic mRNA data, we
+were unable to use it since we did not preserve the raw gene counts in our simulated mRNA datasets.
+InvCov computes inverse covariance over 1000 examples. This does notorient edges, but it is a strong
+connectivity baseline. We discretize based on ground truth positive rate.
+CorrandD-Corr are computed similarly, using global correlation and distance correlation, respectively
+(See C.1 for details).
+27Under review as submission to TMLR
+B.3 Neural network design
+Hyperparameters and architectural choices were selected by training the model on 20% of the the training
+and validation data for approximately 50k steps (several hours). We considered the following parameters in
+sequence.
+•learned positional embedding vs. sinusoidal positional embedding
+•number of layers ×number of heads: {4,8}×{ 4,8}
+•learning rate η={1e−4,5e−5,1e−5}
+For our final model, we selected learned positional embeddings, 4 layers, 8 heads, and learning rate η= 1e−4.
+Some empirical limitations of our implementations include: 1) a hard-coded maximum of 1000 variables
+(arbitrary), 2) generalize poorly to synthetic cyclic data, 3) err on the side of sparsity on real data, 4) inverse
+covariance can be numerically unstable on larger graphs (recommend models finetuned for correlation here),
+and 5) training requires full precision. These are artifacts of our training set and design choices.
+B.4 Training and hardware details
+The models were trained across 2 NVIDIA RTX A6000 GPUs and 60 CPU cores. We used the GPU exclusively
+for running the aggregator, and retained all classical algorithm execution on the CPUs (during data loading).
+The total pretraining time took approximately 14 hours for the final FCI model and 16 hours for the final
+GIES model.
+For finetuning, we used rank r= 2adapters on the axial attention model’s key, query, and feedforward
+weights (Hu et al., 2022). We trained until convergence on the validation set (no improvement for 100 epochs),
+which took 4-6 hours with 40 CPUs and around 10 hours with 20 CPUs. We used a single NVIDIA RTX
+A6000 GPU, but the bottleneck was CPU availability.
+For the scope of this paper, our models and datasets are fairly small. We did not scale further due to hardware
+constraints. Our primary bottlenecks to scaling up lay in availability of CPU cores and networking speed
+across nodes, rather than GPU memory or utilization. The optimal CPU:GPU ratio for Searanges from 20:1
+to 40:1.
+We are able to run inference comfortably over N= 500graphs with T= 500subsets ofk= 5nodes each, on
+a single 32GB V100 GPU. For runtime analysis, we used a batch size of 1, with 1 data worker per dataset.
+Our runtime could be further improved if we amortized the GPU utilization across batches.
+B.5 Choice of classical causal discovery algorithm
+For training, we selected FCI (Spirtes et al., 1995) as the underlying discovery algorithm in the observational
+setting over GES (Chickering, 2002), GRaSP (Lam et al., 2022), and LiNGAM (Shimizu et al., 2006)
+due to its speed and superior downstream performance. We hypothesize this may be due to its richer
+output (ancestral graph) providing more signal to the Transformer model. We also tried Causal Additive
+Models (Bühlmann et al., 2014), but its runtime was too slow for consistent GPU utilization. Observational
+algorithm implementations were provided by the causal-learn library (Zheng et al., 2023). The code for
+running these alternative classical algorithms is available in our codebase.
+We selected GIES as the discovery algorithm in the interventional setting because an efficient Python
+implementation was readily available at https://github.com/juangamella/gies .
+We tried incorporating implementations from the Causal Discovery Toolbox via a Docker image (Kalainathan
+et al., 2020), but there was excessive overhead associated with calling an R subroutine and reading/writing
+the inputs/results from disk.
+28Under review as submission to TMLR
+Finally, we considered other independence tests for richer characterization, such as kernel-based methods.
+However, due to speed, we chose to remain with the default Fisherz conditional independence test for FCI,
+and BIC for GIES (Schwarz, 1978).
+B.6 Sampling procedure
+Selection scores: We consider three strategies for computing selection scores α. We include an empirical
+comparison of these strategies in Table 9.
+1. Random selection: αis anN×Nmatrix of ones.
+2. Global-statistic-based selection: α=ρ.
+3. Uncertainty-based selection: α=ˆH(Et), whereHdenotes the information entropy
+αi,j=−/summationdisplay
+e∈{0,1,2}p(e) logp(e). (37)
+Letct
+i,jbe the number of times edge (i,j)was selected in S1...St−1, and letαt=α//radicalig
+ct
+i,j. We consider two
+strategies for selecting Stbased onαt.
+Greedy selection: Throughout our experiments, we used a greedy algorithm for subset selection. We
+normalize probabilities to 1 before the constructing each Categorical. Initialize
+St←{i:i∼Categorical (αt
+1...αt
+N)}. (38)
+whereαt
+i=/summationtext
+j̸=i∈Vαt
+i,j. While|St|<k, update
+St←St∪{j:j∼Categorical (αt
+1,St...αt
+N,S t)) (39)
+where
+αj,St=/braceleftigg/summationtext
+i∈Stαt
+i,jj̸∈St
+0 otherwise.(40)
+Subset selection: We also considered the following subset-level selection procedure, and observed minor
+performance gain for significantly longer runtime (linear program takes around 1 second per batch). Therefore,
+we opted for the greedy method instead.
+We solve the following integer linear program to select a subset Stof sizekthat maximizes/summationtext
+i∈Stαt
+i,j. Let
+νi∈{0,1}denote the selection of node i, and letϵi,j∈{0,1}denote the selection of edge (i,j). Our objective
+is to
+maximize/summationtext
+i,jat
+i,j·ϵi,j
+subject to/summationtext
+iνi=k subset size
+ϵi,j≥νi+νj−1node-edge consistency
+ϵi,j≤νi
+ϵi,j≤νj,
+νi∈{0,1}
+ϵi,j∈{0,1}
+fori,j∈V×V,i∈V.Stis the set of non-zero indices in ν.
+The final algorithm used the greedy selection strategy, with the first half of batches sampled according to
+global statistics, and the latter half sampled randomly, with visit counts shared. This strategy was selected
+heuristically, and we did not observe significant improvements or drops in performance when switching to
+other strategies (e.g. all greedy statistics-based, greedy uncertainty-based, linear program uncertainty-based,
+etc.)
+Table 9 compares the heuristics-based greedy sampler (inverse covariance + random) with the model
+uncertainty-based greedy sampler. Runtimes are plotted in Figure 6. The latter was run on CPU only, since
+29Under review as submission to TMLR
+Table 9: Comparison between heuristics-based sampler (random and inverse covariance) vs. model confidence-
+based sampler. The suffix -Lindicates the greedy confidence-based sampler. Each setting encompasses 5
+distinct Erdős-Rényi graphs. The symbol †indicates that Seawas not pretrained on this setting. Bold
+indicates best of all models considered (including baselines not pictured).
+N EModel Linear NN add. NN non-add. Sigmoid†Polynomial†
+mAP↑OA↑shd↓mAP↑OA↑shd↓mAP↑OA↑shd↓mAP↑OA↑shd↓mAP↑OA↑shd↓
+10 10Sea-f 0.97 0.92 1.60.95 0.92 2.40.92 0.94 2.8 0.83 0.76 3.7 0.69 0.71 6.7
+Sea-g 0.99 0.94 1.2 0.94 0.88 2.6 0.91 0.93 3.2 0.85 0.84 4.0 0.70 0.795.8
+Sea-f-l 0.97 0.931.0 0.95 0.87 2.40.92 0.98 3.4 0.84 0.77 3.90.70 0.795.8
+Sea-g-l 0.98 0.93 1.4 0.94 0.91 2.8 0.91 0.94 4.00.88 0.84 3.6 0.700.80 5.8
+10 40Sea-f 0.90 0.87 14.4 0.91 0.94 11.2 0.87 0.86 16.00.81 0.85 22.7 0.81 0.92 33.4
+Sea-g 0.94 0.91 12.8 0.910.95 10.4 0.89 0.89 17.2 0.810.87 24.5 0.89 0.93 29.5
+Sea-f-l 0.91 0.90 15.60.91 0.92 15.8 0.88 0.86 14.2 0.81 0.84 23.2 0.82 0.93 33.8
+Sea-g-l 0.93 0.91 13.4 0.91 0.9310.4 0.88 0.85 16.2 0.79 0.83 25.50.90 0.94 28.3
+20 20Sea-f 0.97 0.92 3.2 0.94 0.97 3.2 0.84 0.93 7.2 0.84 0.85 7.60.71 0.80 10.2
+Sea-g 0.97 0.89 3.00.94 0.95 3.4 0.83 0.94 7.8 0.84 0.83 8.1 0.69 0.78 10.1
+Sea-f-l 0.970.92 2.8 0.93 0.95 3.80.85 0.94 6.80.85 0.857.5 0.67 0.789.9
+Sea-g-l 0.97 0.902.6 0.94 0.98 3.4 0.830.97 7.0 0.84 0.84 7.9 0.67 0.79 10.6
+20 80Sea-f 0.860.93 29.6 0.55 0.90 73.6 0.720.93 51.80.77 0.85 42.8 0.61 0.89 61.8
+Sea-g 0.89 0.9226.8 0.58 0.88 71.4 0.73 0.92 50.6 0.76 0.84 45.00.65 0.89 60.1
+Sea-f-l 0.86 0.92 32.0 0.550.90 74.0 0.74 0.93 49.2 0.760.87 41.8 0.59 0.88 62.3
+Sea-g-l 0.89 0.92 28.4 0.58 0.89 71.6 0.75 0.92 49.4 0.75 0.85 45.70.65 0.88 60.6
+it was non-trivial to access the GPU within a PyTorch data loader. We ran a forward pass to obtain an
+updated selection score every 10 batches, so this accrued over 10 times the number of forward passes, all
+on CPU. With proper engineering, this model-based sampler is expected to be much more efficient than
+reported. Still, it is faster than nearly all baselines.
+Figure 6: Runtime for heuristics-based greedy sampler vs. model uncertainty-based greedy sampler (suffix
+-l). For sampling, the model was run on CPU only, due to the difficulty of invoking GPU in the PyTorch
+data sampler.
+B.7 Limitations
+There are several aspects of this work that could be further improved in future iterations. First, classical
+causal discovery algorithms make different types of errors, and different summary statistics capture distinct
+aspects of data. Incorporating this diversity at training time remains unexplored, both from experimental
+30Under review as submission to TMLR
+and theoretical perspectives. The empirical success of this approach also motivates further theoretical studies
+into amortized and supervised causal discovery algorithms, especially with regards to finite data regimes.
+Finally, while our synthetic datasets were quite substantial, dynamically generating them during the training
+process (as Lorch et al. (2022) does) may lead to even better generalization, as the model is unlikely to see
+the same dataset twice.
+C Additional analyses
+C.1 Choice of global statistic
+We selected inverse covariance as our global feature due to its ease of computation and its relationship to
+partial correlation. For context, we also provide the performance analysis of several alternatives. Tables
+11 and 12 compare the results of different graph-level statistics on our synthetic datasets. Discretization
+thresholds for SHD were obtained by computing the pthquantile of the computed values, where p= 1−(E/N ).
+This is not entirely fair, as no other baseline receives the same calibration, but these ablation studies only seek
+to compare state-of-the-art causal discovery methods with the “best” possible (oracle) statistical alternatives.
+Corrrefers to global correlation,
+ρi,j=E(XiXj)−E(Xi)E(Xj)/radicalig
+E(X2
+i)−E(Xi)2·/radicalig
+E/parenleftbig
+X2
+j/parenrightbig
+−E(Xj)2. (41)
+D-Corr refers to distance correlation, computed between all pairs of variables. Distance correlation captures
+both linear and non-linear dependencies, and D-Corr (Xi,Xj) = 0if and only if Xi⊥ ⊥Xj. Please refer
+to Sz’ekely et al. (2007) for the full derivation. Despite its power to capture non-linear dependencies, we
+opted not to use D-Corr because it is quite slow to compute between all pairs of variables.
+InvCov refers to inverse covariance, computed globally,
+ρ=E/parenleftbig
+(X−E(X))(X−E(X))T/parenrightbig−1. (42)
+For graphs N < 100, inverse covariance was computed directly using NumPy. For graphs N≥100, inverse
+covariance was computed using Ledoit-Wolf shrinkage at inference time Ledoit & Wolf (2004). Unfortunately
+we only realized this after training our models, so swapping to Ledoit-Wolf leads to some distribution shift
+(and drop in performance) on Searesults for large graphs.
+C.2 Results on simulated mRNA data
+We generated mRNA data using the SERGIO simulator Dibaeinia & Sinha (2020). We sampled datasets
+with the Hill coefficient set to {0.25,0.5,1,2,4}for training, and 2 for testing (2 was default). We set the
+decay rate to the default 0.8, and the noise parameter to the default of 1.0. We sampled 400 graphs for each
+ofN={10,20}andE={N,2N}.
+These data distributions are quite different from typical synthetic datasets, as they simulate steady-state
+measurements and the data are lower bounded at 0 (gene counts). Thus, we trained a separate model on
+these data using the Sea (Fci) architecture. Table 13 shows that Seaperforms best across the board.
+C.3 Results and ablation studies on synthetic data
+For completeness, we include additional results and analysis on the synthetic datasets. Tables 17 and 18
+compare all baselines across all metrics and graph sizes on Erdős-Rényi graphs. Tables 19 and 20 include the
+same evaluation on scale-free graphs. Tables 21 and 22 assess N= 100graphs.
+Table 15 ablates the contribution of the global and marginal features by setting their hidden representations
+to zero. Note that our model has never seen this type of input during training, so drops in performance may
+be conflated with input distributional shift. Overall, removing the joint statistics ( hρ←0) leads to a higher
+31Under review as submission to TMLR
+Table 10: Synthetic experiments, edge direction accuracy (higher is better). All standard deviations were
+within 0.2. The symbol†indicates that Seawas not pretrained on this setting.
+N E Model Linear NN add NN Sig.†Poly.†
+10 10Dcdi-G 0.74 0.80 0.85 0.41 0.44
+Dcdi-Dsf 0.79 0.62 0.68 0.38 0.39
+Dcd-Fg 0.50 0.47 0.70 0.43 0.54
+DiffAn 0.61 0.55 0.26 0.53 0.47
+Deci 0.50 0.43 0.62 0.63 0.75
+Avici 0.80 0.92 0.83 0.81 0.75
+Fci-Avg 0.52 0.43 0.41 0.55 0.40
+Gies-Avg 0.76 0.49 0.69 0.67 0.63
+Sea (Fci) 0.92 0.92 0.94 0.76 0.71
+Sea (Gies) 0.94 0.88 0.930.84 0.79
+20 80Dcdi-G 0.47 0.43 0.82 0.40 0.24
+Dcdi-Dsf 0.50 0.49 0.78 0.41 0.28
+Dcd-Fg 0.58 0.65 0.75 0.62 0.48
+DiffAn 0.46 0.28 0.36 0.45 0.21
+Deci 0.30 0.47 0.35 0.48 0.57
+Avici 0.57 0.67 0.74 0.63 0.62
+Fci-Avg 0.19 0.19 0.22 0.33 0.23
+Gies-Avg 0.56 0.73 0.59 0.62 0.61
+Sea (Fci) 0.93 0.90 0.93 0.85 0.89
+Sea (Gies) 0.92 0.88 0.92 0.84 0.89
+100 400Dcd-Fg 0.46 0.60 0.70 0.67 0.53
+Avici 0.61 0.68 0.72 0.54 0.42
+Sea (Fci) 0.93 0.90 0.910.87 0.82
+Sea (Gies) 0.94 0.91 0.92 0.87 0.84
+Table 11: Comparison of global statistics (continuous metrics). All standard deviations within 0.1.
+N E Model Linear NN add. NN non-add. Sigmoid Polynomial
+mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑
+10 10Corr 0.45 0.87 0.41 0.86 0.41 0.85 0.46 0.86 0.45 0.85
+D-Corr 0.42 0.86 0.41 0.87 0.40 0.87 0.43 0.86 0.45 0.89
+InvCov 0.49 0.87 0.45 0.86 0.36 0.81 0.44 0.86 0.45 0.83
+10 40Corr 0.47 0.53 0.47 0.52 0.46 0.52 0.48 0.53 0.48 0.54
+D-Corr 0.46 0.53 0.46 0.51 0.46 0.54 0.48 0.53 0.47 0.54
+InvCov 0.50 0.57 0.48 0.52 0.47 0.53 0.47 0.50 0.48 0.52
+100 100Corr 0.42 0.99 0.25 0.94 0.25 0.93 0.42 0.98 0.35 0.91
+D-Corr 0.41 0.99 0.25 0.96 0.26 0.96 0.41 0.98 0.37 0.94
+InvCov 0.40 0.99 0.22 0.94 0.16 0.87 0.40 0.97 0.36 0.90
+100 400Corr 0.19 0.80 0.10 0.63 0.14 0.72 0.27 0.84 0.20 0.72
+D-Corr 0.19 0.80 0.10 0.63 0.14 0.75 0.26 0.84 0.21 0.74
+InvCov 0.25 0.91 0.09 0.62 0.14 0.77 0.27 0.86 0.20 0.67
+performance drop than removing the marginal estimates ( hE←0). However, the gap between these ablation
+studies and our final performance may be quite large in some cases, so both inputs are important to the
+prediction.
+32Under review as submission to TMLR
+Table 12: Comparison of global statistics (SHD). Discretization thresholds for SHD were obtained by
+computing the pthquantile of the computed values, where p= 1−(E/N ).
+N E Model Linear NN add. NN non-add. Sigmoid Polynomial
+10 10Corr 10.6±2.8 10.2±4.6 12.0±1.9 11.1±4.3 9.9±2.8
+D-Corr 10.4±2.6 9.8±4.7 12.2±2.6 10.8±3.3 10.2±3.2
+InvCov 11.0±2.8 11.4±5.5 13.6±2.9 11.4±4.1 10.9±3.5
+10 40Corr 39.2±2.4 38.0±1.8 38.2±0.7 38.8±3.3 38.2±2.0
+D-Corr 38.8±2.0 38.8±1.5 37.0±0.6 38.9±3.2 38.0±2.0
+InvCov 35.8±2.3 39.2±1.5 37.6±2.7 40.7±2.2 38.4±1.2
+100 100Corr 113.0±4.9132.2±18.0 144.6±5.2106.5±11.5 110.3±6.1
+D-Corr 113.8±5.3133.2±17.9 144.2±6.7108.5±11.9 109.5±5.7
+InvCov 124.4±8.1130.0±17.2 158.8±6.2112.3±14.8 106.3±4.6
+100 400Corr 580.4±24.5666.0±13.5 626.2±23.4516.5±18.5562.5±20.1
+D-Corr 578.2±24.7665.4±15.4 626.6±21.9522.3±17.6557.2±20.4
+InvCov 557.0±11.7667.8±15.4 639.0±9.7514.7±23.1539.4±18.4
+Table 13: Causal discovery results on simulated mRNA data. Each setting encompasses 5 distinct scale-free
+graphs. Data were generated via SERGIO Dibaeinia & Sinha (2020).
+N E Model mAP↑AUC↑SHD↓OA↑
+10 10Dcdi-G 0.48±0.1 0.73±0.1 16.1±3.3 0.59±0.2
+Dcdi-Dsf 0.63±0.1 0.84±0.1 18.5±2.7 0.79±0.2
+Dcd-Fg 0.59±0.2 0.82±0.1 81.0±0.0 0.79±0.2
+Avici 0.58±0.2 0.85±0.1 6.4±4.7 0.72±0.2
+Sea (Fci) 0.92±0.10.98±0.0 1.9±2.00.92±0.1
+10 20Dcdi-G 0.32±0.1 0.57±0.1 26.2±1.3 0.47±0.2
+Dcdi-Dsf 0.44±0.1 0.64±0.1 25.7±1.3 0.63±0.1
+Dcd-Fg 0.43±0.1 0.69±0.1 73.0±0.0 0.67±0.2
+Avici 0.22±0.1 0.44±0.2 16.8±1.5 0.27±0.3
+Sea (Fci) 0.76±0.10.90±0.1 8.8±1.50.85±0.1
+20 20Dcdi-G 0.48±0.1 0.86±0.1 37.3±2.8 0.65±0.1
+Dcdi-Dsf 0.45±0.1 0.92±0.051.9±15.8 0.81±0.1
+Dcd-Fg 0.34±0.2 0.87±0.0 361±0 0.66±0.2
+Avici 0.32±0.2 0.78±0.1 18.7±4.9 0.66±0.2
+Sea (Fci) 0.54±0.20.94±0.016.6±3.30.83±0.1
+20 40Dcdi-G 0.31±0.1 0.65±0.1 54.7±2.7 0.49±0.1
+Dcdi-Dsf 0.40±0.1 0.71±0.1 54.6±4.4 0.63±0.1
+Dcd-Fg 0.36±0.1 0.77±0.1 343±0 0.67±0.1
+Avici 0.17±0.1 0.54±0.1 37.1±1.9 0.46±0.1
+Sea (Fci) 0.50±0.10.85±0.131.4±4.90.78±0.1
+Table 16 shows that despite omitting the DAG constraint, we find that our predicted graphs (test split) are
+nearly all acyclic, with a naive discretization threshold of 0.5. Unlike Lippe et al. (2022), which also omits
+the acyclicity constraint during training but optionally enforces it at inference time, we do not require any
+post-processing to achieve high performance. Empirically, we found existing DAG constraints to be unstable
+(Lagrangian) and slow to optimize (Zheng et al., 2018; Brouillard et al., 2020). DAG behavior would not
+emerge until late in training, when the regularization term is of 1e-8 scale or smaller.
+33Under review as submission to TMLR
+Table 14: Scaling to synthetic graphs, larger than those seen in training. Each setting encompasses 5 distinct
+Erdős-Rényi graphs. All Searuns in this table used T= 500subsets of nodes, with b= 500examples per
+batch. For Avici, we tookM= 2000samples per dataset (higher than maximum analyzed in their paper),
+since it performed better than M= 1000. Here, the mean AUC values are artificially high due to the high
+negative rates, as actual edges scale linearly as N, while the number of possible edges scales quadratically.
+NModel Linear, E=N Linear,E= 4N
+mAP↑AUC↑SHD↓OA↑mAP↑AUC↑SHD↓OA↑
+100InvCov 0.43±0.00.99±0.0 117±7 — 0.30±0.00.93±0.0 512±11 —
+Corr 0.42±0.00.99±0.0 113±5 — 0.19±0.00.80±0.0 579±25 —
+Avici 0.03±0.00.43±0.1 109±60.49±0.0 0.11±0.00.55±0.1 394±140.58±0.0
+Sea (Fci) 0.97±0.01.00±0.011.6±4.30.93±0.0 0.88±0.00.98±0.0 129±100.94±0.0
+Sea (Gies) 0.97±0.01.00±0.012.8±4.70.91±0.0 0.91±0.00.99±0.0 105±60.95±0.0
+200InvCov 0.45±0.01.00±0.0 218±11 — 0.33±0.00.96±0.01000±23 —
+Corr 0.42±0.00.99±0.0 223±8 — 0.18±0.00.86±0.01184±25 —
+Avici 0.00±0.00.36±0.1 207±100.41±0.1 0.05±0.00.53±0.1 827±370.54±0.1
+Sea (Fci) 0.91±0.01.00±0.049.9±5.40.87±0.0 0.82±0.00.97±0.0 327±520.92±0.0
+Sea (Gies) 0.95±0.01.00±0.035.4±5.70.91±0.0 0.86±0.00.98±0.0272±500.92±0.0
+300InvCov 0.46±0.01.00±0.0 308±20 — 0.35±0.00.98±0.01445±56 —
+Corr 0.42±0.01.00±0.0 326±21 — 0.20±0.00.89±0.01710±82 —
+Avici 0.01±0.00.70±0.0 298±190.64±0.0 0.02±0.00.50±0.01214±680.51±0.0
+Sea (Fci) 0.80±0.01.00±0.0 121±140.78±0.0 0.70±0.00.95±0.0 693±670.86±0.0
+Sea (Gies) 0.88±0.01.00±0.088.9±11.30.84±0.0 0.78±0.00.96±0.0556±710.87±0.0
+400InvCov 0.47±0.01.00±0.0 418±7 — 0.36±0.00.98±0.01883±28 —
+Corr 0.42±0.01.00±0.0 445±14 — 0.20±0.00.91±0.02269±52 —
+Avici 0.01±0.00.68±0.0 411±70.62±0.0 0.01±0.00.46±0.01614±210.47±0.0
+Sea (Fci) 0.49±0.20.93±0.1 314±107 0.61±0.1 0.56±0.10.90±0.11103±190 0.75±0.1
+Sea (Gies) 0.70±0.10.99±0.0226±570.71±0.1 0.70±0.00.94±0.0872±440.80±0.0
+500InvCov 0.47±0.01.00±0.0 504±19 — 0.38±0.00.99±0.02300±34 —
+Corr 0.42±0.01.00±0.0 543±18 — 0.21±0.00.93±0.02790±78 —
+Avici 0.00±0.00.70±0.0 497±190.63±0.0 0.01±0.00.48±0.02004±250.48±0.0
+Sea (Fci) 0.27±0.10.90±0.1 758±297 0.51±0.0 0.29±0.10.86±0.11824±273 0.56±0.1
+Sea (Gies) 0.41±0.20.98±0.0485±170 0.57±0.1 0.48±0.10.92±0.01654±5050.67±0.0
+Alternatively, we could quantify the raw information content provided by these two features through the
+InvCov,Fci*, and Gies*baselines (Tables 17, 18, 19, 20). Overall, InvCov andFci*are comparable
+to worse-performing baselines. Gies*performs very well, sometimes approaching the strongest baselines.
+However, there remains a large gap in performance between these ablations and our method, highlighting the
+value of learning non-linear transformations of these inputs.
+Table 14 and Figure 8 show that the current implementations of Seacan generalize to graphs up to 4×
+larger than those seen during training. During training, we did not initially anticipate testing on much larger
+graphs. As a result, there are two minor issues with the current implementation with respect to scaling. First,
+we set an insufficient maximum subset positional embedding size of 500, so it was impossible to encode more
+subsets. Second, we did not sample random starting subset indices to ensure that higher-order embeddings
+are updated equally. Since we never sampled up to 500 subsets during training, these higher-order embeddings
+were essentially random. We anticipate that increasing the limit on the number of subsets and ensuring that
+34Under review as submission to TMLR
+Table 15: Causal discovery ablations by setting hidden representations to zero. Each setting encompasses 5
+distinct Erdős-Rényi graphs. The symbol †indicates that Seawas not pretrained on this setting. We set
+T= 100.
+N E Model Linear NN add. NN non-add. Sigmoid†Polynomial†
+mAP↑SHD↓mAP↑SHD↓mAP↑SHD↓mAP↑SHD↓mAP↑SHD↓
+10 10Sea (Fci) 0.97 1.6 0.95 2.4 0.92 2.8 0.83 3.7 0.69 6.7
+hρ←0 0.20 29.8 0.27 22.4 0.34 24.2 0.26 22.6 0.24 26.0
+hE←0 0.61 24.0 0.71 28.8 0.76 27.8 0.49 26.7 0.51 26.7
+Sea (Gies) 0.99 1.2 0.94 2.6 0.91 3.2 0.85 4.0 0.70 5.8
+hρ←0 0.30 29.2 0.27 29.4 0.19 29.0 0.35 27.4 0.31 27.1
+hE←0 0.85 6.4 0.82 10.2 0.78 13.2 0.63 10.2 0.55 13.4
+20 80Sea (Fci) 0.86 29.6 0.55 73.6 0.72 51.8 0.77 42.8 0.61 61.8
+hρ←0 0.23 128.4 0.27 110.6 0.22 119.6 0.23 110.7 0.23 111.1
+hE←0 0.79 50.4 0.52 99.6 0.71 76.4 0.58 93.6 0.59 87.5
+Sea (Gies) 0.89 26.8 0.58 71.4 0.73 50.6 0.76 45.0 0.65 60.1
+hρ←0 0.25 125.2 0.21 123.0 0.24 113.6 0.27 118.0 0.24 129.8
+hE←0 0.86 35.2 0.55 76.8 0.70 53.4 0.69 47.1 0.59 63.5
+100 400Sea (Fci) 0.90 122.0 0.28 361.2 0.60 273.2 0.69 226.9 0.38 327.0
+hρ←0 0.05 726.4 0.04 639.4 0.05 637.0 0.05 760.2 0.04 658.3
+hE←0 0.82 167.4 0.04 403.4 0.51 352.4 0.64 263.8 0.33 366.1
+Sea (Gies) 0.91 116.6 0.27 364.4 0.61 266.8 0.69 218.3 0.38 328.0
+hρ←0 0.05 780.0 0.04 846.0 0.05 715.4 0.04 744.4 0.04 769.8
+hE←0 0.86 134.8 0.03 403.4 0.52 357.8 0.67 224.1 0.32 359.6
+Table 16: Our predicted graphs are highly acyclic, on synthetic ER test sets.
+NAcyclic Total Proportion
+10 434 440 0.99
+20 431 440 0.98
+100 433 440 0.98
+all embeddings are sufficiently learned will improve the generalization capacity on larger graphs. Nonetheless,
+our current model already obtains reasonable performance on larger graphs, out of the box.
+Finally, we note that Aviciscales very poorly to graphs significantly beyond the scope of their training
+set. For example, N= 100is only 2×their largest training graphs, but the performance already drops
+dramatically.
+Figure 7 depicts the model runtimes. Seacontinues to run quickly on much larger graphs, while Avici
+runtimes increase significantly with graph size.
+Dcdilearns a new generative model over each dataset, and its more powerful, deep sigmoidal flow variant
+seems to perform well in some (but not all) of these harder cases.
+C.4 Results on real datasets
+The Sachs flow cytometry dataset (Sachs et al., 2005) measured the expression of phosphoproteins and
+phospholipids at the single cell level. We use the subset proposed by Wang et al. (2017). The ground truth
+“consensus graph” consists of 11 nodes and 17 edges over 5,845 samples, of which 1,755 are observational
+and 4,091 are interventional. The observational data were generated by a “general perturbation” which
+activated signaling pathways, and the interventional data were generated by perturbations intended to target
+35Under review as submission to TMLR
+Figure 7: Seascales very well in terms of runtime on much larger graphs, while Aviciruntimes suffer as
+graph sizes increase.
+Figure 8: mAP on graphs larger than seen during training. During training, we only sampled a maximum of
+100 subsets, so performance drop may be due to extrapolation beyond trained embeddings. We did not have
+time to finetune these embeddings for more samples. These values correspond to the numbers in Table 14.
+individual proteins. Despite the popularity of this dataset in causal discovery literature (due to lack of better
+alternatives), biological networks are known to be time-resolved and cyclic, so the validity of the ground
+truth “consensus” graph has been questioned by experts Mooij et al. (2020). Nonetheless, we benchmark all
+methods on this dataset in Table 23.
+36Under review as submission to TMLR
+Table 17: Full results on synthetic datasets (continuous metrics). Mean/std over 5 distinct Erdős-Rényi
+graphs.†indicates o.o.d. setting. ∗indicates non-parametric bootstrapping. All standard deviations within
+0.03 (most within 0.01).
+N EModel Linear NN add. NN non-add. Sigmoid†Polynomial†
+mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑
+10 10Dcdi-G 0.74 0.88 0.79 0.91 0.89 0.95 0.46 0.72 0.41 0.68
+Dcdi-Dsf 0.82 0.92 0.57 0.83 0.50 0.81 0.38 0.69 0.29 0.64
+Dcd-Fg 0.45 0.68 0.41 0.67 0.59 0.79 0.40 0.64 0.50 0.72
+DiffAn 0.25 0.73 0.32 0.70 0.12 0.51 0.24 0.70 0.20 0.65
+Deci 0.18 0.63 0.16 0.63 0.23 0.71 0.29 0.72 0.46 0.83
+Avici 0.45 0.80 0.81 0.97 0.65 0.89 0.52 0.81 0.31 0.70
+VarSort* 0.70 0.84 0.76 0.90 0.83 0.93 0.52 0.72 0.40 0.71
+InvCov 0.46 0.88 0.43 0.86 0.34 0.81 0.43 0.86 0.43 0.83
+Fci* 0.52 0.78 0.38 0.71 0.40 0.70 0.56 0.79 0.41 0.71
+Gies* 0.81 0.96 0.61 0.93 0.71 0.92 0.70 0.95 0.61 0.87
+Sea (Fci) 0.98 1.00 0.88 0.98 0.88 0.97 0.83 0.97 0.62 0.88
+Sea (Gies) 0.99 1.00 0.94 0.99 0.91 0.98 0.85 0.97 0.70 0.89
+10 40Dcdi-G 0.65 0.72 0.65 0.74 0.84 0.88 0.54 0.59 0.56 0.61
+Dcdi-Dsf 0.65 0.72 0.59 0.67 0.84 0.90 0.52 0.58 0.57 0.62
+Dcd-Fg 0.51 0.57 0.57 0.63 0.53 0.59 0.65 0.68 0.65 0.68
+DiffAn 0.40 0.49 0.36 0.37 0.41 0.53 0.40 0.45 0.37 0.40
+Deci 0.45 0.49 0.50 0.58 0.44 0.52 0.53 0.61 0.63 0.72
+Avici 0.46 0.47 0.63 0.65 0.79 0.86 0.49 0.53 0.47 0.55
+VarSort* 0.81 0.83 0.87 0.89 0.71 0.73 0.69 0.72 0.56 0.62
+InvCov 0.49 0.57 0.46 0.50 0.46 0.53 0.47 0.50 0.48 0.53
+Fci* 0.43 0.50 0.50 0.53 0.46 0.52 0.50 0.51 0.45 0.50
+Gies* 0.49 0.53 0.56 0.64 0.49 0.53 0.44 0.46 0.61 0.62
+Sea (Fci) 0.83 0.85 0.85 0.89 0.86 0.90 0.74 0.75 0.69 0.67
+Sea (Gies) 0.94 0.95 0.91 0.94 0.89 0.92 0.81 0.85 0.89 0.92
+20 20Dcdi-G 0.59 0.87 0.78 0.94 0.75 0.91 0.36 0.81 0.42 0.74
+Dcdi-Dsf 0.66 0.89 0.69 0.91 0.41 0.83 0.37 0.82 0.26 0.71
+Dcd-Fg 0.48 0.85 0.58 0.91 0.51 0.87 0.50 0.78 0.44 0.76
+DiffAn 0.19 0.73 0.16 0.69 0.20 0.72 0.29 0.79 0.09 0.65
+Deci 0.14 0.70 0.14 0.72 0.16 0.73 0.24 0.79 0.35 0.84
+Avici 0.48 0.87 0.59 0.91 0.67 0.90 0.42 0.84 0.24 0.69
+VarSort* 0.81 0.91 0.81 0.92 0.57 0.83 0.50 0.76 0.33 0.69
+InvCov 0.40 0.90 0.31 0.90 0.31 0.84 0.42 0.92 0.41 0.87
+Fci* 0.66 0.86 0.42 0.74 0.40 0.77 0.56 0.80 0.41 0.76
+Gies* 0.84 0.99 0.79 0.97 0.56 0.93 0.71 0.97 0.62 0.91
+Sea (Fci) 0.96 1.00 0.91 0.99 0.82 0.97 0.85 0.98 0.69 0.91
+Sea (Gies) 0.97 1.00 0.94 0.99 0.83 0.97 0.84 0.97 0.69 0.92
+20 80Dcdi-G 0.46 0.73 0.41 0.71 0.82 0.93 0.48 0.71 0.37 0.62
+Dcdi-Dsf 0.48 0.75 0.44 0.74 0.74 0.92 0.48 0.71 0.38 0.63
+Dcd-Fg 0.32 0.61 0.33 0.64 0.41 0.73 0.47 0.74 0.49 0.69
+DiffAn 0.21 0.53 0.19 0.41 0.18 0.46 0.22 0.55 0.18 0.37
+Deci 0.25 0.57 0.29 0.61 0.26 0.59 0.31 0.66 0.43 0.73
+Avici 0.34 0.63 0.46 0.73 0.49 0.74 0.34 0.64 0.30 0.59
+VarSort* 0.76 0.86 0.50 0.81 0.47 0.69 0.59 0.76 0.38 0.63
+InvCov 0.36 0.72 0.26 0.54 0.30 0.64 0.35 0.72 0.32 0.61
+Fci* 0.30 0.59 0.31 0.57 0.30 0.59 0.41 0.66 0.34 0.61
+Gies* 0.41 0.75 0.44 0.74 0.46 0.73 0.50 0.78 0.49 0.69
+Sea (Fci) 0.80 0.92 0.55 0.81 0.70 0.89 0.74 0.85 0.55 0.67
+Sea (Gies) 0.89 0.95 0.58 0.84 0.73 0.90 0.76 0.90 0.65 0.84
+37Under review as submission to TMLR
+Table 18: Full results on synthetic datasets (discrete metrics). Mean/std over 5 distinct Erdős-Rényi graphs.
+†indicates o.o.d. setting. ∗indicates non-parametric bootstrapping. All OA standard deviations within 0.2.
+N EModel Linear NN add. NN non-add. Sigmoid†Polynomial†
+OA↑SHD↓OA↑SHD↓OA↑SHD↓OA↑SHD↓OA↑SHD↓
+10 10Dcdi-G 0.73 2.8±20.84 2.2±30.88 1.0±10.46 5.8±30.33 8.9±6
+Dcdi-Dsf 0.81 2.0±30.73 3.0±30.60 4.2±10.43 6.3±30.24 11.2±5
+Dcd-Fg 0.50 20.4±30.47 21.2±40.70 19.2±40.43 19.8±40.54 18.5±5
+DiffAn 0.61 14.0±50.55 13.6±14 0.26 21.8±80.53 12.0±50.47 15.0±6
+Deci 0.50 19.4±50.43 13.8±60.62 16.2±30.63 13.9±70.75 7.8±4
+Avici 0.58 8.2±40.79 4.2±30.65 5.6±30.54 8.3±30.35 9.6±4
+VarSort* 0.70 6.0±20.74 4.0±20.90 4.2±30.52 7.6±30.48 9.3±3
+InvCov — 10.6±3— 10.2±6— 13.6±3— 11.1±4— 10.4±3
+Fci* 0.52 10.0±30.43 8.2±40.41 9.8±20.55 9.1±30.40 10.0±4
+Gies* 0.76 3.6±20.49 6.0±50.69 4.8±20.67 5.9±30.63 7.1±3
+Sea (Fci) 0.93 1.0±10.82 3.0±40.90 3.8±20.73 3.9±20.70 6.1±3
+Sea (Gies) 0.94 1.2±10.88 2.6±40.93 3.2±10.84 4.0±30.79 5.8±3
+10 40Dcdi-G 0.50 19.8±20.64 17.4±30.82 8.0±20.25 30.8±40.23 31.0±2
+Dcdi-Dsf 0.48 19.8±30.55 21.6±70.87 6.0±30.25 31.4±30.25 30.0±3
+Dcd-Fg 0.35 28.6±40.40 26.0±10.36 26.8±40.45 24.4±50.41 25.5±4
+DiffAn 0.41 27.6±40.29 33.4±40.49 26.4±40.38 29.4±60.32 31.8±4
+Deci 0.43 27.6±50.55 22.4±40.50 25.4±30.5421.5±30.5718.4±3
+Avici 0.44 33.0±50.68 28.4±70.85 20.0±40.50 35.0±30.50 38.8±2
+VarSort* 0.76 21.8±50.81 15.4±40.61 24.0±40.67 33.6±50.46 37.6±2
+InvCov — 40.2±2— 44.6±2— 41.0±3— 44.2±3— 42.3±2
+Fci* 0.16 39.2±20.24 38.8±30.22 36.2±30.22 38.8±20.16 39.9±2
+Gies* 0.44 33.4±40.60 33.0±50.51 32.0±30.38 36.7±20.63 34.6±3
+Sea (Fci) 0.80 18.6±20.89 15.4±40.87 18.8±40.78 24.4±60.69 26.9±4
+Sea (Gies) 0.91 12.8±40.95 10.4±60.89 17.2±30.87 24.5±30.93 29.5±3
+20 20Dcdi-G 0.75 6.4±20.90 3.0±20.84 4.4±20.39 42.7±60.48 10.4±3
+Dcdi-Dsf 0.77 5.2±30.85 4.2±40.64 11.6±30.41 43.2±60.45 15.7±5
+Dcd-Fg 0.76 51.2±12 0.88 177±57 0.85 193±27 0.65 251±35 0.60 52.7±19
+DiffAn 0.56 40.2±27 0.47 38.6±26 0.53 35.0±26 0.63 19.2±80.42 49.7±15
+Deci 0.54 52.0±17 0.56 41.0±14 0.56 39.0±80.65 30.0±90.73 18.9±6
+Avici 0.56 17.2±50.69 10.8±20.79 11.2±30.53 17.2±50.37 18.4±4
+VarSort* 0.84 10.0±30.88 6.6±60.74 14.6±80.50 16.1±40.40 17.1±4
+InvCov — 23.6±6— 24.6±5— 24.6±6— 22.9±5— 20.0±5
+Fci* 0.70 19.0±50.45 17.4±20.50 19.4±60.57 18.5±40.44 18.9±5
+Gies* 0.80 7.4±20.77 9.0±50.71 14.0±30.75 12.5±40.68 13.7±4
+Sea (Fci) 0.92 3.2±30.93 5.0±30.94 8.8±30.79 6.7±30.76 9.8±4
+Sea (Gies) 0.89 3.0±10.95 3.4±20.94 7.8±30.83 8.1±30.78 10.1±4
+20 80Dcdi-G 0.54 44.0±60.53 61.6±11 0.89 37.4±34 0.46 44.2±50.26 59.7±5
+Dcdi-Dsf 0.57 41.2±30.6160.0±12 0.8528.4±26 0.47 43.6±60.30 57.6±5
+Dcd-Fg 0.58 172±27 0.65 156±41 0.75 162±49 0.62 80.1±13 0.48 79.8±7
+DiffAn 0.46 127±50.28 154±10 0.36 145±70.45 117±21 0.21 157±7
+Deci 0.30 87.2±30.47 104±70.35 79.6±90.48 71.0±70.57 58.9±11
+Avici 0.51 75.6±10 0.69 72.8±60.69 61.2±10 0.50 70.6±60.50 75.5±7
+VarSort* 0.82 44.8±40.84 73.6±13 0.61 65.2±10 0.67 63.4±50.39 75.6±5
+InvCov — 97.6±6— 121±4— 104±9— 95.6±7— 97.8±4
+Fci* 0.19 75.8±11 0.19 80.2±50.22 74.4±80.33 72.3±60.23 76.6±5
+Gies* 0.56 70.0±11 0.73 75.2±40.59 67.4±70.62 65.6±70.61 68.1±5
+Sea (Fci) 0.86 39.8±12 0.87 73.8±120.92 52.0±90.8242.9±60.6957.0±5
+Sea (Gies) 0.92 26.8±80.88 71.4±80.92 50.6±70.84 45.0±70.89 60.1±6
+38Under review as submission to TMLR
+Table 19: Full results on synthetic datasets (continuous metrics). Mean over 5 distinct scale-free graphs. †
+indicates o.o.d setting. ∗indicates non-parametric bootstrapping. All standard deviations were within 0.02.
+N EModel Linear NN add. NN non-add. Sigmoid†Polynomial†
+mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑
+10 10Dcdi-G 0.54 0.90 0.59 0.88 0.69 0.89 0.48 0.77 0.50 0.73
+Dcdi-Dsf 0.70 0.92 0.71 0.88 0.36 0.83 0.46 0.75 0.49 0.76
+Dcd-Fg 0.56 0.76 0.47 0.72 0.50 0.73 0.44 0.68 0.57 0.75
+DiffAn 0.25 0.73 0.15 0.66 0.16 0.62 0.31 0.75 0.24 0.63
+Deci 0.17 0.65 0.17 0.67 0.20 0.72 0.27 0.73 0.49 0.82
+Avici 0.51 0.87 0.55 0.85 0.76 0.95 0.44 0.81 0.27 0.71
+VarSort* 0.67 0.84 0.69 0.86 0.76 0.88 0.45 0.69 0.46 0.73
+InvCov 0.50 0.92 0.41 0.87 0.38 0.84 0.47 0.90 0.45 0.86
+Fci* 0.56 0.80 0.51 0.80 0.43 0.74 0.60 0.82 0.34 0.68
+Gies* 0.87 0.98 0.61 0.94 0.69 0.94 0.75 0.96 0.71 0.91
+Sea (Fci) 0.96 0.99 0.88 0.98 0.88 0.97 0.79 0.96 0.73 0.90
+Sea (Gies) 0.95 0.99 0.94 0.98 0.92 0.98 0.85 0.98 0.74 0.90
+10 40Dcdi-G 0.70 0.85 0.74 0.85 0.88 0.91 0.56 0.66 0.53 0.64
+Dcdi-Dsf 0.74 0.87 0.73 0.84 0.71 0.90 0.56 0.69 0.51 0.63
+Dcd-Fg 0.37 0.58 0.45 0.61 0.45 0.58 0.49 0.63 0.63 0.73
+DiffAn 0.29 0.50 0.25 0.38 0.28 0.46 0.31 0.53 0.27 0.44
+Deci 0.30 0.51 0.41 0.65 0.33 0.51 0.38 0.60 0.59 0.77
+Avici 0.41 0.57 0.65 0.81 0.55 0.67 0.41 0.59 0.40 0.61
+VarSort* 0.77 0.83 0.74 0.87 0.59 0.71 0.66 0.76 0.50 0.66
+InvCov 0.44 0.71 0.38 0.59 0.42 0.62 0.44 0.67 0.42 0.62
+Fci* 0.47 0.64 0.41 0.60 0.40 0.58 0.48 0.64 0.41 0.59
+Gies* 0.43 0.68 0.43 0.63 0.44 0.61 0.49 0.69 0.59 0.71
+Sea (Fci) 0.85 0.91 0.80 0.90 0.77 0.88 0.76 0.83 0.66 0.71
+Sea (Gies) 0.92 0.96 0.84 0.93 0.83 0.90 0.79 0.88 0.78 0.87
+20 20Dcdi-G 0.41 0.95 0.50 0.94 0.69 0.96 0.37 0.83 0.37 0.77
+Dcdi-Dsf 0.48 0.95 0.55 0.93 0.33 0.90 0.37 0.79 0.35 0.82
+Dcd-Fg 0.51 0.87 0.39 0.83 0.48 0.84 0.56 0.84 0.50 0.84
+DiffAn 0.27 0.80 0.11 0.65 0.11 0.66 0.26 0.77 0.12 0.69
+Deci 0.13 0.69 0.15 0.71 0.15 0.73 0.15 0.71 0.25 0.79
+Avici 0.53 0.88 0.66 0.89 0.74 0.92 0.46 0.87 0.32 0.77
+VarSort* 0.67 0.85 0.84 0.93 0.59 0.86 0.45 0.72 0.44 0.73
+InvCov 0.44 0.94 0.35 0.91 0.30 0.89 0.43 0.93 0.41 0.87
+Fci* 0.63 0.84 0.44 0.78 0.43 0.79 0.60 0.86 0.47 0.78
+Gies* 0.82 0.99 0.58 0.95 0.57 0.96 0.75 0.98 0.61 0.90
+Sea (Fci) 0.94 1.00 0.87 0.98 0.83 0.97 0.82 0.98 0.72 0.92
+Sea (Gies) 0.93 1.00 0.91 0.98 0.88 0.98 0.82 0.98 0.70 0.91
+20 80Dcdi-G 0.62 0.88 0.61 0.89 0.76 0.94 0.44 0.76 0.36 0.60
+Dcdi-Dsf 0.58 0.87 0.55 0.86 0.58 0.92 0.43 0.78 0.35 0.66
+Dcd-Fg 0.38 0.70 0.30 0.69 0.48 0.80 0.48 0.75 0.53 0.73
+DiffAn 0.18 0.55 0.15 0.44 0.16 0.53 0.19 0.56 0.15 0.38
+Deci 0.21 0.58 0.24 0.64 0.26 0.66 0.30 0.68 0.41 0.75
+Avici 0.29 0.61 0.54 0.80 0.60 0.85 0.35 0.65 0.28 0.63
+VarSort* 0.79 0.90 0.57 0.83 0.62 0.81 0.57 0.77 0.38 0.64
+InvCov 0.38 0.81 0.22 0.56 0.32 0.73 0.38 0.78 0.33 0.67
+Fci* 0.31 0.63 0.30 0.62 0.30 0.62 0.41 0.68 0.32 0.62
+Gies* 0.51 0.87 0.43 0.78 0.47 0.81 0.52 0.82 0.47 0.73
+Sea (Fci) 0.87 0.96 0.59 0.87 0.70 0.90 0.73 0.87 0.53 0.71
+Sea (Gies) 0.92 0.98 0.63 0.89 0.73 0.91 0.77 0.92 0.62 0.84
+39Under review as submission to TMLR
+Table 20: Full results on synthetic datasets (discrete metrics). Mean/std over 5 distinct scale-free graphs. †
+indicates o.o.d. setting. ∗indicates non-parametric bootstrapping. All OA standard deviations within 0.2.
+N EModel Linear NN add. NN non-add. Sigmoid†Polynomial†
+OA↑SHD↓OA↑SHD↓OA↑SHD↓OA↑SHD↓OA↑SHD↓
+10 10Dcdi-G 0.51 16.6±10.61 17.4±20.71 16.2±20.59 16.9±50.63 16.6±3
+Dcdi-Dsf 0.70 16.2±20.75 15.4±30.36 16.8±20.48 18.1±30.67 18.0±2
+Dcd-Fg 0.60 16.4±50.57 22.2±40.57 20.0±40.47 17.9±40.59 16.8±5
+DiffAn 0.55 9.2±40.49 14.6±40.36 11.6±40.59 7.7±40.42 14.8±6
+Deci 0.51 17.4±50.55 17.4±50.58 12.0±20.62 12.6±50.74 8.2±6
+Avici 0.64 6.8±30.59 5.4±30.77 3.6±10.48 7.8±30.35 9.5±3
+VarSort* 0.82 4.4±10.78 4.8±20.80 3.4±20.47 7.3±30.55 8.1±3
+InvCov — 8.8±3— 9.2±2— 9.8±1— 9.7±3— 10.2±2
+Fci* 0.62 8.4±20.51 7.8±20.45 8.0±20.61 9.2±30.34 9.6±2
+Gies* 0.83 2.2±20.60 6.0±20.75 4.2±20.72 4.9±30.73 5.7±2
+Sea (Fci) 0.89 1.4±20.90 2.6±20.93 2.2±10.71 4.0±30.72 5.2±2
+Sea (Gies) 0.85 1.4±10.96 1.8±10.94 2.0±10.86 3.4±30.83 5.0±2
+10 40Dcdi-G 0.82 24.0±40.85 27.8±50.87 19.6±20.62 31.4±30.52 32.6±4
+Dcdi-Dsf 0.79 22.8±50.79 24.4±40.82 20.4±20.64 31.6±20.58 33.3±3
+Dcd-Fg 0.36 24.8±40.41 25.2±50.38 25.6±80.41 23.2±60.54 18.5±3
+DiffAn 0.40 29.8±80.28 37.0±20.38 32.6±20.45 28.0±60.33 32.7±5
+Deci 0.43 27.8±30.66 22.6±30.48 28.6±30.52 22.2±40.6613.3±3
+Avici 0.43 20.2±40.84 17.2±40.61 20.4±80.52 24.8±30.49 26.5±2
+VarSort* 0.75 13.4±20.8912.6±20.60 20.6±30.65 20.8±40.50 26.4±2
+InvCov — 31.4±3— 37.2±4— 36.0±4— 32.3±5— 34.8±3
+Fci* 0.33 23.8±20.28 27.2±20.25 27.6±40.36 26.1±20.24 27.3±2
+Gies* 0.46 21.8±30.50 24.4±20.48 25.2±50.52 22.7±30.64 22.5±2
+Sea (Fci) 0.80 10.0±40.88 14.0±20.87 15.8±30.79 15.6±30.64 18.5±3
+Sea (Gies) 0.88 6.6±30.98 14.0±50.88 14.4±30.87 14.1±30.93 19.1±3
+20 20Dcdi-G 0.54 40.4±20.70 44.8±80.88 39.8±60.47 41.1±40.53 38.4±6
+Dcdi-Dsf 0.64 40.4±30.65 42.4±80.40 42.2±80.37 41.1±40.45 49.3±18
+Dcd-Fg 0.68 252±23 0.77 183±52 0.78 181±27 0.70 251±45 0.69 278±68
+DiffAn 0.67 23.6±13 0.40 42.2±22 0.42 34.0±11 0.59 22.6±12 0.50 46.8±13
+Deci 0.50 42.0±50.54 43.0±11 0.57 40.0±13 0.51 34.7±70.65 25.3±6
+Avici 0.68 11.8±30.79 9.2±20.80 7.8±20.60 15.3±40.45 18.3±5
+VarSort* 0.74 10.4±30.91 6.2±20.76 13.0±60.49 13.7±40.51 16.7±6
+InvCov — 20.2±3— 24.4±5— 23.8±5— 21.2±4— 20.8±5
+Fci* 0.67 13.8±20.52 17.4±10.53 17.8±50.65 16.7±40.50 18.9±5
+Gies* 0.82 6.4±30.71 12.6±20.68 13.2±30.75 11.4±50.73 13.4±4
+Sea (Fci) 0.90 2.8±10.87 7.0±20.91 8.2±50.73 7.7±30.71 9.5±4
+Sea (Gies) 0.85 4.0±20.95 3.6±20.93 6.2±40.80 7.9±40.82 9.9±3
+20 80Dcdi-G 0.81 93.0±10 0.73 104±70.91 67.8±80.61 82.5±80.53 79.7±5
+Dcdi-Dsf 0.75 103±70.73 94.8±11 0.77 63.8±70.65 84.4±80.52 82.6±5
+Dcd-Fg 0.63 188±24 0.70 187±14 0.78 190±26 0.71 217±38 0.71 235±32
+DiffAn 0.42 111±18 0.30 145±11 0.40 119±13 0.41 100±22 0.21 149±11
+Deci 0.33 72.2±10 0.48 81.4±10 0.48 67.0±90.50 60.4±12 0.5847.2±7
+Avici 0.45 56.0±50.7747.6±80.76 42.6±30.50 54.0±60.47 62.2±5
+VarSort* 0.85 32.4±50.84 54.8±80.75 40.2±60.64 54.0±60.37 60.1±5
+InvCov — 79.4±6— 106±5— 87.4±2— 78.8±9— 86.2±4
+Fci* 0.26 58.2±60.22 58.4±40.26 55.0±70.37 59.3±60.23 62.9±4
+Gies* 0.65 48.4±50.71 53.6±30.68 48.0±40.64 53.6±60.61 54.9±5
+Sea (Fci) 0.91 25.6±60.88 51.6±60.89 42.2±40.83 36.1±60.71 47.4±5
+Sea (Gies) 0.92 17.6±30.93 49.2±90.8937.2±50.88 35.1±70.89 48.1±5
+40Under review as submission to TMLR
+Table 21: Causal discovery results on synthetic datasets with 100 nodes, continuous metrics. Each setting
+encompasses 5 distinct Erdős-Rényi graphs. The symbol †indicates that the model was not trained on this
+setting. All standard deviations were within 0.1.
+N E Model Linear NN add. NN non-add. Sigmoid†Polynomial†
+mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑mAP↑AUC↑
+100 100Dcd-Fg 0.11 0.75 0.12 0.71 0.18 0.73 0.20 0.72 0.06 0.60
+InvCov 0.40 0.99 0.22 0.94 0.16 0.87 0.40 0.97 0.36 0.90
+Sea (Fci) 0.96 1.00 0.83 0.97 0.75 0.97 0.79 0.97 0.56 0.88
+Sea (Gies) 0.97 1.00 0.82 0.98 0.74 0.96 0.80 0.97 0.54 0.85
+100 400Dcd-Fg 0.05 0.59 0.07 0.64 0.10 0.72 0.13 0.72 0.12 0.64
+InvCov 0.25 0.91 0.09 0.62 0.14 0.77 0.27 0.86 0.20 0.67
+Sea (Fci) 0.90 0.99 0.28 0.82 0.60 0.92 0.69 0.92 0.38 0.80
+Sea (Gies) 0.91 0.99 0.27 0.82 0.61 0.92 0.69 0.91 0.38 0.78
+Table 22: Causal discovery results on synthetic datasets with 100 nodes, discrete metrics. Each setting
+encompasses 5 distinct Erdős-Rényi graphs. The symbol †indicates that the model was not trained on this
+setting.
+N E Model Linear NN add. NN non-add. Sigmoid†Polynomial†
+OA↑SHD↓OA↑SHD↓OA↑SHD↓OA↑SHD↓OA↑SHD↓
+100 100Dcd-Fg 0.63 3075.8 0.58 2965.0 0.60 2544.4 0.59 3808.0 0.34 1927.9
+InvCov — 124.4— 130.0— 158.8— 112.3— 106.3
+Sea (Fci) 0.91 13.4 0.90 34.4 0.91 47.2 0.78 40.3 0.69 59.2
+Sea (Gies) 0.91 13.6 0.93 32.8 0.91 45.8 0.78 38.6 0.68 60.3
+100 400Dcd-Fg 0.46 3068.2 0.60 3428.8 0.70 3510.8 0.67 3601.8 0.53 3316.7
+InvCov — 557.0— 667.8— 639.0— 514.7— 539.4
+Sea (Fci) 0.93 122.0 0.90 361.2 0.91 273.2 0.87 226.9 0.82 327.0
+Sea (Gies) 0.94 116.6 0.91 364.4 0.92 266.8 0.87 218.3 0.84 328.0
+41Under review as submission to TMLR
+Table 23: Complete results on Sachs flow cytometry dataset (Sachs et al., 2005), using the subset proposed
+by (Wang et al., 2017).
+Model mAP ↑AUC↑SHD↓
+Dcdi-G 0.17 0.55 21
+Dcdi-Dsf 0.20 0.59 20
+Dcd-Fg 0.32 0.59 27
+DiffAn 0.14 0.45 37
+Deci 0.21 0.62 28
+Avici-L 0.35 0.78 20
+Avici-R 0.29 0.65 18
+Avici-L+R 0.59 0.83 14
+Fci* 0.27 0.59 18
+Gies* 0.21 0.59 17
+Sea (Fci) 0.23 0.54 24
++Kci 0.33 0.63 14
++Corr 0.41 0.70 15
++Kci+Corr 0.49 0.71 13
+Sea (Gies) 0.23 0.60 14
+42

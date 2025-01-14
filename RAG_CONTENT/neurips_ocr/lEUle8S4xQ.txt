@@ -1,0 +1,3203 @@
+S2FT: Efficient, Scalable and Generalizable LLM
+Fine-tuning by Structured Sparsity
+Xinyu Yang1, Jixuan Leng1, Geyang Guo2, Jiawei Zhao3, Ryumei Nakada4,
+Linjun Zhang4, Huaxiu Yao5, Beidi Chen1
+1CMU,2Georgia Tech,3Caltech,4Rutgers,5UNC-Chapel Hill
+xinyuya2, beidic@andrew.cmu.edu
+https://infini-ai-lab.github.io/S2FT-Page
+Abstract
+Current PEFT methods for LLMs can achieve high quality, efficient training, or
+scalable serving, but not all three simultaneously. To address this limitation, we
+investigate sparse fine-tuning and observe a remarkable improvement in generaliza-
+tion ability. Utilizing this key insight, we propose a family of Structured Sparse
+Fine-Tuning ( S2FT) methods for LLMs, which concurrently achieve state-of-the-
+art fine-tuning performance, training efficiency, and inference scalability . S2FT
+accomplishes this by “selecting sparsely and computing densely”. Based on the
+coupled structures in LLMs, S2FT selects a few attention heads and channels in
+the MHA and FFN modules for each Transformer block, respectively. Next, it
+co-permutes the weight matrices on both sides of all coupled structures to connect
+the selected subsets in each layer into a dense submatrix. Finally, S2FT performs
+in-place gradient updates on all selected submatrices. Through theoretical analyses
+and empirical results, our method prevents forgetting while simplifying optimiza-
+tion, delivers SOTA performance on both commonsense and arithmetic reasoning
+with 4.6 %and 1.3 %average improvements compared to LoRA, and surpasses full
+FT by 11.5 %when generalizing to various domains after instruction tuning. Using
+our partial back-propagation algorithm, S2FT saves training memory up to 3 ×and
+improves latency by 1.5-2.7 ×compared to full FT, while achieving an average
+10% improvement over LoRA on both metrics. We further demonstrate that the
+weight updates in S2FT can be decoupled into adapters, enabling effective fusion,
+fast switch, and efficient parallelism when serving multiple fine-tuned models.
+1 Introduction
+Recently, Large Language Models (LLMs) have achieved significant success [ 16,1,66]. With these
+models being applied in diverse domains, full fine-tuning (FT) is commonly employed to enhance their
+downstream capabilities [ 56,6,74]. However, retraining all parameters comes with three drawbacks:
+(i) Full FT suffers from catastrophic forgetting, where a model forgets pre-trained knowledge while
+acquiring new information [ 44,8]. (ii) As the model and dataset sizes grow at scale, full FT becomes
+increasingly computation-demanding and memory-intensive [ 70]. (iii) It is impractical to store and
+serve thousands of fine-tuned LLMs on modern GPUs if each requires full parameter storage [ 81,60].
+Parameter-efficient fine-tuning (PEFT) methods propose to address these bottlenecks by updating a
+small fraction of parameters [ 21]. Rather than merely reducing the number of learnable parameters,
+an ideal PEFT method should possess three key properties to be practically effective and efficient:
+High Quality : It should exhibit both memorization and generalization capabilities, balancing the
+acquisition of new information from fine-tuning tasks with the retention of pre-trained knowledge.
+Efficient Training : It should minimize the memory footprint for model gradient and optimization
+states, and further translate such memory efficiency into less computation and fine-tuning speedup.
+Scalable Serving : It should avoid adding inference overhead when serving a single PEFT model. For
+multiple models, new parameters should be partially stored as adapters to save memory, and allows
+for effective fusion [ 78], fast switch [ 33], and efficient parallelism [ 60] among thousands of adapters.
+38th Conference on Neural Information Processing Systems (NeurIPS 2024).𝑊!
+𝑊"𝑊#QueryKeyValueSplitQueryHeadsSplitKeyHeadsSplitValueHeadsAttention𝑊$MHAOutputMHAInput𝑊%FFNInput𝑊&Up
+Gate
+MHAInput𝑊"!Value′SplitValueHeads′Attention′𝑊$!MHAOutputStep1:Select sparsely with coupled structuresStep2: Compute densely after co-permutationFFNInput𝑊'ActivationFFN OutputMulti-head AttentionFeed-forward NetworkActivation:Parameter:Trainable:Frozen:Modified:Saved:
+𝑊&!Up′𝑊'!Activation′FFN OutputFigure 1: An Overview of the S2FT Family for LLMs : First, we perform sparse selection of specific
+attention heads and channels within the coupled structures of the MHA and FFN modules. Next, we
+apply co-permutation to the weight matrices on both sides of these structures, enabling dense gradient
+computation only for the selected components. While we demonstrate S2FT by selecting the same
+heads/channels on both sides for clarity, our approach also supports asymmetric selection strategies.
+However, achieving all the aforementioned goals simultaneously is challenging. Common PEFT
+approaches, such as LoRA [ 27], DoRA [ 38], and Galore [ 80], project the model’s weights or gradients
+onto a low-rank subspace. While this significantly reduces memory footprint, their performance lags
+behind full fine-tuning in most large-scale scenarios. Recent state-of-the-art PEFT methods have
+aimed to improve performance but at the cost of serving efficiency. ReFT operates on a frozen base
+model and learns task-specific interventions on hidden representations that cannot be merged into the
+original model, leading to a 2.2×increase in inference latency. LISA [ 48] employs a coarse-grained
+selective method by randomly freezing most Transformer blocks during optimization, which requires
+significantly more trainable parameters. Consequently, in scaled serving settings like S-LoRA [ 60],
+LISA can only serve at most1
+10as many fine-tuned models as LoRA under the same memory budget.
+Prior to the era of LLMs, PEFT methods based on unstructured sparse fine-tuning (SpFT) have shown
+a strong trade-off between low number of parameters and high model performance without sacrificing
+serving efficiency [ 63,3,71]. We hypothesize that SpFT, which selectively updates a small subset of
+model parameters, can outperform LoRA and its variants in generalization capabilities. In Figure 2,
+our findings across various generalization tasks support this hypothesis. However, the unstructured
+nature of SpFT necessitates sparse operations in computation, hindering its efficient training and
+scalable serving on modern hardware. This makes SpFT less practical for adapting LLMs at scale.
+In this work, we propose a family of Structured Sparse Fine-Tuning ( S2FT) methods to “select
+sparsely and compute densely” (See Figure 1), thereby closing the efficiency gap in SpFT. Inspired by
+structured weight pruning techniques [ 45,42], we first identify several coupled structures inherent in
+LLMs that are connected by intermediate activations. For example, in the multi-head attention (MHA)
+module, each attention head in the query, key, and value projections is linked to only a few rows in the
+output projection. Similarly, in the feed-forward network (FFN) module, each column in the up and
+gate projections corresponds to a single row in the down projection. By co-permuting the matrices on
+both sides of these coupled structures, we can preserve the original output of these structures, with
+only the order of the intermediate activations changed. Exploiting this property, our S2FT strategically
+selects a subset of attention heads for the MHA module and a subset of channels for the FFN module.
+We then permute the coupled structures to connect the selected components within each linear layer
+into a dense submatrix. Finally, through our partial back-propagation algorithm with only two-line
+code modification, S2FT performs in-place gradient updates exclusively for all selected submatrices,
+boosting training efficiency by eliminating redundant forward activations and backward calculation.
+Through our theoretical analysis, S2FT mitigates forgetting under distribution shifts while simplifying
+optimization. Empirically, S2FT outperforms other PEFT methods on LLaMA and Mistral family
+models, improving 1.2-4.1% on commonsense reasoning tasks and 0.6-1.9% on arithmetic reasoning
+ones. It also surpasses full FT by 11.5% when generalize to various domains after instruction tuning.
+Finally, we conduct a comprehensive analysis to verify the training efficiency and serving scalability of
+S2FT. Compared to existing PEFT methods, S2FT not only saves 1.4-3.0 ×memory, but also increases
+latency by 1.5 to 2.7 ×, making LLM fine-tuning more accessible. Additionally, S2FT’s parameter
+updates can be decomposed into adapters, enabling adapter fusion with smaller performance drop than
+LoRA. Our method also results in more scalable and efficient adapter switch and parallelism through
+reduced matrix multiplications, showcasing strong potential for large-scale LLM serving scenarios.
+22 Memorization or Generalization?
+In this section, we evaluate the memorization and generalization capabilities of various fine-tuning
+methods, including full FT, LoRA, and SpFT. We hypothesize that SpFT can generalize better to
+downstream tasks. To support this hypothesis, we present detailed observations and analyses. Further
+theoretical analysis about the generalization capabilities of the S2FT family can be found in Section 4.
+Hypothesis. We hypothesize that SpFT offers superior generalization than both full FT and LoRA,
+while maintaining comparable memorization to LoRA with the same number of trainable parameters.
+Experimental Setup. We fine-tune the Llama3-8B on the Math10K data [ 28] using SpFT, LoRA, and
+full FT. In addition to training losses, accuracies are measured on downstream tasks in LLM-Adapters,
+including near out-of-distribution (OOD) generalization on both easy (i.e, MultiArith, AddSub,
+SingleEq, MAWPS) and hard (i.e, GSM8K, AQuA, SV AMP) arithmetic reasoning tasks, and far
+OOD generalization on commonsense reasoning ones. For PEFT methods, we set three ratios of
+trainable parameters ( p= 10% ,1%,0.1%) and search for the optimal hyperparameters on the valid
+set. In SpFT, trainable parameters are selected randomly with given ratios. See details in Appendix C.
+103
+102
+101
+(a) Training Loss0.030.070.110.150.600.67LLaMA3-8B
+103
+102
+101
+(b) Near OOD Acc. (Easy)23.524949596
+103
+102
+101
+(c) Near OOD Acc. (Hard)19.5205354555657
+103
+102
+101
+(d) Far OOD Acc.253035404550
+SpFT LoRA Full FT Vanilla
+Figure 2: Accuracy comparison of SpFT, LoRA and Full FT at varying ratios of trainable parameters
+in various settings. SpFT exhibits strong generalization ability while full FT excels in memorization.
+Observations. Figure 2 indicates several key findings. First, SpFT achieves lower training losses
+than LoRA when using the same ratio of trainable parameters, especially at very small ratios. This
+gap arises from the more complex optimization process in LoRA, which requires the simultaneous
+updating of two matrices [ 23]. Second, we observe both elevated training loss and reduced average
+accuracy on easier math tasks as the ratio decreases, suggesting a positive correlation between memo-
+rization abilities and trainable parameters. Notably, with only 10% of the parameters updated, PEFT
+methods learn comparable memorization abilities to full FT when trained on a 10k-sample dataset.
+When generalizing to complex mathematical problems or commonsense reasoning tasks, the perfor-
+mance ranking emerges as: SpFT >Full FT >LoRA. SpFT effectively transfers reasoning abilities
+to commonsense domains, while LoRA exhibits significant performance drops in far OOD gener-
+alization. This indicates (i) freezing a larger fraction of the parameters can retain more pre-trained
+abilities, and (ii) approximating high-dimensional gradients with low-rank decomposition may overfit
+fine-tuned data and hinder the model from generalization. Since LLMs are pre-trained on high-quality
+data, SpFT emerges as the preferred choice for fine-tuning on task-specific data of varying quality.
+3 The S2FT family of methods
+While SpFT demonstrates strong generalization ability and good overall performance in Section 2, its
+unstructured nature poses challenges for efficient training and scalable serving on modern hardware
+(e.g., GPU). This is because of the need for sparse operations when storing and computing weights,
+gradients, and optimization states, which are significantly slower than their dense variants on GPU.
+This motivates our investigation into structured sparsity approaches that utilize only dense operations:
+Can structured sparsity improve hardware efficiency while preserving performance by selecting
+sparsely but computing densely? If so, how far can the flexibility of selection be pushed in this context?
+To answer this question, we design a family of Structured Sparse Fine-Tuning ( S2FT) methods with
+dense-only computations, making PEFT effective, efficient and scalable. We begin by discovering the
+coupled structure in LLMs in Section 3.1. Leveraging this property, Section 3.2 introduce the selection
+and permutation strategies of S2FT, with overall pipeline illustrated in Figure 1b. In Section 3.3, we
+present our partial back-propagation algorithm that enables end-to-end training latency reduction.
+3.1 Discover Coupled Structures in LLMs
+We initiate our pursuit of flexible structured sparsity by examining the coupled structures in LLMs.
+3W1W2
+W′1W′2Permute
+W1W2
+Residual Connection
+W′1W′2
+Residual Connection + PermutationPermute(a) Basic Structure
+W1W2
+W′1W′2Permute
+W1W2
+Residual Connection
+W′1W′2
+Residual Connection + PermutationPermute (b) Residual Structure
+Figure 3: Grouped model weights with basic structure and residual structure. All highlighted weights
+must be permuted simultaneously. Residual structures require additional permutation during runtime.
+Structure Dependency in LLMs. Inspired by prior work on structured pruning [ 45,17], our study
+start by building the dependencies between activations and weights for LLMs. Let Adenote an
+activation and Wdenote a weight in the model. We define In(A)as the set of parameters that directly
+contribute to the computation of A, andOut(A)as the set of parameters that depend on Ain the com-
+putation of subsequent activations. The dependency between structures can be defined as follows:
+W1∈In(A)∧Deg+(W1) = 1⇒Ais dependent on W1 (1)
+W2∈Out(A)∧Deg−(W2) = 1⇒W2is dependent on A (2)
+where Deg+(W1)represents the out-degree of weight W1, and Deg−(W2)represents the in-degree
+of weight W2. Each equation represents a unqiue directional dependency between activations and
+weights. When both equations hold simultaneously, a coupled structure exists between W1andW2.
+In Figure 3, we employ deep linear networks to illustrate two types of coupled structures in LLMs:
+Basic Structures : In Figure 3a, these structures exist in both the multi-head attention (MHA) and
+feed-forward network (FFN) modules. Taking LLaMA as an example, in the MHA module, we
+consider the Query ( Q), Key ( K), and Value ( V) projections as W1, and the Output ( O) projection
+asW2, while Softmax (QK⊤)V(x)acting as the activation between weight matrices. Similarly, in
+the FFN module, the Up ( U) and Gate ( G) projections function as W1, with the Down ( D) projection
+corresponding to W2. Here,U(x)·SwiGLU (G(x))serves as the activations connecting W1andW2.
+Residual Structures : In Figure 3b, this type of coupled structures exists between the MHA and FFN
+modules. We further consider how residual connections influence the activations in these structures.
+Permutation Invariance of Coupled Structures. Figure 3 demonstrates that W1andW2can be
+co-permuted using the same order, which only affects the order of activations between them while
+preserving the original output from the coupled structure. Since residual dependencies require an
+additional run-time step to permute the residuals, we will focus on basic dependencies in our method.
+3.2 Sparse Selection and Permutation
+At this point, all coupled structures within the model have been identified. The subsequent sparse
+selection and permutation processes are straightforward, with overall pipeline illustrated in Figure 1b.
+MHA Module : There are four linear layers in a MHA module: Q, K, V, O ∈Rd×d. For a model with
+hattention heads, each head i∈[h]has its own projections denoted as Qi∈Rd×dh,Ki∈Rd×dh,
+Vi∈Rd×dh, andOi∈Rdh×d, where dh=d/his the dimension per head. Let SMHA⊆[h]denote a
+small subset of attention heads. By permuting SMHA to the beginning of each weight matrix, we are
+able to update these selected heads using dense-only operations, while keeping the other ones frozen.
+FFN Module : There are three linear layers in an FFN module: U, G∈Rk×dandD∈Rd×k. In
+S2FT, only a few channels require gradient updates. Let SFFN⊆[d]denote the selected channels. We
+can permute SFFNto the beginning of each weight matrix and only fine-tune this compact subset.
+Next, we provide several strategies for identifying and selecting important subsets in each module.
+1.S2FT-R (S2FT): In this strategy, a subset of channels is randomly selected and set to be trainable.
+2.S2FT-W : This variant selects subsets based on the magnitude of the weights for linear layers.
+3.S2FT-A : This variant selects subsets based on the magnitude of activations on a calibration set.
+4.S2FT-S : Top-K subsets are ranked and selected by the product of weight and activation magnitudes.
+5.S2FT-G : This variant selects subsets based on the magnitude of gradients on a calibration set.
+Here, 1 and 2 can be applied directly without pre-processing. 3 and 4 only require a forward pass
+on a small calibration dataset. While 5 necessitates a backward pass on this dataset, it does not store
+optimization states and can mitigate memory footprints for activations through gradient checkpoint-
+ing [18]. By default, we use S2FT-R for a fair comparison and discuss other variants in Section 5.4.
+43.3 Partial Back-propagation Algorithm
+Finally, we introduce our partial back-propagation algorithm with only two line modifications in
+PyTorch. our algorithm stores trainable channels based on their start and end positions, thereby
+improving training efficiency by eliminating redundant forward activations and backward calculations.
+def setup_context(ctx, inputs, output):
+activation, weight, bias, start, end = inputs
+# only save partial input tensors for gradient calculation in forward
+ctx.save_for_backward(activation[:, start:end], weight, bias, start, end)
+def gradient_update(parameter, gradient, start, end):
+# only modify the assigned positions of weight matrices during optimization
+parameter[:, start:end].add_(gradient)
+4 Theoretical Analysis
+In this section, we theoretically explain why S2FT demonstrates stronger generalization capabilities
+compared to LoRA. Following previous work [ 23,79,53,52], we further show that S2FT is simple
+and efficient in optimization by maintaining stability in both the magnitude and direction of updates.
+4.1 Stronger Generalization Capability
+First, we theoretically explore why S2FT demonstrates stronger generalization capabilities compared
+to LoRA. We consider a pre-trained L-layer deep linear network, which has been widely used
+to facilitate the theoretical analysis of complex DNNs [ 59,30,43,22,34,5]. Let fpre(x) :=
+Wpre
+LWpre
+L−1. . . Wpre
+1xbe the pre-trained deep linear network, where Wpre
+ℓ∈Rdℓ×dℓ−1, with d0=p
+anddL=q. We fine-tune the ℓ-th layer with low-rankness level r≤min{dℓ, dℓ−1}or sparsity level
+s=⌊r·dℓ+dℓ−1
+dℓ−1⌋. Denote a class of adaptation with parameters U∈Rdℓ×dandV∈Rdℓ−1×das
+fℓ,U,V(x) :=Wpre
+ℓ+1(Wpre
+ℓ+UV⊤)Wpre
+ℓ−1x, (3)
+where Wpre
+ℓ:=Wpre
+LWpre
+L−1. . . Wpre
+ℓ∈RdL×dℓ−1andWpre
+ℓ:=Wpre
+ℓWpre
+ℓ−1. . . Wpre
+1∈Rdℓ×d0with
+Wpre
+0=IpandWpre
+L=Iq. In a transformer-based LLM, each row of Wℓcan represent the
+parameters in a single attention head for the MHA module or in a single channel for the FFN module.
+Given nobservations (x(i)
+i, y(i)
+i)⊂Rp×Rq, we fine-tune fpreby minimizing the empirical risk
+R(i)
+n(fℓ,U,V) := (1 /n)P
+i∈[n]∥y(i)
+i−fℓ,U,V(x(i)
+i)∥2via gradient descent. For LoRA, we train both
+low-rank matrices (U, V)in Equation (3)withd←r. For S2FT, we train only Vin Equation (3)
+withd←sand fixed U←US2FT
+S:= [ea1;ea2;. . .;eas], where S={a1, . . . , a s} ⊂[dℓ]andea
+is the a-th standard basis. Similar conclusions hold when we fine-tune only U. Motivated by the
+implicit regularization in gradient descent [ 77,19,5], we directly consider minimum norm solutions.
+We consider a multiple linear regression setting. Assume that the in-distribution training data (x(i),
+y(i))∈Rp+qand out-of-distribution test data (x(o), y(o))∈Rp+qare generated i.i.d. according to
+y(k)=B(k)x(k)+ϵ(k), k∈ {i,o},
+where B(k)∈Rq×pis the coefficient matrix, x(k)andϵ(k)are mean zero sub-Gaussian signal and
+noise with covariance matrices Σ(k)
+xandΣ(k)
+ϵ, respectively. The generalization capacity is measured
+by the fine-tuned model’s excess risk E(f) :=E[∥y(o)−f(x(o))∥2]−inff′E[∥y(o)−f′(x(o))∥2].
+For these OOD data, LoRA suffers from forgetting, while S2FT can maintain pre-training knowledge.
+Assumption 4.1 (Distribution Shift) .Assume that Σ(i)
+x= Σ(o)
+x= Σ xfor some Σx∈Rp×p, and
+∥(Wpre
+ℓ+1US2FT
+S)(Wpre
+ℓ+1US2FT
+S)†(B(o)−B(i))Σ1/2
+x∥2
+F≤ε2E(o)(fpre)for some ε >0.
+Assumption 4.1 states that while the covariate distribution remains unchanged, the label distribution
+conditioned on covariates may shift, but not exceeding a factor of ϵ2of the OOD risk of fpre. This
+holds for fine-tuning with proper channel selection, where primarily the output distribution is changed.
+Theorem 4.2 (Out-of-distribution Excess Risk, Informal) .Suppose Assumption 4.1 holds. Consider
+n→ ∞ . IfB(i)=Wpre
+ℓ+1˜B(i)Wpre
+ℓ−1holds for some ˜B(i)∈Rdℓ×dℓ−1, and s≤rank(Σ(i)
+f), then,
+E(o)(fℓ,US2FT
+S,VS2FT)≤(1 + 3 ε2)E(o)(fpre),E(o)(fℓ,ULoRA,VLoRA)≥ ∥(B(o)−B(i))Σ1/2
+x∥2
+F.
+5Theorem 4.2 indicates that the OOD risk of S2FTis bounded above by that of fpre, while that of
+LoRA is bounded below by the label shift magnitude. If fprealready has a low risk for OOD tasks, and
+the label shift is significant, S2FT is expected to outperform LoRA. Essentially, when the OOD task
+deviates significantly from the FT distribution, LoRA may forget pre-trained knowledge and overfit
+to the FT data, compromising its generalization capabilities. See formal statements in Theorem F.8.
+4.2 Simple and Efficient Optimization
+Next, we explain why S2FT is a simple and efficient optimization method. In Equation (3), S2FT
+can be viewed as a LoRA variant that fixes US2FT
+S as a combination of multiple orthogonal standard
+basis vectors while optimizing VS2FTwith zero initialization. The gradient is given by∂L
+∂VS2FT=
+(Wpre
+ℓ−1x)⊤∂L
+∂Wpre
+ℓ+1US2FT
+S. Ignore Wpre
+ℓ−1,Wpre
+ℓ−1and denote∂L
+∂Wpre
+ℓ+1asG, at step twith learning rate η,
+∆fℓ,t(x) :=fℓ,t(x)−fℓ,t−1(x) =US2FT
+S(VS2FT
+t−VS2FT
+t−1)⊤x=−ηUS2FT
+SUS2FT⊤
+S G⊤||x||2.
+Since US2FT
+S is an orthogonal matrix, the update simplifies to ∆fℓ,t(x) =−ηG⊤||x||2. Following
+LoRA+ [ 23], assuming that x= Θ n(1), where nis the width of the layers in LLMs, we expect
+∆fℓ,t(x) = Θ(1) to ensure stability and feature learning in the infinite-width limit [ 72]. S2FT can
+achieve this when η= Θ( n−1)while LoRA requires ηU= Θ(1) andηV= Θ( n−1)for optimal
+performance. These rates become impractical for modern LLMs with very large n. Therefore, S2FT
+aligns with LoRA variants that fix one matrix [ 52,79], offering more stable and efficient optimization.
+Furthermore, under a given sparsity level as regularization, our model simplifies optimization when
+approximating the full fine-tuning gradients at non-zero positions. Similar to LoRA-SB [ 53], letGV
+denote the gradient of VS2FT. The equivalent gradient ˜G, which describes the virtual gradient of the
+pretrained weight matrices, can be expressed as US2FT
+SG⊤
+V. Then, the gradient with respect to VS2FT
+can be expressed in terms of the gradient of the pretrained weight Wpreas:GO
+V=US2FT⊤
+S G. Using
+this relationship, our objective is to minimize the distance between the equivalent gradient and the full
+gradient as minGV∥˜G−G∥2
+F, where the optimal solution is given by GV= (US2FT⊤
+S US2FT
+S)−1GO
+V.
+Since US2FT
+S is orthogonal, we have GV=GO
+V. This shows that S2FT can keep the optimal update
+directions throughout the training process, establishing it as an efficient sparse optimization method.
+5 Experiments
+In this section, we conduct a series of experiments across three diverse benchmarks covering more
+than 20 datasets. Our goal is to provide a rich picture of how S2FT performs in different scenarios.
+Here, we compare our method with different fine-tuning strategies and categories including: (i) Full
+fine-tuning (FT), (ii) reparameterized fine-tuning : LoRA [ 27], DoRA [ 38], and Galore [ 80], (iii)
+adapter-based fine-tuning : Series Adapter [ 26], Parallel Adapter [ 24], and LoReFT [ 69], (iv) prompt-
+based fine-tuning : Prefix-Tuning [ 36], (v) sparse fine-tuning : LISA [ 48]. For a fair comparison, we
+keep a comparable number of trainable parameters in S2FT to that of LoRA. The design choices for
+trainable parameter allocations in S2FT will be detailed in Section 5.4. All other hyperparameters are
+selected via cross-validation. Detailed setups and dataset descriptions are provided in Appendix E.
+5.1 Commonsense Reasoning
+The results of eight common sense reasoning tasks in Table 1 show that S2FT consistently outperforms
+existing PEFT methods in the LLaMA-7B / 13B ,LLaMA2-7B andLLaMA3-8B models. Compared to
+LoRA and DoRA, it achieves average performance gains of 4.6% and 2.8%, respectively. Furthermore,
+S2FT also shows superior performance against recent approaches, including Galore, LoReFT, and
+LISA, with improvements of at least 1.0%. Remarkably, despite using less than 1% of trainable pa-
+rameters, our method surpasses full FT by 0.5%. The 3.0% improvement on the LLaMA3-8B suggests
+that keeping most pre-trained parameters frozen enables better generalization to test distributions.
+5.2 Arithmetic Reasoning
+As showcased in Table 2, S2FT consistently outperforms other PEFT methods for different base
+models. On average, it achieves improvements of 1.3% and 0.9% over LoRA and DoRA, respectively.
+These results highlight the versatility and effectiveness of our approach across a diverse range of
+tasks. Additionally, we observe substantial improvements even when compared to Full FT for the
+LLaMA3-8B model, particularly on complex tasks such as GSM8K and AQuA. This suggests that
+S2FT better preserves the original reasoning capabilities of this stronger model while acquiring new
+skills from the fine-tuning data, thereby validating the enhanced generalization ability of our method.
+6Table 1: Comparison among various fine-tuning methods for the LLaMA-7B/13B ,LLaMA2-7B , and
+LLaMA3-8B models on eight commonsense reasoning tasks. Non-PEFT methods are marked in gray.
+(1: from DoRA paper,2: from ReFT paper,3: reproduced by us,†: projected trainable parameters)
+Model Method # Param(%) BoolQ PIQA SIQA HellaSwag Wino ARC-e ARC-c OBQA Avg. ↑
+ChatGPT1- - 73.1 85.4 68.5 78.5 66.1 89.8 79.9 74.8 77.0
+LLaMA-7BFull FT3100 70.3 84.2 80.1 92.3 85.4 86.6 72.8 83.4 81.9
+Prefix [36]10.11 64.3 76.8 73.9 42.1 72.1 72.9 54.0 60.6 64.6
+Series [26]10.99 63.0 79.2 76.3 67.9 75.7 74.5 57.1 72.4 70.8
+Parallel [24]13.54 67.9 76.4 78.8 69.8 78.9 73.7 57.3 75.2 72.2
+LoRA [27]30.83 69.2 81.7 78.4 83.4 80.8 79.0 62.4 78.4 76.7
+DoRA [38]10.84 68.5 82.9 79.6 84.8 80.8 81.4 65.8 81.0 78.1
+Galore [80]30.83†68.6 79.0 78.5 84.7 80.1 80.3 62.1 77.3 76.3
+LoReFT [69]20.03 69.3 84.4 80.3 93.1 84.2 83.2 68.2 78.9 80.2
+LISA [48]39.91 70.4 82.1 78.7 92.4 82.9 84.9 70.2 78.4 80.0
+S2FT (Ours) 0.81 72.7 83.7 79.6 93.4 83.5 86.1 72.2 83.4 81.8
+LLaMA-13BFull FT3100 74.5 86.3 81.3 94.4 86.9 89.7 77.9 88.8 85.0
+Prefix [36]10.03 65.3 75.4 72.1 55.2 68.6 79.5 62.9 68.0 68.4
+Series [26]10.80 71.8 83.0 79.2 88.1 82.4 82.5 67.3 81.8 79.5
+Parallel [24]12.89 72.5 84.9 79.8 92.1 84.7 84.2 71.2 82.4 81.4
+LoRA [27]10.67 72.1 83.5 80.5 90.5 83.7 82.8 68.3 82.4 80.5
+DoRA [38]10.68 72.4 84.9 81.5 92.4 84.2 84.2 69.6 82.8 81.5
+LoReFT [69]20.03 72.1 86.3 81.8 95.1 87.2 86.2 73.7 84.2 83.3
+S2FT (Ours) 0.65 74.2 85.7 80.7 94.9 86.4 88.4 76.3 87.8 84.3
+LLaMA2-7BFull FT3100 74.7 84.9 78.7 93.7 84.1 87.5 75.2 85.0 83.0
+LoRA [27]10.83 69.8 79.9 79.5 83.6 82.6 79.8 64.7 81.0 77.6
+DoRA [38]10.84 71.8 83.7 76.0 89.1 82.6 83.7 68.2 82.4 79.7
+S2FT (Ours) 0.81 72.9 86.1 80.2 94.3 85.5 87.2 74.6 83.4 83.0
+LLaMA3-8BFull FT3100 73.9 86.2 79.1 93.1 85.8 88.1 78.2 84.0 83.6
+LoRA [27]10.70 70.8 85.2 79.7 92.5 84.9 88.9 78.7 84.4 82.5
+DoRA [38]10.71 74.6 89.3 79.9 95.5 85.6 90.5 80.4 85.8 85.2
+S2FT (Ours) 0.70 75.0 89.0 80.7 96.5 88.0 92.5 83.4 87.8 86.6
+Table 2: Comparison among various fine-tuning methods for different models on seven math reasoning
+tasks. Non-PEFT methods are marked in gray. (1: from LLM-Adapters paper,2: reproduced by us)
+Model Method # Param(%) MultiArith GSM8K AddSub AQuA SingleEq SV AMP MA WPS Avg. ↑
+GPT-3.51- - 83.8 56.4 85.3 38.9 88.1 69.9 87.4 72.8
+LLaMA-7BFull FT2100 98.8 43.1 91.1 20.9 94.3 60.6 88.2 71.0
+LoRA [27]20.83 98.0 40.0 91.2 21.7 93.1 56.7 85.3 69.7
+DoRA [38]20.84 97.3 38.9 89.6 22.4 93.9 58.4 85.3 69.4
+S2FT (Ours) 0.81 98.8 41.3 91.4 21.3 93.5 58.4 86.1 70.1
+LLaMA-13BFull FT2100 98.3 47.6 92.9 26.0 95.1 65.7 88.7 73.5
+LoRA [27]20.67 97.5 47.8 89.9 20.5 94.3 61.2 87.4 71.2
+DoRA [38]20.68 97.2 48.1 90.6 20.9 93.9 63.8 88.2 71.8
+S2FT (Ours) 0.65 97.7 48.4 90.4 22.8 95.5 63.9 87.8 72.4
+LLaMA2-7BFull FT2100 99.3 47.5 91.1 24.4 96.7 62.5 89.1 72.9
+LoRA [27]20.83 97.5 44.0 91.2 20.9 94.1 59.2 85.7 70.4
+DoRA [38]20.84 98.2 43.8 90.1 24.4 94.5 59.1 89.1 71.3
+S2FT (Ours) 0.81 98.5 44.3 91.1 25.2 94.7 61.8 88.2 72.0
+LLaMA3-8BFull FT2100 99.2 62.0 93.9 26.8 96.7 74.0 91.2 77.7
+LoRA [27]20.70 99.5 61.6 92.7 25.6 96.3 73.8 90.8 77.2
+DoRA [38]20.71 98.8 62.7 92.2 26.8 96.9 74.0 91.2 77.5
+S2FT (Ours) 0.70 99.7 65.8 93.7 31.5 97.8 76.0 92.4 79.6
+5.3 Instruction Following
+Table 3 comprehensively compares various methods on eight tasks in the MT-Bench dataset [82]. It
+is observed that S2FT>LISA >Full FT >LoRA/Galore ≥Vanilla for both the Mistral-7B and
+LLama2-7B model. This is because sparse FT methods like S2FT and LISA retain more pre-trained
+knowledge while acquiring new skills on the FT dataset, thereby generalizing better to diverse tasks in
+the MT-Bench dataset. Moreover, our method outperforms LISA due to its fine-grained and flexible
+selection strategy, enabling all layers to learn to follow instructions on the full fine-tuning set.
+7Table 3: Performance comparison of LLM fine-tuning methods trained on the Alpaca GPT-4 dataset.
+We report the MT-Bench score as the evaluation metric. All baseline results are cited from LISA.
+Model Method Writing Roleplay Reasoning Code Math Extraction STEM Humanities Avg.
+Mistral-7BVanilla 5.25 3.20 4.50 1.60 2.70 6.50 6.17 4.65 4.32
+Full FT 5.50 4.45 5.45 2.50 3.25 5.78 4.75 5.45 4.64
+LoRA 5.30 4.40 4.65 2.35 3.30 5.50 5.55 4.30 4.41
+Galore 5.05 5.27 4.45 1.70 2.50 5.21 5.52 5.20 4.36
+LISA 6.84 3.65 5.45 2.20 2.75 5.65 5.95 6.35 4.85
+Ours 6.95 4.40 5.50 2.70 3.55 5.95 6.35 6.75 5.27
+LLaMA2-7BVanilla 2.75 4.40 2.80 1.55 1.80 3.20 5.25 4.60 3.29
+Full FT 5.55 6.45 3.60 1.75 2.00 4.70 6.45 7.50 4.75
+LoRA 6.30 5.65 4.05 1.60 1.45 4.17 6.20 6.20 4.45
+Galore 5.60 6.40 3.20 1.25 1.95 5.05 6.57 7.00 4.63
+LISA 6.55 6.90 3.45 1.60 2.16 4.50 6.75 7.65 4.94
+Ours 6.75 6.60 4.15 1.65 1.85 4.75 7.45 8.38 5.20
+5.4 Design Choices for Trainable Parameter Allocations
+Finally, we detail how S2FT distribute trainable parameters across layers, modules, and channels.
+Uniform across Layers : Following Chen et al. [ 10], we allocate parameters to each layer uniformly.
+Fine-tune Important Modules : Figure 4 analyzes the effectiveness of different components in a
+LLaMA-like Transformer Block for fine-tuning, including Query, Key, Value, Output, Up, Gate, and
+Down projections. To ensure a fair comparison, we maintain a fixed number of trainable parameters
+when fine-tuning each component. The results show that the effectiveness of components in fine-
+tuning follows the order: Query/Key ≪Value/Up/Gate <Output/Down. This is because Query/Key
+are only used to measure token similarities, while others serve as persistent memories of training data.
+Based on this finding, we allocate our parameter budget fairly to the Output and Down projections.
+For the LLama3-8B andMistral-7B models, we only fine-tune the Down projection due to the
+inflexible selection in multi-query attention. Further analysis of this setting is left for future research.
+BoolQ6080100
+PIQA SIQA HellaSwag WinoGrande ARC-e ARC-c QBQAQuery Key Value Output Up Gate Down
+Figure 4: The impact of different components in fine-tuning, including Query, Key, Value, Output, Up,
+Gate, and Down projection. We fix the trainable parameter budget and only fine-tune one component.
+Table 4: Comparison of various channel selection strategies on the commonsense and arithmetic
+reasoning datasets for the LLama3-8B . We report the average accuracy (%) as the evaluation metric.
+Task S2FT-RS2FT-W S2FT-A S2FT-S S2FT-G
+Large Small Large Small Large Small Large Small
+Commonsense 86.6 85.9 (-0.7) 85.3 (-1.3) 84.7 (-1.9) 87.3 (+0.7) 85.1 (-1.5) 87.2 (+0.6) 85.4 (-1.2) 86.2 (-0.4)
+Arithmetic 79.6 78.4 (-1.2) 78.4 (-1.2) 77.1 (-2.5) 80.0 (+0.4) 76.8 (-2.8) 79.8 (+0.2) 77.8 (-1.8) 79.5 (-0.1)
+Selection across Channels : In Section 3.2, we discuss several strategies for channel selection. In our
+main experiments, we employ random selection to ensure fair comparisons with baseline methods,
+as these approaches treat all channels with equal importance. However, the sparse structure of S2FT
+offers controllability during fine-tuning, allowing us to prioritize important channels in the selection
+process to further boost performance. Table 4 compared nine different strategies, incorporating five
+varying selection metrics (i.e., random, weight, activation, weight-activation product, and gradient),
+each choosing either the largest or smallest values. For S2FT-A, S2FT-S, and S2FT-G, we employ
+1% of the fine-tuning data as a calibration set, introducing only negligible overhead during inference.
+Our results demonstrate that random selection serves as a strong baseline due to its unbiased nature.
+Among heuristic metrics, selecting channels with the smallest activations (i.e., S2FT-A and S2FT-S)
+outperforms random selection. This indicates that these channels contain less task-specific informa-
+tion, enabling us to inject new knowledge through fine-tuning while preserving pre-trained capabilities
+in other channels. In contrast, other strategies introduce bias that compromises model performance.
+Notably, the counterintuitive accuracy decrease in S2FT-G (Large) suggests that channels with large
+gradients contain task-related pre-trained knowledge, and modifying them will disrupt these abilities.
+86 Analysis
+Having demonstrated the strong generalization capability and overall performance of S2FT, we now
+further explore its training efficiency and serving scalability compared to other fine-tuning techniques.
+6.1 Training Efficiency
+To evaluate training efficiency, we examine two crucial metrics: peak memory footprint and average
+training latency. These numbers are measured on a single Nvidia A100 (80G) SXM GPU. We keep a
+comparable number of parameters for all methods. To obtain the average latency, we fine-tune the
+model for 50 runs, each run including 200 iterations, with 10 warmup runs excluded in measurement.
+bs=1 bs=2Memory (GB)18232026
+2230
+19242026
+192554 54
+bs=1 bs=22639
+2945
+3252
+2640
+2842
+274254 54
+bs=1 bs=23341
+3646
+3952
+34423846
+3443OOM OOM
+bs=1 bs=24567
+5075
+56OOM
+4667
+5071
+4770OOM OOM
+LLaMA2-7B, length 512bs=1 bs=2Latency (ms)118231
+138260 234398
+135250485579 610717
+314439
+LLaMA2-7B, length 1024bs=1 bs=2258476
+288529
+418742
+279504606822
+7331010
+461713
+LLaMA2-13B, length 512bs=1 bs=2190369
+214411 429669
+21539881598711441312OOM OOM
+LLaMA2-13B, length 1024bs=1 bs=2411779
+453865
+702OOM
+4378141029139113551763OOM OOMS2FT(Ours) LoRA DoRA LISA LoReFT Galore Full FT
+Figure 5: Comparison of memory and computation efficiency during training on the LLaMA2-7B/13B
+with varying sequence lengths and batch sizes. Average latency and peak memory usage are reported.
+S2FT significantly improves training latency while reducing memory footprint compared to baselines.
+In Figure 5, we thoughtfully profile S2FT on various model sizes, sequence lengths, and batch sizes.
+Compared to Full FT, S2FT saves 1.4-3.0 ×memory, and speedups fine-tuning by 1.5-2.7 times.
+When benchmarking against other PEFT methods, S2FT establishes new standards for efficiency,
+offering average reductions of 2% in memory usage and 9% in latency. Notably, S2FT outperforms
+the widely adopted LoRA, achieving about 10% improvement in both metrics by avoiding the need
+to store new parameters and perform additional calculations. Our partial back-propagation algorithm
+further improves efficiency by saving unnecessary forward activations and backward calculations.
+6.2 Serving Scalability
+While S2FT avoids additional inference overhead for a single fine-tuned model through in-place
+gradient updates, we will now discuss its scalability for serving thousands of fine-tuned models. To
+begin, we introduce the unmerged computation paradigm of S2FT: Given a pre-trained weight matrix
+Wpre∈Rd×kand its corresponding fine-tuned weight matrix Wwith sparsity level s, we define the
+weight difference as ∆W=W−Wpre. Similar to Section 4, ∆Wcan be decomposed into the product
+of a weight matrix V∈Rk×sand a permutation matrix U∈Rd×s. This decomposition allows us to
+“unmerge” an adapter ∆W=UV⊤fromW, thereby sharing similarities with other adapters during
+inference. Following Zhong et al. [83], we consider three different adapter composition scenarios:
+Adapter Fusion. To combine knowledge from multiple trained adapters, we employ weighted fusion
+when fine-tuning is impractical due to limited data access or computational resources. However, this
+approach degrades performance. In Table 5, we compare the effectiveness of LoRA and S2FT when
+combining adapters trained separately on commonsense and arithmetic reasoning tasks, where we
+consider both fine-tuning overlapped and non-overlapped parameters for different adapters in S2FT.
+Our results show that S2FT with non-overlapped parameters achieves the best performance, while the
+overlapped variant shows inferior results. This is because S2FT (non-overlap) modifies orthogonal
+low-rank spaces for different tasks. Similarly, LoRA largely retains task-specific capabilities during
+adapter fusion by optimizing low-rank projection matrices to create separate spaces for each adapter.
+Table 5: Adapter Fusion Results for LoRA and S2FT trained on the commonsense and arithmetic
+reasoning datasets using the LLama3-8B . We report the average accuracy (%) as the evaluation metric.
+TaskLoRA S2FT
+Commonsense Arithmetic Fused Commonsense Arithmetic Fused (overlap) Fused (non-overlap)
+Commonsense 83.1 32.1 79.8 (-3.3) 86.6 42.3 82.0 (-4.6) 84.0 (-2.6)
+Arithmetic 12.0 77.2 71.6 (-5.6) 12.8 79.6 72.2 (-7.4) 75.3 (-4.3)
+91024 2048 4096 8192 16384 32768
+Base Weight Dimension0.00.51.01.52.02.53.0Latency (ms)
+S2FT: scatter_add
+LoRA: matmul+add(a) Switch Time on GPU
+1024 2048 4096 8192 16384 32768
+Base Weight Dimension020406080100120Latency (ms)
+S2FT: scatter_add
+LoRA: add (b) Switch Time on CPU
+1 10 100 1000 10000 100000
+Number of Adapters051015202530Latency (ms)
+S2FT(W1): matmul+scatter+add
+S2FT(W2): matmul+gather+add
+LoRA: 2×matmul+add (c) Parallelism Time on GPU
+Figure 6: Comparison of latency for adapter switch and parallelism on a single linear layer. S2FT
+improves scalability for switch on GPU and CPU, while saving 22% time during parallelism on GPU.
+Adapter Switch. Another way to leveraging multiple adapters is to dynamically switch between them.
+This process involves four steps: unfusing the old adapter, unloading it from memory, loading the new
+adapter, and fusing it into the model. In such setting, LoRA needs two matrix multiplications ( matmul )
+and two additions ( add) on GPU whereas S2FT only requires two sparse addition ( scatter add). In
+Figure 6a, we increase the base weight dimension while maintaining a sparsity of 32 for S2FT and a
+low-rankness of 16 for LoRA. Notably, we observe that LoRA’s switching time scales quadratically,
+while S2FT remains nearly constant. Moreover, in I/O-constrained scenarios such as deployment on
+CPU, S2FT further accelerates adapter switch by only updating a small fraction of the original weights,
+reducing the volume of I/O transfers, as time compared between scatter addandaddin Figure 6b.
+Adapter Parallelism. To serve thousands of adapters in parallel, we decompose the computation into
+separate batched computations for Wpreand∆Wfollowing S-LoRA [ 60]. While LoRA requires
+twomatmul and one addon GPU, S2FT reduces this to a matmul , anadd, and either a scatter or
+gather forW1andW2in Section 3.1. Figure 6c shows that S2FT achieves up to 22% faster inference
+than LoRA under the same memory constraints, with more speedup as the number of adapters scales.
+7 Related Work
+PEFT methods reduce the fine-tuning cost for large models, which can be categorized into 4 groups:
+Adapter-based Fine-tuning introduces additional trainable module into the original model. Series
+Adapters insert components between MHA or FFN layers [ 51,26], while parallel adapters add
+modules alongside existing components [ 24]. Recently, ReFT [ 69] was introduced to directly learn
+interventions on hidden representations. However, they introduce additional latency during inference.
+Prompt-based Fine-tuning adds randomly-initialized soft tokens to the input (usually as a prefix)
+and train their embeddings while freezing the model weights [ 36,40,35]. These approaches result in
+poor performance compared to other groups, while come at the cost of significant inference overhead.
+Reparameterized Fine-tuning utilizes low-rank projections to reduce trainable parameters while
+allowing operations with high-dimensional matrices. LoRA[ 27] and its recent variants like DoRA[ 38],
+AsyLoRA [ 84], and FLoRA [ 61], use low-rank matrices to approximate additive weight updates
+during training. To alleviate the limitations of low-rank structure, other work also add or multiply
+orthogonal matrices to enable high-rank updating, including MoRA [ 29], OFT [ 54], and BOFT [ 39].
+These methods require no additional inference cost as the weight updates can be merged into models.
+Sparse Fine-tuning aims to reduce the number of fine-tuned parameters by selecting a subset of
+pre-trained parameters that are critical to downstream tasks while discarding unimportant ones. This
+kind of methods are commonly used in the pre-LLM era [ 20,75,64]. However, they cannot reduce
+the memory footprints due to their unstructured nature. Recent approaches address this limitation
+through three directions: (1) developing structured variants that sacrifice selection flexibility for better
+hardware efficiency [ 48,85], (2) incorporating sparsity into LoRA [ 68,15,41] but yield limited
+efficiency gains, or (3) using sparse operators for lower memory cost but slow down training [ 4,49,7].
+Our work is based on the last category but achieving better performance and efficiency simultaneously.
+Additionally, we focus on scalable inference of PEFT methods, with S2FT being the only approach
+that enables effective fusion, rapid switching, and efficient parallelism when serving multiple adapters.
+8 Conclusion
+This paper introduces S2FT, a novel PEFT family that simultaneously achieves high quality, efficient
+training, and scalable serving for LLM fine-tuning. S2FT accomplishes this by selecting sparsely
+and compute densely. It selects a subset of heads and channels to be trainable for the MHA and FFN
+modules, respectively. The weight matrices from the two sides of the coupled structures in LLMs are
+co-permuted to connect the selected components into dense matrices, and only these parameters are
+updated using dense operations. We hope S2FT can be considered as a successor to LoRA for PEFT.
+109 Acknowledgement
+We would like to thank Songlin Yang, Kaustubh Ponkshe, Raghav Singhal, Jinqi Luo, Tianqi Chen,
+Hanshi Sun, and Chris De Sa for their helpful discussions, and the authors of LLM-Adapters, ReFT,
+and DoRA for providing detailed results.
+References
+[1]Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman,
+Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report. arXiv
+preprint arXiv:2303.08774 , 2023. 1
+[2]Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman,
+Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report. arXiv
+preprint arXiv:2303.08774 , 2023. 17
+[3]Alan Ansell, Edoardo Maria Ponti, Anna Korhonen, and Ivan Vuli ´c. Composable sparse fine-tuning for
+cross-lingual transfer. arXiv preprint arXiv:2110.07560 , 2021. 2
+[4]Alan Ansell, Ivan Vuli ´c, Hannah Sterz, Anna Korhonen, and Edoardo M Ponti. Scaling sparse fine-tuning
+to large language models. arXiv preprint arXiv:2401.16405 , 2024. 10
+[5]Sanjeev Arora, Nadav Cohen, Wei Hu, and Yuping Luo. Implicit regularization in deep matrix factorization.
+Advances in Neural Information Processing Systems , 32, 2019. 5, 18
+[6]Zhangir Azerbayev, Hailey Schoelkopf, Keiran Paster, Marco Dos Santos, Stephen McAleer, Albert Q
+Jiang, Jia Deng, Stella Biderman, and Sean Welleck. Llemma: An open language model for mathematics.
+arXiv preprint arXiv:2310.10631 , 2023. 1
+[7]Kartikeya Bhardwaj, Nilesh Prasad Pandey, Sweta Priyadarshi, Viswanath Ganapathy, Rafael Esteves,
+Shreya Kadambi, Shubhankar Borse, Paul Whatmough, Risheek Garrepalli, Mart Van Baalen, et al. Rapid
+switching and multi-adapter fusion via sparse high rank adapters. arXiv preprint arXiv:2407.16712 , 2024.
+10
+[8]Dan Biderman, Jose Gonzalez Ortiz, Jacob Portes, Mansheej Paul, Philip Greengard, Connor Jennings,
+Daniel King, Sam Havens, Vitaliy Chiley, Jonathan Frankle, et al. Lora learns less and forgets less. arXiv
+preprint arXiv:2405.09673 , 2024. 1
+[9]Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin Choi, et al. Piqa: Reasoning about physical common-
+sense in natural language. In Proceedings of the AAAI conference on artificial intelligence , volume 34,
+pages 7432–7439, 2020. 16, 17
+[10] Jiaao Chen, Aston Zhang, Xingjian Shi, Mu Li, Alex Smola, and Diyi Yang. Parameter-efficient fine-tuning
+design spaces. arXiv preprint arXiv:2301.01821 , 2023. 8
+[11] Yuxin Chen, Yuejie Chi, Jianqing Fan, Cong Ma, et al. Spectral methods for data science: A statistical
+perspective. Foundations and Trends® in Machine Learning , 14(5):566–806, 2021. 31
+[12] Christopher Clark, Kenton Lee, Ming-Wei Chang, Tom Kwiatkowski, Michael Collins, and Kristina
+Toutanova. Boolq: Exploring the surprising difficulty of natural yes/no questions. arXiv preprint
+arXiv:1905.10044 , 2019. 16, 17
+[13] Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick, and Oyvind
+Tafjord. Think you have solved question answering? try arc, the ai2 reasoning challenge. arXiv preprint
+arXiv:1803.05457 , 2018. 16, 17
+[14] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias
+Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers to solve math word
+problems. arXiv preprint arXiv:2110.14168 , 2021. 16, 17
+[15] Ning Ding, Xingtai Lv, Qiaosen Wang, Yulin Chen, Bowen Zhou, Zhiyuan Liu, and Maosong Sun. Sparse
+low-rank adaptation of pre-trained language models. arXiv preprint arXiv:2311.11696 , 2023. 10
+[16] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman,
+Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models. arXiv preprint
+arXiv:2407.21783 , 2024. 1
+11[17] Gongfan Fang, Xinyin Ma, Mingli Song, Michael Bi Mi, and Xinchao Wang. Depgraph: Towards
+any structural pruning. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition , pages 16091–16101, 2023. 4
+[18] Jianwei Feng and Dong Huang. Optimal gradient checkpoint search for arbitrary computation graphs. In
+Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition , pages 11433–
+11442, 2021. 4
+[19] Suriya Gunasekar, Blake E Woodworth, Srinadh Bhojanapalli, Behnam Neyshabur, and Nati Srebro.
+Implicit regularization in matrix factorization. Advances in neural information processing systems , 30,
+2017. 5, 18
+[20] Demi Guo, Alexander M Rush, and Yoon Kim. Parameter-efficient transfer learning with diff pruning.
+arXiv preprint arXiv:2012.07463 , 2020. 10
+[21] Zeyu Han, Chao Gao, Jinyang Liu, Sai Qian Zhang, et al. Parameter-efficient fine-tuning for large models:
+A comprehensive survey. arXiv preprint arXiv:2403.14608 , 2024. 1
+[22] Moritz Hardt and Tengyu Ma. Identity matters in deep learning. arXiv preprint arXiv:1611.04231 , 2016.
+5, 18
+[23] Soufiane Hayou, Nikhil Ghosh, and Bin Yu. Lora+: Efficient low rank adaptation of large models. arXiv
+preprint arXiv:2402.12354 , 2024. 3, 5, 6
+[24] Junxian He, Chunting Zhou, Xuezhe Ma, Taylor Berg-Kirkpatrick, and Graham Neubig. Towards a unified
+view of parameter-efficient transfer learning. arXiv preprint arXiv:2110.04366 , 2021. 6, 7, 10
+[25] Mohammad Javad Hosseini, Hannaneh Hajishirzi, Oren Etzioni, and Nate Kushman. Learning to solve
+arithmetic word problems with verb categorization. In Proceedings of the 2014 Conference on Empirical
+Methods in Natural Language Processing (EMNLP) , pages 523–533, 2014. 16, 17
+[26] Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna Morrone, Quentin De Laroussilhe, Andrea
+Gesmundo, Mona Attariyan, and Sylvain Gelly. Parameter-efficient transfer learning for NLP. In
+International conference on machine learning , pages 2790–2799. PMLR, 2019. 6, 7, 10
+[27] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and
+Weizhu Chen. Lora: Low-rank adaptation of large language models. arXiv preprint arXiv:2106.09685 ,
+2021. 2, 6, 7, 10
+[28] Zhiqiang Hu, Yihuai Lan, Lei Wang, Wanyu Xu, Ee-Peng Lim, Roy Ka-Wei Lee, Lidong Bing, and
+Soujanya Poria. Llm-adapters: An adapter family for parameter-efficient fine-tuning of large language
+models. arXiv preprint arXiv:2304.01933 , 2023. 3, 16, 17
+[29] Ting Jiang, Shaohan Huang, Shengyue Luo, Zihan Zhang, Haizhen Huang, Furu Wei, Weiwei Deng, Feng
+Sun, Qi Zhang, Deqing Wang, et al. Mora: High-rank updating for parameter-efficient fine-tuning. arXiv
+preprint arXiv:2405.12130 , 2024. 10
+[30] Kenji Kawaguchi. Deep learning without poor local minima. Advances in neural information processing
+systems , 29, 2016. 5, 18
+[31] Rik Koncel-Kedziorski, Hannaneh Hajishirzi, Ashish Sabharwal, Oren Etzioni, and Siena Dumas Ang.
+Parsing algebraic word problems into equations. Transactions of the Association for Computational
+Linguistics , 3:585–597, 2015. 16, 17
+[32] Rik Koncel-Kedziorski, Subhro Roy, Aida Amini, Nate Kushman, and Hannaneh Hajishirzi. Mawps: A
+math word problem repository. In Proceedings of the 2016 conference of the north american chapter of the
+association for computational linguistics: human language technologies , pages 1152–1157, 2016. 16, 17
+[33] Rui Kong, Qiyang Li, Xinyu Fang, Qingtian Feng, Qingfeng He, Yazhu Dong, Weijun Wang, Yuanchun
+Li, Linghe Kong, and Yunxin Liu. Lora-switch: Boosting the efficiency of dynamic llm adapters via
+system-algorithm co-design. arXiv preprint arXiv:2405.17741 , 2024. 1
+[34] Thomas Laurent and James Brecht. Deep linear networks with arbitrary loss: All local minima are global.
+InInternational conference on machine learning , pages 2902–2907. PMLR, 2018. 5, 18
+[35] Brian Lester, Rami Al-Rfou, and Noah Constant. The power of scale for parameter-efficient prompt tuning.
+arXiv preprint arXiv:2104.08691 , 2021. 10
+12[36] Xiang Lisa Li and Percy Liang. Prefix-tuning: Optimizing continuous prompts for generation. arXiv
+preprint arXiv:2101.00190 , 2021. 6, 7, 10
+[37] Wang Ling, Dani Yogatama, Chris Dyer, and Phil Blunsom. Program induction by rationale generation:
+Learning to solve and explain algebraic word problems. arXiv preprint arXiv:1705.04146 , 2017. 16, 17
+[38] Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo Molchanov, Yu-Chiang Frank Wang, Kwang-
+Ting Cheng, and Min-Hung Chen. DoRA: Weight-Decomposed low-rank adaptation. arXiv preprint
+arXiv:2402.09353 , 2024. 2, 6, 7, 10
+[39] Weiyang Liu, Zeju Qiu, Yao Feng, Yuliang Xiu, Yuxuan Xue, Longhui Yu, Haiwen Feng, Zhen Liu, Juyeon
+Heo, Songyou Peng, et al. Parameter-efficient orthogonal finetuning via butterfly factorization. arXiv
+preprint arXiv:2311.06243 , 2023. 10
+[40] Xiao Liu, Yanan Zheng, Zhengxiao Du, Ming Ding, Yujie Qian, Zhilin Yang, and Jie Tang. GPT
+understands, too. AI Open , 2023. 10
+[41] Zequan Liu, Jiawen Lyn, Wei Zhu, Xing Tian, and Yvette Graham. Alora: Allocating low-rank adaptation
+for fine-tuning large language models. arXiv preprint arXiv:2403.16187 , 2024. 10
+[42] Zichang Liu, Jue Wang, Tri Dao, Tianyi Zhou, Binhang Yuan, Zhao Song, Anshumali Shrivastava,
+Ce Zhang, Yuandong Tian, Christopher Re, et al. Deja vu: Contextual sparsity for efficient llms at inference
+time. In International Conference on Machine Learning , pages 22137–22176. PMLR, 2023. 2
+[43] Haihao Lu and Kenji Kawaguchi. Depth creates no bad local minima. arXiv preprint arXiv:1702.08580 ,
+2017. 5, 18
+[44] Yun Luo, Zhen Yang, Fandong Meng, Yafu Li, Jie Zhou, and Yue Zhang. An empirical study of catastrophic
+forgetting in large language models during continual fine-tuning. arXiv preprint arXiv:2308.08747 , 2023.
+1
+[45] Xinyin Ma, Gongfan Fang, and Xinchao Wang. Llm-pruner: On the structural pruning of large language
+models. Advances in neural information processing systems , 36:21702–21720, 2023. 2, 4
+[46] Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish Sabharwal. Can a suit of armor conduct electricity?
+a new dataset for open book question answering. arXiv preprint arXiv:1809.02789 , 2018. 16, 17
+[47] Ryumei Nakada, Halil Ibrahim Gulluk, Zhun Deng, Wenlong Ji, James Zou, and Linjun Zhang. Understand-
+ing multimodal contrastive learning and incorporating unpaired data. arXiv preprint arXiv:2302.06232 ,
+2023. 32
+[48] Rui Pan, Xiang Liu, Shizhe Diao, Renjie Pi, Jipeng Zhang, Chi Han, and Tong Zhang. LISA: Lay-
+erwise importance sampling for memory-efficient large language model fine-tuning. arXiv preprint
+arXiv:2403.17919 , 2024. 2, 6, 7, 10
+[49] Ashwinee Panda, Berivan Isik, Xiangyu Qi, Sanmi Koyejo, Tsachy Weissman, and Prateek Mittal. Lottery
+ticket adaptation: Mitigating destructive interference in llms. arXiv preprint arXiv:2406.16797 , 2024. 10
+[50] Arkil Patel, Satwik Bhattamishra, and Navin Goyal. Are NLP models really able to solve simple math word
+problems? In Kristina Toutanova, Anna Rumshisky, Luke Zettlemoyer, Dilek Hakkani-Tur, Iz Beltagy,
+Steven Bethard, Ryan Cotterell, Tanmoy Chakraborty, and Yichao Zhou, editors, Proceedings of the 2021
+Conference of the North American Chapter of the Association for Computational Linguistics: Human
+Language Technologies , pages 2080–2094, Online, June 2021. Association for Computational Linguistics.
+16, 17
+[51] Jonas Pfeiffer, Ivan Vuli ´c, Iryna Gurevych, and Sebastian Ruder. Mad-x: An adapter-based framework for
+multi-task cross-lingual transfer. arXiv preprint arXiv:2005.00052 , 2020. 10
+[52] Lai-Man Po, Yuyang Liu, Haoxuan Wu, Tianqi Zhang, Wing-Yin Yu, Zhuohan Wang, Zeyu Jiang, and Kun
+Li. Sbora: Low-rank adaptation with regional weight updates. arXiv preprint arXiv:2407.05413 , 2024. 5, 6
+[53] Kaustubh Ponkshe, Raghav Singhal, Eduard Gorbunov, Alexey Tumanov, Samuel Horvath, and Praneeth
+Vepakomma. Initialization using update approximation is a silver bullet for extremely efficient low-rank
+fine-tuning. arXiv preprint arXiv:2411.19557 , 2024. 5, 6
+[54] Zeju Qiu, Weiyang Liu, Haiwen Feng, Yuxuan Xue, Yao Feng, Zhen Liu, Dan Zhang, Adrian Weller, and
+Bernhard Sch ¨olkopf. Controlling text-to-image diffusion by orthogonal finetuning. Advances in Neural
+Information Processing Systems , 36:79320–79362, 2023. 10
+13[55] Subhro Roy and Dan Roth. Solving general arithmetic word problems. arXiv preprint arXiv:1608.01413 ,
+2016. 16, 17
+[56] Baptiste Roziere, Jonas Gehring, Fabian Gloeckle, Sten Sootla, Itai Gat, Xiaoqing Ellen Tan, Yossi Adi,
+Jingyu Liu, Tal Remez, J ´er´emy Rapin, et al. Code llama: Open foundation models for code. arXiv preprint
+arXiv:2308.12950 , 2023. 1
+[57] Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. Winogrande: An adversarial
+winograd schema challenge at scale. Communications of the ACM , 64(9):99–106, 2021. 16, 17
+[58] Maarten Sap, Hannah Rashkin, Derek Chen, Ronan LeBras, and Yejin Choi. Socialiqa: Commonsense
+reasoning about social interactions. arXiv preprint arXiv:1904.09728 , 2019. 16, 17
+[59] Andrew M Saxe, James L McClelland, and Surya Ganguli. Exact solutions to the nonlinear dynamics of
+learning in deep linear neural networks. arXiv preprint arXiv:1312.6120 , 2013. 5, 18
+[60] Ying Sheng, Shiyi Cao, Dacheng Li, Coleman Hooper, Nicholas Lee, Shuo Yang, Christopher Chou,
+Banghua Zhu, Lianmin Zheng, Kurt Keutzer, et al. S-lora: Serving thousands of concurrent lora adapters.
+arXiv preprint arXiv:2311.03285 , 2023. 1, 2, 10
+[61] Chongjie Si, Xuehui Wang, Xue Yang, Zhengqin Xu, Qingyun Li, Jifeng Dai, Yu Qiao, Xiaokang Yang,
+and Wei Shen. Flora: Low-rank core space for n-dimension. arXiv preprint arXiv:2405.14739 , 2024. 10
+[62] GW Stewart. On the continuity of the generalized inverse. SIAM Journal on Applied Mathematics ,
+17(1):33–45, 1969. 33
+[63] Yi-Lin Sung, Varun Nair, and Colin A Raffel. Training neural networks with fixed sparse masks. Advances
+in Neural Information Processing Systems , 34:24193–24205, 2021. 2
+[64] Yi-Lin Sung, Varun Nair, and Colin A Raffel. Training neural networks with fixed sparse masks. Advances
+in Neural Information Processing Systems , 34:24193–24205, 2021. 10
+[65] Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy Liang,
+and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following LLaMA model. https://github.
+com/tatsu-lab/stanford alpaca , 2023. 17
+[66] Gemini Team, Rohan Anil, Sebastian Borgeaud, Yonghui Wu, Jean-Baptiste Alayrac, Jiahui Yu, Radu
+Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth, et al. Gemini: a family of highly capable
+multimodal models. arXiv preprint arXiv:2312.11805 , 2023. 1
+[67] J Leo van Hemmen and Tsuneya Ando. An inequality for trace ideals. Communications in Mathematical
+Physics , 76:143–148, 1980. 33
+[68] Haoyu Wang, Tianci Liu, Tuo Zhao, and Jing Gao. Roselora: Row and column-wise sparse low-rank adapta-
+tion of pre-trained language model for knowledge editing and fine-tuning. arXiv preprint arXiv:2406.10777 ,
+2024. 10
+[69] Zhengxuan Wu, Aryaman Arora, Zheng Wang, Atticus Geiger, Dan Jurafsky, Christopher D Manning, and
+Christopher Potts. ReFT: Representation finetuning for language models. arXiv preprint arXiv:2404.03592 ,
+2024. 6, 7, 10
+[70] Lingling Xu, Haoran Xie, Si-Zhao Joe Qin, Xiaohui Tao, and Fu Lee Wang. Parameter-efficient fine-
+tuning methods for pretrained language models: A critical review and assessment. arXiv preprint
+arXiv:2312.12148 , 2023. 1
+[71] Runxin Xu, Fuli Luo, Zhiyuan Zhang, Chuanqi Tan, Baobao Chang, Songfang Huang, and Fei Huang.
+Raise a child in large language model: Towards effective and generalizable fine-tuning. arXiv preprint
+arXiv:2109.05687 , 2021. 2
+[72] Ge Yang, Edward Hu, Igor Babuschkin, Szymon Sidor, Xiaodong Liu, David Farhi, Nick Ryder, Jakub
+Pachocki, Weizhu Chen, and Jianfeng Gao. Tuning large neural networks via zero-shot hyperparameter
+transfer. Advances in Neural Information Processing Systems , 34:17084–17097, 2021. 6
+[73] Yi Yu, Tengyao Wang, and Richard J Samworth. A useful variant of the davis–kahan theorem for
+statisticians. Biometrika , 102(2):315–323, 2015. 31
+[74] Li Yunxiang, Li Zihan, Zhang Kai, Dan Ruilong, and Zhang You. Chatdoctor: A medical chat model
+fine-tuned on llama model using medical domain knowledge. arXiv preprint arXiv:2303.14070 , 2023. 1
+14[75] Elad Ben Zaken, Shauli Ravfogel, and Yoav Goldberg. Bitfit: Simple parameter-efficient fine-tuning for
+transformer-based masked language-models. arXiv preprint arXiv:2106.10199 , 2021. 10
+[76] Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. Hellaswag: Can a machine
+really finish your sentence? arXiv preprint arXiv:1905.07830 , 2019. 16, 17
+[77] Chiyuan Zhang, Samy Bengio, Moritz Hardt, Benjamin Recht, and Oriol Vinyals. Understanding deep
+learning (still) requires rethinking generalization. Communications of the ACM , 64(3):107–115, 2021. 5,
+18
+[78] Jinghan Zhang, Junteng Liu, Junxian He, et al. Composing parameter-efficient modules with arithmetic
+operation. Advances in Neural Information Processing Systems , 36:12589–12610, 2023. 1
+[79] Longteng Zhang, Lin Zhang, Shaohuai Shi, Xiaowen Chu, and Bo Li. Lora-fa: Memory-efficient low-rank
+adaptation for large language models fine-tuning. arXiv preprint arXiv:2308.03303 , 2023. 5, 6
+[80] Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar, and Yuandong Tian.
+Galore: Memory-efficient llm training by gradient low-rank projection. arXiv preprint arXiv:2403.03507 ,
+2024. 2, 6, 7, 16
+[81] Justin Zhao, Timothy Wang, Wael Abid, Geoffrey Angus, Arnav Garg, Jeffery Kinnison, Alex Sherstinsky,
+Piero Molino, Travis Addair, and Devvret Rishi. Lora land: 310 fine-tuned llms that rival gpt-4, a technical
+report. arXiv preprint arXiv:2405.00732 , 2024. 1
+[82] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin,
+Zhuohan Li, Dacheng Li, Eric Xing, et al. Judging llm-as-a-judge with mt-bench and chatbot arena.
+Advances in Neural Information Processing Systems , 36, 2024. 7, 17
+[83] Ming Zhong, Yelong Shen, Shuohang Wang, Yadong Lu, Yizhu Jiao, Siru Ouyang, Donghan Yu, Jiawei
+Han, and Weizhu Chen. Multi-lora composition for image generation. arXiv preprint arXiv:2402.16843 ,
+2024. 9
+[84] Jiacheng Zhu, Kristjan Greenewald, Kimia Nadjahi, Haitz S ´aez de Oc ´ariz Borde, Rickard Br ¨uel Gabrielsson,
+Leshem Choshen, Marzyeh Ghassemi, Mikhail Yurochkin, and Justin Solomon. Asymmetry in low-rank
+adapters of foundation models. arXiv preprint arXiv:2402.16842 , 2024. 10
+[85] Ligeng Zhu, Lanxiang Hu, Ji Lin, and Song Han. Lift: Efficient layer-wise fine-tuning for large model
+models. arXiv preprint arXiv:2410.11772 , 2023. 10
+15A Limitations
+While our work demonstrates the effectiveness of S2FT for LLM fine-tuning, several promising
+directions remain unexplored. First, extending S2FT to other architectures with coupled structures,
+such as CNNs and RNNs, can broaden its applicability. Second, verifying our approach beyond
+language tasks, particularly in large vision/multi-modal models, will enhance its versatility. Third,
+exploring more selection strategies can provide deeper insights into optimal fine-tuning protocols
+due to the controllability in S2FT. Fourth, scaling our method to larger models requires further
+experiments. Finally, although our work confirms the feasibility of scalable and efficient deployment
+during inference, developing a practical serving system for S2FT remains an important next step.
+B Broader Impacts
+Since our work focuses on PEFT, it leads to a reduction in hardware resource and energy consumption.
+Given the growing adoption of LLMs across diverse domains and the corresponding surge in fine-
+tuning demands, S2FT should represent an important step toward more sustainable AI development.
+C Detailed Experimental Setups for Section 2
+In this study, we used SpFT, LoRA, and Full FT to fine-tune the LLaMA-3-8B model on the Math10K
+dataset [ 28]. The Math10K dataset combines training sets from GSM8K [ 14], MAWPS [ 32], and
+AQuA [ 37], augmented with chain-of-thought steps generated by language models. We conducted
+training for 3 epochs with a batch size of 64. For both PEFT methods–SpFT and LoRA–we fine-tune
+with three ratios of trainable parameters for all linear layers: p= 10% ,1%,0.1%. The model’s
+performance is evaluated on both arithmetic and commonsense reasoning tasks, representing near out-
+of-distribution (OOD) and far OOD generalization scenarios, respectively. The arithmetic reasoning
+dataset comprises seven subtasks: MultiArith [ 55], GSM8K, AddSub [ 25], AQuA, SingleEq [ 31],
+SV AMP [ 50], and MAWPS. The commonsense reasoning dataset includes eight subtasks: BoolQ [ 12],
+PIQA [ 9], SocialQA [ 58], HellaSwag [ 76], WinoGrande [ 57], ARC-challenge [ 13], ARC-easy [ 13],
+and OpenbookQA [ 46]. Based on task complexity within arithmetic reasoning (accuracy ≥90%),
+we group MultiArith, AddSub, SingleEq, and MAWPS as easy subtasks, while the remaining ones
+are classified as hard subtasks. This stratification enables us to evaluate whether the model develops
+advanced reasoning abilities beyond memorizing basic arithmetic operations from the training data.
+D Detailed Selection Strategies in Section 3
+For the five selection strategies described in Section 3.2, we will detail the methods for identifying
+and selecting important subsets within each linear layer of both MHA and FFN modules in LLMs.
+1.S2FT-R (S2FT): In this strategy, we will randomly select some heads for the MHA modules and
+select a few channels for the FFN modules. For the output projection, all channels in the selected
+heads will be included to enable dense-only computation. In the up and gate projections, we will
+select a subset of columns, while for the down projection, a few trainable rows will be chosen.
+2.S2FT-W : This variant selects subsets based on the weight magnitudes (i.e., ∥W∥2) in the MHA
+and FFN modules. We will test subsets corresponding to both the largest and smallest weights.
+3.S2FT-A : This variant selects subsets based on the magnitude of activations (i.e., ∥A∥2) on a
+calibration set, using 1%of the fine-tuning data. Since collecting activations requires only forward
+passes, this approach maintains the same memory footprint as inference and incurs a negligible
+increase in training time. Similarly, we evaluate both the largest and smallest activation variants.
+4.S2FT-S : The Top-K subsets are ranked and selected by the product of the weight and activation
+magnitudes (i.e, ∥W∥2·∥A∥2). The activation values are collected in a manner similar to S2FT-A.
+5.S2FT-G : This variant selects subsets based on the magnitude of gradients on the calibration set.
+Since gradients are collected without updating the model, we calculate and discard gradients layer
+by layer during back-propagation similar to Galore [80], requiring minimal additional memory.
+16E Detailed Experimental Setups for Section 5
+Detailed selection strategies and number of trainable parameters are presented in Section 5.
+E.1 Dataset Description
+Commonsense Reasoning. The commonsense reasoning dataset comprise eight subsets: BoolQ [ 12],
+PIQA [ 9], SocialQA [ 58], HellaSwag [ 76], WinoGrande [ 57], ARC-challenge [ 13], ARC-easy [ 13],
+and OpenbookQA [ 46]. Following the experimental setup of LLM-Adapters [ 28], we split each
+dataset into training and test sets. Subsequently, we combine the training data from all eight tasks
+into a single fine-tuning dataset and evaluate performance on the individual test dataset for each task.
+Arithmetic Reasoning. We followed Hu et al. [ 28] and evaluated S2FT on seven math reasoning tasks,
+including MultiArith [ 55], GSM8K [ 14], AddSub [ 25], AQuA [ 37], SingleEq [ 31], SV AMP [ 50]
+and MAWPS [ 32]. Our fine-tuning employed the Math10K dataset [ 28], which combines training
+sets from GSM8K, MAWPS, and AQuA, augmented with LM-generated chain-of-thought steps.
+Therefore, these three tasks are considered ID, while the remaining four are classified as OOD tasks.
+Instruction Following. To further showcase S2FT’s superior generalization ability, we employ the
+instruction-following fine-tuning task with Alpaca GPT-4 dataset, which comprises 52k samples gen-
+erated by GPT-4 [ 2] based on inputs from Alpaca [ 65]. Performance is measured on MT-Bench [82] ,
+featuring 80 high-quality, multi-turn questions designed to assess LLMs on eight different aspects.
+E.2 Hyperparameter Description
+Additional hyperparameter configurations for all tasks are provided in Table 6. We maintain the same
+hyperparameter settings across the LLaMA-7/13B ,LLaMA2-7B ,LLaMA3-8B , and Mistral-7B models.
+Table 6: Hyperparameter configurations of S2FT on various base models across three tasks.
+Hyperparameters Commonsense Reasoning Arithmetic Reasoning Instruction Following
+Optimizer AdamW AdamW AdamW
+LR 2e-4 1e-3 2e-5
+LR Scheduler linear linear cosine
+Batch size 16 ×4 16 ×4 16 ×4
+Warmup Steps 100 100 0
+Epochs 3 3 1
+F Proofs for Theoretical Results in Section 4
+Here we provide proofs for the results in Section 4.
+F.1 Notation
+For a vector a, let∥a∥be the ℓ2norm of a. For d1≥d2, denote a set of orthogonal matrices
+byOd1,d2:={R∈Rd1×d2:R⊤R=Id2}. For a matrix A∈Rd1×d2, let∥A∥Fand∥A∥op
+be the Frobenius norm and spectral norm of A, respectively. Denote the condition number of
+Abyκ∗(A) :=∥A∥op/λ∗(A). Let A†beMoore-Penrose inverse of A. For a symmetric matrix A,
+denote its effective rank by re(A) := tr( A)/∥A∥op. Note that re(A)≤rank( A)always holds.
+Fora, b∈R, we let a∨b:= max( a, b)anda∧b:= min( a, b). For a matrix A∈Rd1×d2, let
+SVD r(A) := Φ r(A)Λr(A)Ψ⊤
+r(A)be the top- rsingular value decomposition of A, where Φr(A)∈
+Od1,randΨr(A)∈Od2,rare top- rleft and right singular vectors of A, respectively , and Λr(A) =
+diag( λ1(A), . . . , λ r(A))∈Rr×ris a diagonal matrix of singular values of A, where λj(A)denotes
+thej-th largest singular value of A. Define Φ∗(A) := Φ rank( A)(A)andΨ∗(A) := Ψ rank( A)(A)as
+the left and right singular vectors of Acorresponding to non-zero singular values, respectively. Define
+the smallest positive singular value of Aasλ∗(A) =λrank( A)(A)and let Λ∗(A) = Λ rank( A)(A).
+For a deep learning model fine-tuned on ni.i.d. samples (x(i)
+i, y(i)
+i)⊂Rp×Rq, we say an event F
+occurs with high probability when P(F) = 1−exp 
+−Ω(log2(n+p+q))
+.
+17F.2 Setup
+We consider multivariate regression task. Using ni.i.d. samples (x(i)
+i, y(i)
+i)⊂Rp×Rqfrom
+in-distribution task, we fine-tune a pre-trained network fpre:Rp→Rqfor better prediction.
+Deep Linear Networks We consider deep linear networks of the form x7→WLWL−1. . . W 1x:
+Rd→Rp, where Wℓ∈Rdℓ×dℓ−1, with dL=qandd0=p. In comparison to multi-head
+attention transformers, each row of Wℓcan be viewed as corresponding to the parameters in a single
+head. Let fpre(x) =Wpre
+LWpre
+L−1. . . Wpre
+1x:Rp→Rqrepresent a pre-trained neural network.
+We denote Wpre
+ℓ:=Wpre
+LWpre
+L−1. . . Wpre
+ℓ∈RdL×dℓ−1as the weights up to the ℓ-th layer, and
+Wpre
+ℓ:=Wpre
+ℓWpre
+ℓ−1. . . Wpre
+1∈Rdℓ×d0as the weights above the ℓ-th layer, with the promise that
+Wpre
+0=I. Deep linear networks have been widely used to facilitate the theoretical analysis of
+modern complex deep neural networks [59, 30, 43, 22, 34, 5].
+Fine-Tuning We employ ℓ2distance as the error metric. Given a pre-trained network fpre, we fine-
+tune its ℓ-th layer by minimizing the empirical in-distribution risk R(i)
+n(f) := (1 /n)P
+i∈[n]∥y(i)
+i−
+f(x(i)
+i)∥2, where (x(i)
+i, y(i)
+i)⊂Rp×Rqareni.i.d. observations from in-distribution task. More
+specifically, we consider a class of rank- dadaptation defined as
+fℓ,U,V(x) :=Wpre
+ℓ+1(Wpre
+ℓ+UV⊤)Wpre
+ℓ−1x, (4)
+where U∈Rdℓ×dandV∈Rdℓ−1×dare parameters to fine-tune. Note that by regarding multiple
+consecutive layers as a single layer, our settings can be extended to multi-layer fine-tuning.
+We specifically compare two fine-tuning methods: LoRA and S2FT.
+•LoRA. For a fixed ℓ∈[L], and low-rankness level 1≤r≤min{dℓ, dℓ−1}, we train the low-
+rank matrices (U, V)in(4)by minimizing the empirical in-distribution risk via gradient descent.
+Motivated from the previous results that gradient descent has implicit regularization [ 77,19,5], we
+directly consider the minimum norm solutions:
+(ULoRA, VLoRA)∈arg min
+U,V∥(U, V)∥2
+Fs.t.(U, V)minimizes R(i)
+n(fℓ,U,V). (5)
+•S2FT.For a fixed ℓ∈[L], and a sparsity level s=⌊r·dℓ+dℓ−1
+dℓ−1⌋, we train only Vin(4)with the
+fixed choice of U←US2FT
+S:= [ea1;ea2;. . .;eas], which specifies schannels to fine-tune, where
+S={a1, a2, . . . , a s} ⊂[dℓ]. Here eais the standard basis vector with the a-th entry being 1. We
+minimize the empirical in-distribution risk via gradient descent. Similar to LoRA, we consider the
+following minimum norm solution:
+VS2FT= arg min
+V∥V∥2
+Fs.t.Vminimizes R(i)
+n(fℓ,US2FT
+S,V). (6)
+Data Generating Process As a simplification of the data generating process, we consider multiple
+linear regression. Assume that the in-distribution data (x(i), y(i))∈Rp+qand out-of-distribution data
+(x(o), y(o))∈Rp+qare generated according to
+y(k)=B(k)x(k)+ϵ(k), k∈ {i,o}, (7)
+where B(k)∈Rq×p, and ϵ(k)∈Rqis the error term satisfying E[ϵ(k)|x(k)] = 0 . Assume that
+Σ(k)
+ϵ:=E[ϵ(k)ϵ(k)⊤]∈Rq×qexists and E[x(k)] = 0 . The signal covariance matrix is denoted by
+Σ(k)
+x:=E[x(k)x(k)⊤]∈Rp×p.
+We define the in-distribution and out-of-distribution risks of f:Rp→Rqas:
+R(k)(f) =E[∥y(k)−f(x(k))∥], k∈ {i,o}.
+For notational brevity, we can write Wpre=Wpre
+L∈Rq×p. Let X(i):= (x(i)
+1, . . . , x(i)
+n)∈Rp×n,
+Y(i):= (y(i)
+1, . . . , y(i)
+n)∈Rq×n, and E(i)= (ϵ(i)
+1, . . . , ϵ(i)
+n) :=Y(i)−B(i)X(i)∈Rq×n. Denote the
+18in-distribution sample covariance matrices by ˆΣ(i)
+x:= (1 /n)X(i)X(i)⊤,ˆΣ(i)
+ϵ:= (1 /n)E(i)E(i)⊤,
+ˆΣ(i)
+x,ϵ:= (1 /n)X(i)E(i)⊤,ˆΣ(i)
+ϵ,x=ˆΣ(i)⊤
+x,ϵ. Define ˇΣ(k)
+x,ϵ= (X(i)⊤)†E(i)⊤,ˆA:= (Wpre
+ℓ−1ˆΣ(i)
+xWpre⊤
+ℓ−1)1/2,
+A:= (Wpre
+ℓ−1Σ(i)
+xWpre⊤
+ℓ−1)1/2,Φ′:= Φ ∗(Wpre
+ℓ+1),Φ′′
+S:= Φ ∗(Wpre
+ℓ+1US2FT
+S),D=B(i)−Wpre,
+ˆD:=B(i)−Wpre+ˇΣ(i)
+ϵ,x. Also define M:= Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†andˆM:= Φ′⊤ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†.
+LetˆΨ′:= Ψ∗(ˆA), and G(i,o)
+ℓ:= (Wpre
+ℓΣ(i)1/2
+x)†Wpre
+ℓΣ(o)1/2
+x be a matrix that captures the covariate
+shift at the ℓ-th layer.
+We consider fine-tuning the ℓ-th (ℓ∈[L]) layer of the pre-trained deep linear network fpre(x) =
+Wpre
+LWpre
+L−1. . . Wpre
+1xusing in-distribution observations (x(i)
+i, y(i)
+i)i∈[n].
+To measure the performance of models, we define the excess risks of ffor the task k∈ {i,o}as
+E(k)(f) :=E[∥y(k)−f(x(k))∥2]−inf
+f′E[∥y(k)−f′(x(k))∥2],
+where the infimum is taken over all square integrable functions.
+F.3 Assumptions
+We assume that Wpre
+ℓ−1Σ(i)
+xWpre⊤
+ℓ−1̸= 0, since otherwise Wpre
+ℓ−1x(i)= 0almost surely and fine-tuning
+theℓ-th layer does not improve the performance of the pre-trained model. Define the in-distribution
+prediction residuals for the pre-trained model fprebyΣ(i)
+f:=E[(B(i)x(i)−Wprex(i))(B(i)x(i)−
+Wprex(i))⊤]. Note that E(i)(fpre) = tr
+Σ(i)
+f
+. We also assume that ∥Σ(i)
+f∥op>0, since otherwise
+E(i)(fpre) =∥Σ(i)
+f∥2
+F= 0and there is no room for improvement from the pre-trained model.
+Next, we introduce several assumptions.
+Assumption F.1 (Sub-Gaussianity) .Assume that there exist some constants c1, c2∈(0,∞)such
+that(x(i), ϵ(i))in the model 7 satisfies
+γ⊤Σ(i)
+xγ≥c1∥γ⊤x(i)∥2
+ψ2,and γ′⊤Σ(i)
+ϵγ′≥c2∥γ′⊤ϵ(i)∥2
+ψ2,
+for any γ∈Rpandγ′∈Rq, where ∥y∥ψ2is the sub-Gaussian norm defined as
+∥y∥ψ2:= inf{υ >0 :E[exp 
+y2/υ2
+]≤2}
+for a random variable ytaking values in R.
+Assumption F.2 (Sufficiently Many Observations) .Assume that
+n≫(κ4
+∗(A)re(A2) +κ2
+∗(Σ(i)
+x)re(Σ(i)
+x) +re(DΣ(i)
+xD⊤)) log2(n+p+q),
+n≫∥Σ(i)
+ϵ∥op
+∥DΣ(i)
+xD⊤∥op(re(Σ(i)
+ϵ) +re(A2)) log2(n+p+q),
+and
+n≫κ4
+∗(Σ(i)
+x)re(Σ(i)
+x)(re(Σ(i)
+ϵ) +re(Σ(i)
+x))
+re(A2)log2(n+p+q).
+Assumption F.3 (Eigengap Condition) .Assume that there exists some constant Cg>0such that
+λs(Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†)
+λs(Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†)−λs+1(Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†)≲Cg
+holds.
+Assumption F.3 is necessary to identify the rank- rapproximation of M, which is used to derive the
+risk of LoRA.
+Assumption F.4 (Approximate Sparsity of Channels) .Assume that there exists some S0⊂[dℓ]with
+|S0| ≤sandδ >0such that
+X
+a∈[dℓ]\S0∥e⊤
+a(Wpre
+ℓ+1)†(B(i)−Wpre)Σ(i)1/2
+x∥2≤δ2∥(Wpre
+ℓ+1)†(B(i)−Wpre)Σ(i)1/2
+x∥2
+F
+holds.
+19Assumption F.5 (Distribution Shift) .Assume that Σ(i)
+x= Σ(o)
+x= Σ xfor some Σx∈Rd×dand that
+∥Φ⊤
+∗(Wpre
+ℓ+1US2FT
+S)(B(o)−B(i))Σ1/2
+x∥2
+F≤ε2E(o)(fpre)for some ε >0.
+Assumption F.6 (Condition Number) .Assume that κ∗(M)≲1,κ∗(Wpre
+ℓ+1)≲1,κ∗(Σ(i)
+f)≲1and
+κ∗(Wpre
+ℓ−1Σ(i)
+xWpre⊤
+ℓ−1)≲1.
+Note that Assumption F.6 is not essential to our analysis.
+F.4 Main Results
+We first demonstrate that LoRA and S2FT exhibit comparable memorization abilities. Next, we
+present a formal restatement of 4.2 that combine Theorems F.10, F.11, F.13, F.15, and Lemma F.14.
+Theorem F.7. Suppose that Assumptions F .1, F .2, F .3, F .4, and F .6 hold. Choose Ssuch that S⊃S0
+holds. Let ULoRA, VLoRAbe the LoRA adaptation matrices defined in (5). Let VS2FTbe the S2FT
+adaptation matrices given US2FT
+S defined in (6). Then, for all sufficiently large n, the following holds
+with probability 1−exp 
+−Ω(log2(n+p+q))
+: for any η >0,
+E(i)(fℓ,US2FT
+S,VS2FT)≤(1 +η)(TS2FT
+bias)2+ (1 + η−1)(TS2FT
+variance )2,
+E(i)(fℓ,ULoRA,VLoRA)≤(1 +η)(TLoRA
+bias)2+ (1 + η−1)(TLoRA
+variance )2,
+where
+0≤(TLoRA
+bias)2− E(i)(ffull
+ℓ)≃(TS2FT
+bias)2− E(i)(ffull
+ℓ)≲δ2E(i)(fpre),
+(TS2FT
+variance )2≲(∥Σ(i)
+ϵ∥op+∥Σ(i)
+f∥op)sdℓ−1log2(n+p+q)
+n,
+(TLoRA
+variance )2≲(∥Σ(i)
+ϵ∥op+∥Σ(i)
+f∥op)r(dℓ+dℓ−1) log2(n+p+q)
+n.
+Theorem F.8 (Restatement of Theorem 4.2) .Consider the limit n→ ∞ . Suppose that Assumption F .5
+holds. Let ULoRA, VLoRAbe the LoRA adaptation matrices defined in (15). Let VS2FTbe the
+S2FT adaptation matrices given US2FT
+S defined in (25). IfB(i)=Wpre
+ℓ+1˜BWpre
+ℓ−1holds for some
+˜B(i)∈Rdℓ×dℓ−1, and s, r≤rank(Σ(i)
+f), then,
+E(o)(fℓ,US2FT
+S,VS2FT)≤(1 + 3 ε2)E(o)(fpre),
+E(o)(fℓ,ULoRA,VLoRA)≥ ∥(B(o)−B(i))Σ1/2
+x∥2
+F.
+Intuition of the proof of Theorem F .8. LoRA forgets pre-trained tasks due to its model complexity.
+Consider the simplest low-rank adaptation to a single-layer linear network:
+∆1∈arg min
+∆′
+1∈Rd1×d0
+rank(∆′
+1)=rE[∥y(i)−(Wpre
+1+ ∆′
+1)x(i)∥2].
+Assume that Σ(i)
+x=I, then we can show that the solution is ∆1=SVD r(B(i)−Wpre
+1). Under the
+condition that the rank of B(i)−Wpre
+1is smaller than, or comparable to r, LoRA fine-tuned model can
+learn the in-distribution best regressor in ℓ2sense, since (Wpre
+1+ ∆ 1)x≈B(i)x=E[y(i)|x(i)=x].
+Hence it makes LoRA fine-tuned model vulunerable to distribution shift.
+On the other hand, we model S2FT as fine-tuning only a few channels:
+∆1∈ arg min
+∆′
+1=P
+a∈Seav⊤
+a,va∈Rd0E[∥y(i)−(Wpre
+1+ ∆′
+1)x(i)∥2].
+Although S2FT is a special case of LoRA, the constraint on the direction of low-rank matrix prevents
+overfitting to the in-distribution task. To see this, note that a sparse fine-tuned model can be written as
+(Wpre
+1+ ∆ 1)x=Wpre
+1x+X
+a∈Seae⊤
+a(B(i)−Wpre
+1)x=X
+a∈Sceae⊤
+aWpre
+1x+X
+a∈Seae⊤
+aB(i)x,
+where S⊂[d1]is a set of channels with cardinality s. Since S2FT keeps most of parameters from
+the pre-trained model, except for rows specified by S, the model forget less pre-training tasks.
+20F.5 Proofs for LoRA
+F.5.1 Excess Risk of LoRA
+Lemma F.9 (Excess Risk) .Consider the minimum norm solution
+(ULoRA, VLoRA)∈ arg min
+(U,V)∈Rdℓ×r×Rdℓ−1×r∥(U, V)∥2
+Fs.t.(U, V)minimizes R(i)
+n(fℓ,U,V).
+Then, the low-rank adaptation matrix satisfies
+ULoRAVLoRA⊤= (Wpre
+ℓ+1)†SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†)ˆA†,
+and
+E(k)(fℓ,ULoRA,VLoRA) = tr
+B(k)−Wpre−SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†)ˆA†Wpre
+ℓ−1
+Σ(k)
+x
+·
+B(k)−Wpre−SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†)ˆA†Wpre
+ℓ−1⊤
+fork∈ {i,o}.
+Proof of Lemma F .9. The empirical risk of fℓ,U,V for the in-distribution task can be written as
+R(i)
+n(fℓ,U,V) =1
+nX
+i∈[n]∥(B(i)−Wpre)x(i)
+i+ϵ(i)
+i−Wpre
+ℓ+1UV⊤Wpre
+ℓ−1x(i)
+i∥2
+= tr
+(B(i)−Wpre−Wpre
+ℓ+1UV⊤Wpre
+ℓ−1)ˆΣ(i)
+x(B(i)−Wpre−Wpre
+ℓ+1UV⊤Wpre
+ℓ−1)⊤
++ 2 tr
+(B(i)−Wpre−Wpre
+ℓ+1UV⊤Wpre
+ℓ−1)ˆΣ(i)
+x,ϵ
++ tr
+ˆΣ(i)
+ϵ
+= tr
+V⊤Wpre
+ℓ−1ˆΣ(i)
+xWpre⊤
+ℓ−1V U⊤Wpre⊤
+ℓ+1Wpre
+ℓ+1U
+−2 tr
+Wpre
+ℓ+1UV⊤Wpre
+ℓ−1n
+ˆΣ(i)
+x(B(i)−Wpre)⊤+ˆΣ(i)
+x,ϵo
++ tr
+(B(i)−Wpre)ˆΣ(i)
+x(B(i)−Wpre)⊤
++ 2 tr
+(B(i)−Wpre)ˆΣ(i)
+x,ϵ
++ tr
+ˆΣ(i)
+ϵ
+.
+(8)
+Since ˆΣ(i)
+x,ϵ=ˆΣ(i)
+x(X(i)⊤)†E(i)⊤=ˆΣ(i)
+xˇΣ(i)
+x,ϵ,
+R(i)
+n(fℓ,U,V) = tr
+ˆAV U⊤Wpre⊤
+ℓ+1Wpre
+ℓ+1UV⊤ˆA
+−2 tr
+Wpre
+ℓ+1UV⊤ˆAˆA†Wpre
+ℓ−1ˆΣ(i)
+xˆD⊤
+−2 tr
+Wpre
+ℓ+1UV⊤(I−ˆAˆA†)Wpre
+ℓ−1ˆΣ(i)
+xˆD⊤
++ tr
+DˆΣ(i)
+xD⊤
++ 2 tr
+DˆΣ(i)
+x,ϵ
++ tr
+ˆΣ(i)
+ϵ
+=∥Wpre
+ℓ+1UV⊤ˆA−ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†∥2
+F− ∥ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†∥2
+F
++ tr
+DˆΣ(i)
+xD⊤
++ 2 tr
+DˆΣ(i)
+x,ϵ
++ tr
+ˆΣ(i)
+ϵ
+, (9)
+where we used (I−ˆAˆA†)Wpre
+ℓ−1ˆΣ(i)1/2
+x = 0. From (9), minimizing R(i)
+n(fℓ,U,V)is equivalent to
+minimizing the norm:
+∥Wpre
+ℓ+1UV⊤ˆA−ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†∥2
+F=∥Wpre
+ℓ+1UV⊤ˆA−Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†∥2
+F
++∥(I−Wpre
+ℓ+1(Wpre
+ℓ+1)†)ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†∥2
+F.
+This is minimized by (U′, V′)satisfying
+U′V′⊤= (Wpre
+ℓ+1)†SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†)ˆA†
++ (I−(Wpre
+ℓ+1)†Wpre
+ℓ+1)A1+A2(I−ˆΨ′ˆΨ′⊤), (10)
+21where A1, A2∈Rdℓ×dℓ−1are arbitrary matrices. Since we particularly consider the minimum norm
+solution, we must have A1= 0andA2= 0. Hence
+Wpre
+ℓ+1ULoRAVLoRA⊤Wpre
+ℓ−1=SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†)ˆA†Wpre
+ℓ−1.
+Therefore, the excess risk for k∈ {i,o}becomes
+E(k)(fℓ,ULoRA,VLoRA) =E
+B(k)x(k)−Wpre
+ℓ+1(Wpre
+ℓ+ULoRAVLoRA⊤)Wpre
+ℓ−1x(k)2
+= tr
+B(k)−Wpre−SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†)ˆA†Wpre
+ℓ−1
+Σ(k)
+x
+·
+B(k)−Wpre−SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†)ˆA†Wpre
+ℓ−1⊤
+.
+This concludes the proof.
+F.5.2 In-distribution Excess Risk of LoRA
+LetE(i)(ffull
+ℓ)denote the excess risk of fpreafter fine-tuning all the parameters of the ℓ-th layer under
+population in-distribution risk.
+Theorem F.10 (Restatement of Theorem F.7: LoRA Part) .Suppose that Assumptions F .1, F .2 and
+F .3 hold. Then, the following holds with probability 1−exp 
+−Ω(log2(n+p+q))
+. For any η >0,
+E(i)(fℓ,ULoRA,VLoRA)≤(1 +η)(TLoRA
+bias)2+ (1 + η−1)(TLoRA
+variance )2,
+where
+(TLoRA
+bias)2≤0∨(rank( DΣ(i)
+xD⊤)−r)
+rank( DΣ(i)
+xD⊤)κ2
+∗(DΣ(i)
+xD⊤)E(i)(fpre) +E(i)(ffull
+ℓ), (11)
+(TLoRA
+variance )2≲C2κ4
+∗(M)∥Σ(i)
+ϵ∥opκ2
+∗(A)r(re(Φ′⊤Σ(i)
+ϵΦ′) +re(A2)) log2(n+p+q)
+n
++C2κ4
+∗(M)∥DΣ(i)
+xD⊤∥opr(κ2
+∗(A)re(Φ′⊤DΣ(i)
+xD⊤Φ′) +κ6
+∗(A)re(A2)) log2(n+p+q)
+n.
+Note that the first term on the right hand side of (11) depends on the rank of residual matrix
+Σ(i)
+f=DΣ(i)
+xD⊤. It becomes zero when rank(Σ(i)
+f)≤rand small when r/rank(Σ(i)
+f)≈1.
+Proof of Theorem F .10. LetWLoRA
+ℓ:=Wpre
+ℓ+1ULoRAVLoRA⊤. From Lemma F.9, we have
+E(i)(fℓ,ULoRA,VLoRA) = tr
+(D−WLoRA
+ℓWpre
+ℓ−1)Σ(i)
+x(D−WLoRA
+ℓWpre
+ℓ−1)⊤
+=∥(WLoRA
+ℓAA†Wpre
+ℓ−1−D)Σ(i)1/2
+x∥2
+F,
+where we used (I−AA†)Wpre
+ℓ−1Σ(i)1/2
+x = 0. From Lemma F.9
+WLoRA
+ℓA=SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†)ˆA†A.
+This gives
+∥(WLoRA
+ℓAA†Wpre
+ℓ−1−D)Σ(i)1/2
+x∥F≤ ∥(WLoRA
+ℓA−SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†DΣ(i)
+xWpre⊤
+ℓ−1A†))A†Wpre
+ℓ−1Σ(i)1/2
+x∥F
++∥SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†DΣ(i)
+xWpre⊤
+ℓ−1A†)A†Wpre
+ℓ−1Σ(i)1/2
+x−DΣ(i)1/2
+x∥F
+=:TLoRA
+variance +TLoRA
+bias.
+We bound TLoRA
+variance andTLoRA
+bias separately.
+For the term TLoRA
+variance , since A†Wpre
+ℓ−1Σ(i)
+xWpre⊤
+ℓ−1A†=A†A2A†,
+TLoRA
+variance =∥SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†)ˆA†A−SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†DΣ(i)
+xWpre⊤
+ℓ−1A†)A†A∥F.
+22Therefore,
+TLoRA
+variance ≤ ∥SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†DΣ(i)
+xWpre⊤
+ℓ−1A†)A†A−SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†)A†A∥F
++∥SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†)(ˆA†A−A†A)∥F
+=:TLoRA
+variance ,1+TLoRA
+variance ,2,
+We first bound TLoRA
+variance ,1. From Lemma G.1 and Assumption F.3, we have
+TLoRA
+variance ,1≤ ∥SVD r(ˆM)−SVD r(M)∥F
+≤κ2
+∗(M)λr(M)
+λr(M)−λr+1(M)√r∥ˆM−M∥op
+≤κ2
+∗(M)C√r∥ˆM−M∥op,
+where ˆM=Wpre
+ℓ+1(Wpre
+ℓ+1)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†andM=Wpre
+ℓ+1(Wpre
+ℓ+1)†DΣ(i)
+xWpre⊤
+ℓ−1A†. From
+Lemma G.3,
+∥ˆM−M∥op≤ ∥Φ′⊤ˆDˆΣ(i)
+xWpre⊤
+ℓ−1−Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1∥op∥ˆA†∥op
++∥DΣ(i)
+xWpre⊤
+ℓ−1∥op∥ˆA†−A†∥op
+≲∥Σ(i)
+ϵ∥1/2
+opκ∗(A)s
+(re(Φ′⊤Σ(i)
+ϵΦ′) +re(A2)) log2(n+p+q)
+n
++∥DΣ(i)
+xD⊤∥1/2
+opκ∗(A)s
+(re(Φ′⊤DΣ(i)
+xD⊤Φ′) +re(A2)) log2(n+p+q)
+n
++∥DΣ(i)
+xWpre⊤
+ℓ−1∥opκ∗(A)
+λ∗(A)s
+re(A2) log2(n+p+q)
+n
+≲∥Σ(i)
+ϵ∥1/2
+opκ∗(A)s
+(re(Φ′⊤Σ(i)
+ϵΦ′) +re(A2)) log2(n+p+q)
+n
++∥DΣ(i)
+xD⊤∥1/2
+ops
+(κ2∗(A)re(Φ′⊤DΣ(i)
+xD⊤Φ′) +κ4∗(A)re(A2)) log2(n+p+q)
+n
+holds on the event F, where we used ∥DΣ(i)
+xWpre⊤
+ℓ−1∥op≤ ∥DΣ(i)1/2
+x∥op∥A∥op. Hence
+TLoRA
+variance ,1≲Cgκ2
+∗(M)∥Σ(i)
+ϵ∥1/2
+opκ∗(A)s
+r(re(Φ′⊤Σ(i)
+ϵΦ′) +re(A2)) log2(n+p+q)
+n
++Cgκ2
+∗(M)∥DΣ(i)
+xD⊤∥1/2
+ops
+r(κ2∗(A)re(Φ′⊤DΣ(i)
+xD⊤Φ′) +κ4∗(A)re(A2)) log2(n+p+q)
+n.
+Next we bound TLoRA
+variance ,2. Again from Lemma G.3,
+TLoRA
+variance ,2≤√r∥ˆDˆΣ(i)
+xWpre⊤
+ℓ−1∥op∥ˆA†∥op∥ˆA†−A†∥op∥A∥op
+≲∥DΣ(i)1/2
+x∥op∥Σ(i)1/2
+xWpre⊤
+ℓ−1∥opκ2
+∗(A)
+λ∗(A)s
+r·re(A2) log2(n+p+q)
+n
+=∥DΣ(i)1/2
+x∥opκ3
+∗(A)s
+r·re(A2) log2(n+p+q)
+n
+holds on the event F. Therefore,
+TLoRA
+variance≲Cgκ2
+∗(M)∥Σ(i)
+ϵ∥1/2
+opκ∗(A)s
+r(re(Φ′⊤Σ(i)
+ϵΦ′) +re(A2)) log2(n+p+q)
+n
++Cgκ2
+∗(M)∥DΣ(i)
+xD⊤∥1/2
+ops
+r(κ2∗(A)re(Φ′⊤DΣ(i)
+xD⊤Φ′) +κ6∗(A)re(A2)) log2(n+p+q)
+n
+(12)
+23hold with high probability.
+Bound TLoRA
+bias .Note that
+(TLoRA
+bias)2=∥SVD r(M)A†Wpre
+ℓ−1Σ(i)1/2
+x−DΣ(i)1/2
+x∥2
+F
+=∥SVD r(M)A†Wpre
+ℓ−1Σ(i)1/2
+x−Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x| {z }
+=:T1∥2
+F
++∥DΣ(i)1/2
+x(I−Σ(i)1/2
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x)
+| {z }
+=:T2∥2
+F
++∥(I−Φ′Φ′⊤)DΣ(i)
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x| {z }
+=:T3∥2
+F
+where the second equality follows from the fact that cross terms are zero, i.e.,
+tr 
+T1T⊤
+2
+= tr 
+T2T⊤
+3
+= tr 
+T3T⊤
+1
+= 0 since Ψ∗(Wpre
+ℓ−1Σ(i)1/2
+x)Ψ⊤
+∗(Wpre
+ℓ−1Σ(i)1/2
+x) =
+Σ(i)1/2
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x and
+(I−Φ′Φ′⊤)Φ∗(SVD r(M)) = 0 , Wpre
+ℓ−1Σ(i)1/2
+x(I−Ψ∗(Wpre
+ℓ−1Σ(i)1/2
+x)Ψ⊤
+∗(Wpre
+ℓ−1Σ(i)1/2
+x)) = 0
+hold. Thus from Lemma F.17,
+(TLoRA
+bias)2=∥SVD r(Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†)−Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+F+E(i)(ffull
+ℓ). (13)
+Notice that
+∥SVD r(Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†)−Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+F
+≤ {0∨(rank(Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†)−r)}∥Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+op
+≤ {0∨(rank(Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†)−r)}∥DΣ(i)1/2
+x∥2
+op
+≤0∨(rank( DΣ(i)
+xD⊤)−r)
+rank( DΣ(i)1/2
+x)κ2
+∗(DΣ(i)
+xD⊤)E(i)(fpre), (14)
+where the last inequality follows since
+∥DΣ(i)1/2
+x∥2
+F=∥Λ∗(DΣ(i)1/2
+x)∥2
+F≥rank( DΣ(i)1/2
+x)λ2
+∗(DΣ(i)1/2
+x) =rank( DΣ(i)1/2
+x)
+κ2∗(DΣ(i)1/2
+x)∥DΣ(i)1/2
+x∥2
+op.
+Summary Note that for any η >0,(TLoRA
+variance +TLoRA
+bias)2≤(1 +η)(TLoRA
+bias)2+ (1 + 1 /η)(TLoRA
+variance )2
+holds. Therefore,
+E(i)(fℓ,ULoRA,VLoRA)≤(1 +η)(TLoRA
+bias)2+ (1 + η−1)(TLoRA
+variance )2.
+Combined with (12), (13), and (14), this concludes the proof.
+F.5.3 Out-of-distribution Excess Risk of LoRA
+We define the low-rank matrix obtained by LoRA under population in-distribution risk as
+(ULoRA
+∞, VLoRA
+∞)∈arg min
+U,V∥(U, V)∥2
+Fs.t.(U, V)minimizes R(i)(fℓ,U,V). (15)
+Theorem F.11 (Restatement of Theorem F.8: LoRA Part) .For(ULoRA
+∞, VLoRA
+∞), defined in (15)
+E(o)(fℓ,ULoRA∞,VLoRA∞)≲∥(I−Φ′Φ′⊤)B(o)Σ(o)1/2
+x∥2
+F+∥(B(o)−B(i))Σ(i)1/2
+x∥2
+F∥G(i,o)
+ℓ−1∥2
+op
++∥(B(o)−Wpre)(Σ(o)1/2
+x−Σ(i)1/2
+xG(i,o)
+ℓ−1)∥F
++0∨(rank( DΣ(i)
+xD⊤)−r)
+rank( DΣ(i)
+xD⊤)κ2
+∗(DΣ(i)
+xD⊤)∥G(i,o)
+ℓ−1∥2
+opE(i)(fpre).
+24Furthermore, for any η∈(0,1),
+E(o)(fℓ,ULoRA∞,VLoRA∞)≥(1−η)(B(o)−B(i))Σ(o)1/2
+x2
+F−3(η−1−1)∥(I−Φ′Φ′⊤)B(i)Σ(o)1/2
+x∥2
+F
+−3(η−1−1)∥(B(i)−Wpre)(Σ(o)1/2
+x−Σ(i)1/2
+xG(i,o)
+ℓ−1)∥2
+F
+−3(η−1−1)0∨(rank( DΣ(i)
+xD⊤)−r)
+rank( DΣ(i)
+xD)κ2
+∗(DΣ(i)
+xD⊤)∥G(i,o)
+ℓ−1∥opE(i)(fpre).
+(16)
+Proof of Theorem F .11. With a slight modification to the proof of Lemma F.9, it follows that
+E(o)(fℓ,ULoRA∞,VLoRA∞) = tr
+B(o)−Wpre−SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†DΣ(i)
+xWpre⊤
+ℓ−1A†)A†Wpre
+ℓ−1
+Σ(o)
+x
+·
+B(o)−Wpre−SVD r(Wpre
+ℓ+1(Wpre
+ℓ+1)†DΣ(i)
+xWpre⊤
+ℓ−1A†)A†Wpre
+ℓ−1⊤
+=(B(o)−Wpre)Σ(o)1/2
+x−SVD r(Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†)A†Wpre
+ℓ−1Σ(o)1/2
+x2
+F.
+(17)
+Recall that M:= Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†. Then,
+(B(o)−Wpre)Σ(o)1/2
+x−SVD r(Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†)A†Wpre
+ℓ−1Σ(o)1/2
+x
+F
+≤(B(o)−Wpre)Σ(o)1/2
+x−Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(o)1/2
+x
+F
++∥MA†Wpre
+ℓ−1Σ(o)1/2
+x−SVD r(M)A†Wpre
+ℓ−1Σ(o)1/2
+x∥F
+=(B(o)−Wpre)Σ(o)1/2
+x−Φ′Φ′⊤DΣ(i)1/2
+x(Wpre
+ℓ−1Σ(i)1/2
+x)†Wpre
+ℓ−1Σ(o)1/2
+x
+F
++∥MA†Wpre
+ℓ−1Σ(o)1/2
+x−SVD r(M)A†Wpre
+ℓ−1Σ(o)1/2
+x∥F
+≤ ∥(I−Φ′Φ′⊤)B(o)Σ(o)1/2
+x∥F+∥Φ′Φ′⊤(B(o)−B(i))Σ(i)1/2
+xG(i,o)
+ℓ−1∥F
++∥Φ′Φ′⊤(B(o)−Wpre)(Σ(o)1/2
+x−Σ(i)1/2
+xG(i,o)
+ℓ−1)∥F
++∥MA†Wpre
+ℓ−1Σ(o)1/2
+x−SVD r(M)A†Wpre
+ℓ−1Σ(o)1/2
+x∥F
+≤ ∥(I−Φ′Φ′⊤)B(o)Σ(o)1/2
+x∥F+∥(B(o)−B(i))Σ(i)1/2
+x∥F∥G(i,o)
+ℓ−1∥op
++∥(B(o)−Wpre)(Σ(o)1/2
+x−Σ(i)1/2
+xG(i,o)
+ℓ−1)∥F+∥M−SVD r(M)∥F∥A†Wpre
+ℓ−1Σ(o)1/2
+x∥op,
+where we used Φ′Φ′⊤Wpre=Wpre. From (14), we have
+{E(o)(fℓ,ULoRA∞,VLoRA∞)}1/2≤ ∥(I−Φ′Φ′⊤)B(o)Σ(o)1/2
+x∥F+∥(B(o)−B(i))Σ(i)1/2
+x∥F∥G(i,o)
+ℓ−1∥op
++∥(B(o)−Wpre)(Σ(o)1/2
+x−Σ(i)1/2
+xG(i,o)
+ℓ−1)∥F
++∥G(i,o)
+ℓ−1∥opκ∗(DΣ(i)
+xD⊤)vuut0∨(rank( DΣ(i)
+xD⊤)−r)
+rank( DΣ(i)1/2
+x)E(i)(fpre),
+where we used ∥A†Wpre
+ℓ−1Σ(o)1/2
+x∥op=∥G(i,o)
+ℓ−1∥op. This gives the first claim.
+25Using 2 tr 
+AB⊤
+≥ −η∥A∥2
+F−(1/η)∥B∥2
+Ffor any η >0and any matrices A, B of the same shape,
+(17) can be rewritten as
+E(o)(fℓ,ULoRA∞,VLoRA∞) =(B(o)−B(i))Σ(o)1/2
+x + (I−Φ′Φ′⊤)(B(i)−Wpre)Σ(o)1/2
+x| {z }
+=:T1
++ Φ′Φ′⊤(B(i)−Wpre)(Σ(o)1/2
+x−Σ(i)1/2
+xG(i,o)
+ℓ−1)
+| {z }
+=:T2
++MA†Wpre
+ℓ−1Σ(o)1/2
+x−SVD r(M)A†Wpre
+ℓ−1Σ(o)1/2
+x| {z }
+=:T32
+F
+=(B(o)−B(i))Σ(o)1/2
+x2
+F+ 2 tr
+(B(o)−B(i))Σ(o)1/2
+x (T1+T2+T3)⊤
++∥T1+T2+T3∥2
+F
+≥(1−η)(B(o)−B(i))Σ(o)1/2
+x2
+F+ (1−η−1)∥T1+T2+T3∥2
+F. (18)
+Choose η∈(0,1). By a similar argument as above, and using Φ′Φ′⊤Wpre=Wpre, we can show that
+∥T1+T2+T3∥2
+F≤3∥T1∥2
+F+ 3∥T2∥2
+F+ 3∥T3∥2
+F
+≤3∥(I−Φ′Φ′⊤)B(i)Σ(o)1/2
+x∥2
+F+ 3∥(B(i)−Wpre)(Σ(o)1/2
+x−Σ(i)1/2
+xG(i,o)
+ℓ−1)∥2
+F
++ 30∨(rank( DΣ(i)
+xD⊤)−r)
+rank( DΣ(i)1/2
+x)κ2
+∗(DΣ(i)
+xD⊤)∥G(i,o)
+ℓ−1∥opE(i)(fpre),
+where we used (14) again. This concludes the proof.
+F.6 Proofs for Structured Sparse Fine-tuning
+F.6.1 Excess Risk of Structured Sparse Fine-tuning
+Lemma F.12 (Excess Risk) .Given S⊂[dℓ], consider the minimum norm solution
+VS2FT∈arg min
+V∈Rdℓ−1×s∥V∥2
+Fs.t.Vminimizes R(i)
+n(fℓ,US2FT
+S,V).
+Then, the structured sparse adaptation matrix satisfies
+US2FT
+SVS2FT⊤=US2FT
+S(Wpre
+ℓ+1US2FT
+S)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1(ˆA†)2, (19)
+and
+E(k)(fℓ,US2FT
+S,VS2FT) = tr
+B(k)−Wpre−Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1(ˆA†)2Wpre
+ℓ−1
+Σ(k)
+x
+·
+B(k)−Wpre−Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1(ˆA†)2Wpre
+ℓ−1⊤
+fork∈ {i,o}.
+Proof. Since ˆΣ(k)
+x,ϵ= (1 /n)X(k)E(k)⊤and ˆΣ(k)
+x= (1 /n)X(k)X(k)⊤, we have ˆΣ(k)
+x,ϵ=
+ˆΣ(k)
+x(X(k)⊤)†E(k)⊤=:ˆΣ(k)
+xˇΣ(k)
+x,ϵ. Similar to (9), we have
+R(i)
+n(fℓ,US2FT
+S,V) =∥Wpre
+ℓ+1US2FT
+SV⊤ˆA−ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†∥2
+F− ∥ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†∥2
+F
++ tr
+DˆΣ(i)
+xD⊤
++ 2 tr
+DˆΣ(i)
+x,ϵ
++ tr
+ˆΣ(i)
+ϵ
+.
+Thus minimizing R(i)
+n(fℓ,US2FT
+S,V)is equivalent to minimizing the norm
+∥Wpre
+ℓ+1US2FT
+SV⊤ˆA−ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†∥2
+F (20)
+=∥Wpre
+ℓ+1US2FT
+SV⊤ˆA−Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†∥2
+F
++∥(I−(Wpre
+ℓ+1US2FT
+S)(Wpre
+ℓ+1US2FT
+S)†)ˆDˆΣ(i)
+xWpre⊤
+ℓ−1ˆA†∥2
+F.
+26Using the same argument as in the proof of Lemma F.9, the minimum norm solution VS2FTis obtained
+by
+VS2FT= (ˆA†)2Wpre
+ℓ−1ˆΣ(i)
+xˆD⊤(US2FT⊤
+S Wpre⊤
+ℓ+1)†.
+The excess risk for k∈ {i,o}becomes
+E(k)(fℓ,US2FT
+S,VS2FT) =E
+B(k)x(k)−Wpre
+ℓ+1(Wpre
+ℓ+US2FT
+SVS2FT⊤)Wpre
+ℓ−1x(k)2
+= tr
+B(k)−Wpre−Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1(ˆA†)2Wpre
+ℓ−1
+Σ(k)
+x
+·
+B(k)−Wpre−Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1(ˆA†)2Wpre
+ℓ−1⊤
+.
+This concludes the proof.
+F.6.2 In-distribution Excess Risk of Structured Sparse Fine-tuning
+Theorem F.13 (Restatement of Theorem F.7: S2FT Part) .Suppose that Assumptions F .1 and F .2 hold.
+FixS⊂[dℓ]with|S|=s. Then, the following holds with probability 1−exp 
+−Ω(log2(n+p+q))
+.
+For any η >0,
+E(i)(fℓ,US2FT
+S,VS2FT)≤(1 +η)(TS2FT
+bias)2+ (1 + η−1)(TS2FT
+variance )2,
+where
+(TS2FT
+bias)2≤ ∥(Φ′Φ′⊤−Φ′′
+SΦ′′⊤
+S)Φ∗(DΣ(i)1/2
+x)∥2
+opE(i)(fpre
+ℓ) +E(i)(ffull
+ℓ), (21)
+(TS2FT
+variance )2≲∥Σ(i)
+ϵ∥opκ2
+∗(A)s(re(Φ′′⊤
+SΣ(i)
+ϵΦ′′
+S) +re(A2)) log2(n+p+q)
+n
++∥DΣ(i)
+xD⊤∥ops(κ2
+∗(A)re(Φ′′⊤
+SDΣ(i)
+xD⊤Φ′′
+S) +κ8
+∗(A)re(A2)) log2(n+p+q)
+n.
+Note that the term ∥(Φ′Φ′⊤−Φ′′
+SΦ′′⊤
+S)Φ∗(DΣ(i)1/2
+x)∥opin(21) measures the distance between
+subspaces spanned by Φ′andΦ′′
+Sin a label space, weighted by Φ∗(Σ(i)
+f). In high level, this quantity
+shows the closeness between the ℓ-th layer full fine-tuning and S2FT. It takes small values when the
+important channels for residual prediction are sparsely distributed among all channels. This aligns
+with the intuition that S2FT only selectively fine-tunes small number of coordinates, and thus relying
+on the information contained in those coordinates.
+Proof of Theorem F .13. Using the same argument as in the proof of Theorem F.10 combined with
+Lemma F.12, we have
+E(i)(fℓ,US2FT
+S,VS2FT) =∥(Wpre
+ℓ+1US2FT
+SVS2FT⊤AA†Wpre
+ℓ−1−D)Σ(i)1/2
+x∥2
+F,
+and
+∥(Wpre
+ℓ+1US2FT
+SVS2FT⊤AA†Wpre
+ℓ−1−D)Σ(i)1/2
+x∥F
+≤ ∥Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†(ˆDˆΣ(i)
+xWpre⊤
+ℓ−1(ˆA2)†−DΣ(i)
+xWpre⊤
+ℓ−1(A2)†)A∥F
++∥Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†DΣ(i)
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x−DΣ(i)1/2
+x∥F
+=:TS2FT
+variance +TS2FT
+bias.
+We bound TS2FT
+variance andTS2FT
+bias separately.
+27Bound TS2FT
+variance .Note that
+TS2FT
+variance =∥Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1(ˆA†)2A−Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†DΣ(i)
+xWpre⊤
+ℓ−1A†∥F
+≤ ∥Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†DΣ(i)
+xWpre⊤
+ℓ−1A†−Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1A†∥F
++∥Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†ˆDˆΣ(i)
+xWpre⊤
+ℓ−1((ˆA†)2−(A†)2)A∥F
+=:TS2FT
+variance ,1+TS2FT
+variance ,2.
+For the term TS2FT
+variance ,1, using Lemma G.3,
+TS2FT
+variance ,1≤2√s∥Φ′′⊤
+SDΣ(i)
+xWpre⊤
+ℓ−1−Φ′′⊤
+SˆDˆΣ(i)
+xWpre⊤
+ℓ−1∥op∥A†∥op
+≲∥Σ(i)
+ϵ∥1/2
+opκ∗(A)s
+s(re(Φ′′⊤
+SΣ(i)
+ϵΦ′′
+S) +re(A2)) log2(n+p+q)
+n
++∥DΣ(i)
+xD⊤∥1/2
+opκ∗(A)s
+s(re(Φ′′⊤
+SDΣ(i)
+xD⊤Φ′′
+S) +re(A2)) log2(n+p+q)
+n
+holds on the event F, where the first inequality follows since the term inside the norm is at most
+rank-2s. Again from Lemma G.3,
+TS2FT
+variance ,2≤√s∥Φ′′⊤
+SˆDˆΣ(i)
+xWpre⊤
+ℓ−1∥op∥(ˆA†)2−(A†)2∥op∥A∥op
+≲∥DΣ(i)1/2
+x∥op∥Σ(i)1/2
+xWpre⊤
+ℓ−1∥opκ3
+∗(A)
+λ∗(A)s
+sre(A2) log2(n+d+p)
+n
+=∥DΣ(i)1/2
+x∥opκ4
+∗(A)s
+sre(A2) log2(n+d+p)
+n
+holds on the event F. Therefore,
+TS2FT
+variance≲∥Σ(i)
+ϵ∥1/2
+opκ∗(A)s
+s(re(Φ′′⊤
+SΣ(i)
+ϵΦ′′
+S) +re(A2)) log2(n+p+q)
+n
++∥DΣ(i)
+xD⊤∥1/2
+ops
+s(κ2∗(A)re(Φ′′⊤
+SDΣ(i)
+xD⊤Φ′′
+S) +κ8∗(A)re(A2)) log2(n+p+q)
+n.
+(22)
+Bound TS2FT
+bias.By the same argument as in the proof of Theorem F.10,
+(TS2FT
+bias)2=∥Φ′′
+SΦ′′⊤
+SDΣ(i)
+xWpre⊤
+ℓ−1A†−Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+F+E(i)(ffull
+ℓ) (23)
+≤ ∥(Φ′′
+SΦ′′⊤
+S−Φ′Φ′⊤)Φ∗(DΣ(i)1/2
+x)∥2
+op∥DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+F+E(i)(ffull
+ℓ)
+=∥(Φ′′
+SΦ′′⊤
+S−Φ′Φ′⊤)Φ∗(DΣ(i)1/2
+x)∥2
+opE(i)(fpre
+ℓ) +E(i)(ffull
+ℓ), (24)
+where we used ∥DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+F≤ ∥DΣ(i)1/2
+x∥2
+F=E(i)(fpre
+ℓ). We hypothesize that TS2FT
+bias≃
+TLoRA
+bias by comparing (13) and(23), Here, SVD s(Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†)is the best rank- sapproxi-
+mation of Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†andΦ′′
+SΦ′′⊤
+SDΣ(i)
+xWpre⊤
+ℓ−1A†benefits from a rank- rapproximation,
+where r > s .
+Summary Note that for any η >0,(TS2FT
+variance +TS2FT
+bias)2≤(1 +η)(TS2FT
+bias)2+ (1 + 1 /η)(TS2FT
+variance )2
+holds. Thus
+E(i)(fℓ,US2FT
+S,VS2FT)≤(1 +η)(TS2FT
+bias)2+ (1 + η−1)(TS2FT
+variance )2.
+Combined with (22) and (24), this concludes the proof.
+Next we characterize the bias terms TLoRA
+bias andTS2FT
+bias under sparsity assumption.
+28Lemma F.14. Suppose that Assumption F .4 holds. Then, for a sparse fine-tuned network with the
+choice S⊃S0, it follows that
+E(i)(ffull
+ℓ)≤(TLoRA
+bias)2≤(TS2FT
+bias)2≤ E(i)(ffull
+ℓ) +δ2κ2
+∗(Wpre
+ℓ+1)E(i)(fpre).
+Proof. Note that Φ′′
+SΦ′′⊤
+Sis a projection into a subspace, which is contained in a subspace projected
+byΦ′Φ′⊤. Thus
+∥Φ′′
+SΦ′′⊤
+SDΣ(i)
+xWpre⊤
+ℓ−1A†−Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+F
+=∥(Φ′′
+SΦ′′⊤
+S−I)Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+F
+=∥(Φ′′
+SΦ′′⊤
+S−I)Wpre
+ℓ+1(Wpre
+ℓ+1)†DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+F
+=∥(Φ′′
+SΦ′′⊤
+S−I)Wpre
+ℓ+1((I−US2FT
+SUS2FT⊤
+S ) +US2FT
+SUS2FT⊤
+S )(Wpre
+ℓ+1)†DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+F
+=∥(Φ′′
+SΦ′′⊤
+S−I)Wpre
+ℓ+1(I−US2FT
+SUS2FT⊤
+S )(Wpre
+ℓ+1)†DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+F,
+where the last equality follows since (Φ′′
+SΦ′′⊤
+S−I)Wpre
+ℓ+1US2FT
+S = 0 by definition of Φ′′
+S=
+Φ∗(Wpre
+ℓ+1US2FT
+S). Thus
+∥Φ′′
+SΦ′′⊤
+SDΣ(i)
+xWpre⊤
+ℓ−1A†−Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†∥2
+F
+≤ ∥Wpre
+ℓ+1∥2
+op∥(I−US2FT
+SUS2FT⊤
+S )(Wpre
+ℓ+1)†DΣ(i)1/2
+x∥2
+F∥Σ(i)1/2
+xWpre⊤
+ℓ−1A†∥2
+op
+=∥Wpre
+ℓ+1∥2
+op∥Σ(i)1/2
+xWpre⊤
+ℓ−1A†∥2
+opX
+a∈[dℓ]\S∥e⊤
+a(Wpre
+ℓ+1)†DΣ(i)1/2
+x∥2
+≤δ2∥Wpre
+ℓ+1∥2
+op∥(Wpre
+ℓ+1)†DΣ(i)1/2
+x∥2
+F
+≤δ2κ2
+∗(Wpre
+ℓ+1)∥DΣ(i)1/2
+x∥2
+F,
+where the second inequality follows from ∥Σ(i)1/2
+xWpre⊤
+ℓ−1A†∥op≤1, Assumption F.4 and S⊃S0.
+The conclusion follows from (13) and (23).
+F.6.3 Out-of-distribution Excess Risk of Structured Sparse Fine-tuning
+Given S⊂[dℓ]with|S|=s, we define the structured sparse adaptation matrix obtained by S2FT
+under population in-distribution risk as
+VS2FT
+∞= arg min
+V∥V∥2
+Fs.t.Vminimizes R(i)(fℓ,US2FT
+S,V). (25)
+Theorem F.15 (Restatement of Theorem F.8: S2FT Part) .FixS⊂[dℓ]with|S|=s. For VS2FT
+∞
+defined in (25),
+E(o)(fℓ,US2FT
+S,VS2FT∞)≤ E(o)(fpre) + 3Φ′′
+SΦ′′⊤
+S(B(o)−B(i))Σ(o)1/2
+x2
+F
++ 3∥B(i)(Σ(o)1/2
+x−Σ(i)1/2
+xG(i,o)
+ℓ−1)∥2
+F
++ 3∥Wpre
+ℓ∥2
+op∥Wpre
+ℓ−1Σ(o)1/2
+x−Wpre
+ℓ−1Σ(i)1/2
+xG(i,o)
+ℓ−1∥2
+F.
+Remark F.16.If there is no covariate shift, i.e., Σ(i)
+x= Σ(o)
+x= Σ xfor some Σx, Theorem F.15 further
+gives the bound
+E(o)(fℓ,US2FT
+S,VS2FT∞)≤ E(o)(fpre) + 3Φ′′
+SΦ′′⊤
+S(B(o)−B(i))Σ1/2
+x2
+F
++ 3∥B(i)Σ1/2
+x(I−(Wpre
+ℓ−1Σ1/2
+x)†Wpre
+ℓ−1Σ1/2
+x))∥2
+F.
+29Proof of Theorem F .15. With a slight modification to Lemma F.12, we obtain
+E(o)(fℓ,US2FT
+S,VS2FT∞) = tr
+B(o)−Wpre−Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†DΣ(i)
+xWpre⊤
+ℓ−1(A†)2Wpre
+ℓ−1
+Σ(o)
+x
+·
+B(o)−Wpre−Wpre
+ℓ+1US2FT
+S(Wpre
+ℓ+1US2FT
+S)†DΣ(i)
+xWpre⊤
+ℓ−1(A†)2Wpre
+ℓ−1⊤
+=(B(o)−Wpre)Σ(o)1/2
+x−Φ′′
+SΦ′′⊤
+SDΣ(i)
+xWpre⊤
+ℓ−1(A†)2Wpre
+ℓ−1Σ(o)1/2
+x2
+F
+=∥(I−Φ′′
+SΦ′′⊤
+S)(B(o)−Wpre)Σ(o)1/2
+x∥2
+F
++Φ′′
+SΦ′′⊤
+Sn
+(B(o)−Wpre)Σ(o)1/2
+x−DΣ(i)1/2
+x(Wpre
+ℓ−1Σ(i)1/2
+x)†Wpre
+ℓ−1Σ(o)1/2
+xo
+| {z }
+=:T2
+F,
+where we used Σ(i)1/2
+xWpre⊤
+ℓ−1(A†)2Wpre
+ℓ−1Σ(o)1/2
+x = (Wpre
+ℓ−1Σ(i)1/2
+x)†Wpre
+ℓ−1Σ(o)1/2
+x . Note that
+∥T∥F≤Φ′′
+SΦ′′⊤
+Sn
+B(o)Σ(o)1/2
+x−B(i)Σ(i)1/2
+x(Wpre
+ℓ−1Σ(i)1/2
+x)†Wpre
+ℓ−1Σ(o)1/2
+xo
+F
++Φ′′
+SΦ′′⊤
+SWpre
+ℓn
+Wpre
+ℓ−1Σ(o)1/2
+x−Wpre
+ℓ−1Σ(i)1/2
+x(Wpre
+ℓ−1Σ(i)1/2
+x)†Wpre
+ℓ−1Σ(o)1/2
+xo
+F
+≤Φ′′
+SΦ′′⊤
+S(B(o)−B(i))Σ(o)1/2
+x
+F
++Φ′′
+SΦ′′⊤
+SB(i)(Σ(o)1/2
+x−Σ(i)1/2
+xG(i,o)
+ℓ−1)
+F
++Φ′′
+SΦ′′⊤
+SWpre
+ℓ(Wpre
+ℓ−1Σ(o)1/2
+x−Wpre
+ℓ−1Σ(i)1/2
+xG(i,o)
+ℓ−1)
+F.
+Therefore,
+E(o)(fℓ,US2FT
+S,VS2FT∞) =∥(I−Φ′′
+SΦ′′⊤
+S)(B(o)−Wpre)Σ(o)1/2
+x∥2
+F+∥T∥2
+F
+≤ E(o)(fpre) + 3Φ′′
+SΦ′′⊤
+S(B(o)−B(i))Σ(o)1/2
+x2
+F
++ 3∥B(i)(Σ(o)1/2
+x−Σ(i)1/2
+xG(i,o)
+ℓ−1)∥2
+F
++ 3∥Wpre
+ℓ∥2
+op∥Wpre
+ℓ−1Σ(o)1/2
+x−Wpre
+ℓ−1Σ(i)1/2
+xG(i,o)
+ℓ−1∥2
+F,
+where we used x+y+z≤3x2+ 3y2+ 3z2. This concludes the proof.
+F.7 Proofs for Full Fine-tuning
+Define ffull
+ℓ(x) =Wpre
+ℓ+1(Wpre
+ℓ+ ∆full
+ℓ)Wpre
+ℓ−1xas a fine-tuned network with full fine-tuning applied
+to the ℓ-th layer, evaluated under the population in-distribution risk, where ∆full
+ℓis obtained by
+∆full
+ℓ∈arg min
+∆′∈Rdℓ×dℓ−1E
+B(i)x(i)−Wpre
+ℓ+1(Wpre
+ℓ+ ∆′)Wpre
+ℓ−1x(i)2
+.
+Lemma F.17 (In-distribution Excess Risk) .Forffull
+ℓ, it holds that
+E(i)(ffull
+ℓ) =∥DΣ(i)1/2
+x(I−Σ(i)1/2
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x)∥2
+F
++∥(I−Φ′Φ′⊤)DΣ(i)
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x∥2
+F.
+Proof of Lemma F .17. Similar to the proof of Theorem F.10, we have
+E(i)(ffull
+ℓ) = min
+∆∈Rdℓ×dℓ−1E
+B(i)x(i)−Wpre
+ℓ+1(Wpre
+ℓ+ ∆) Wpre
+ℓ−1x(i)2
+= min
+∆∈Rdℓ×dℓ−1∥DΣ(i)1/2
+x−Wpre
+ℓ+1∆Wpre
+ℓ−1Σ(i)1/2
+x∥2
+F,
+30and
+∥DΣ(i)1/2
+x−Wpre
+ℓ+1∆Wpre
+ℓ−1Σ(i)1/2
+x∥2
+F=∥Wpre
+ℓ+1∆Wpre
+ℓ−1Σ(i)1/2
+x−Φ′Φ′⊤DΣ(i)
+xWpre⊤
+ℓ−1A†
+| {z }
+=:T1∥2
+F(26)
++∥DΣ(i)1/2
+x(I−Σ(i)1/2
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x)
+| {z }
+=:T2∥2
+F
++∥(I−Φ′Φ′⊤)DΣ(i)
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x| {z }
+=:T3∥2
+F,
+where we used the fact that the inner products tr 
+T1T⊤
+2
+= tr 
+T2T⊤
+3
+= tr 
+T3T⊤
+1
+= 0. By
+choosing ∆ = ( Wpre
+ℓ+1)†DΣ(i)
+xWpre⊤
+ℓ−1A†for example, the term T1becomes 0. Thus
+E(i)(ffull
+ℓ) =∥DΣ(i)1/2
+x(I−Σ(i)1/2
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x)∥2
+F
++∥(I−Φ′Φ′⊤)DΣ(i)
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x∥2
+F.
+This gives the desired result.
+We obtain the following corollary as a direct consequence of Lemma F.17.
+Corollary F.18. Forffull
+ℓ, it holds that
+E(i)(ffull
+ℓ)≤ ∥Ψ⊤
+∗(DΣ(i)1/2
+x)(I−Σ(i)1/2
+xWpre⊤
+ℓ−1(A2)†Wpre
+ℓ−1Σ(i)1/2
+x)∥opE(i)(fpre)
++∥(I−Φ′Φ′⊤)Φ∗(DΣ(i)1/2
+x)∥opE(i)(fpre). (27)
+The first term on the right hand side of (27) measures the distance between two subspaces spanned
+byΨ∗(DΣ(i)1/2
+x)andΨ∗(Wpre
+ℓ−1Σ(i)1/2
+x). Intuitively, this quantifies the information coded at the ℓ-th
+layer, and the necessary information to predict residuals. Thus, it bounds the maximum improvement
+by the ℓ-th layer fine-tuning. The second term measures the subspace distance between the subspace
+where prediction residuals reside, and the subspace predictable by the ℓ-th layer fine-tuning.
+G Auxiliary Results for Proofs
+Lemma G.1. Fixs, d1, d2∈N+. For any A, B∈Rd1×d2, if∥B−A∥op≤ ∥A∥opandλs(A)>
+λs+1(A)hold, then,
+∥SVD s(B)−SVD s(A)∥F≲κ2
+∗(A)λs(A)
+λs(A)−λs+1(A) √s∥B−A∥op∧ ∥B−A∥F
+.
+Proof. By triangle inequality,
+∥SVD s(B)−SVD s(A)∥F=∥Φs(B)Φ⊤
+s(B)B−Φs(A)Φ⊤
+s(A)A∥F
+≤ ∥Φs(B)Φ⊤
+s(B)(B−A)∥F+∥(Φs(B)Φ⊤
+s(B)−Φs(A)Φ⊤
+s(A))A∥F
+≤√s∥B−A∥op+∥Φs(B)Φ⊤
+s(B)−Φs(A)Φ⊤
+s(A)∥F∥A∥op.
+Using Davis-Kahan theorem (Theorem 4 from [73]), and Lemma 2.6 from [11],
+∥Φs(B)Φ⊤
+s(B)−Φs(A)Φ⊤
+s(A)∥F≤6√
+2∥A∥op(√s∥B−A∥op∧ ∥B−A∥F)
+λ2s(A)−λ2
+s+1(A).
+Thus
+∥SVD s(B)−SVD s(A)∥F≲∥A∥2
+op
+λ2s(A)λ2
+s(A)
+λ2s(A)−λ2
+s+1(A)(√s∥B−A∥op∧ ∥B−A∥F)
+≲∥A∥2
+op
+λ2s(A)λs(A)
+λs(A)−λs+1(A)(√s∥B−A∥op∧ ∥B−A∥F).
+This concludes the proof.
+31We cite the concentration inequality for cross-covariance matrices from [47].
+Lemma G.2 (Proposition 9.1 from [ 47]).LetZand˜Zbe mean zero random vectors taking values in
+Rd1andRd2, respectively. Denote covariance matrices of Zand˜ZbyΣZandΣ˜Z, respectively. Fix
+anyt >0. Assume that there exist constants c1, c2>0such that
+γ⊤ΣZγ≥c1∥γ⊤Z∥2
+ψ2and γ′⊤Σ˜Zγ′≥c2∥γ′⊤˜Z∥2
+ψ2(28)
+holds for any γ∈Rd1andγ′∈Rd2. Choose n≫(re(ΣZ)∧re(Σ˜Z))(t+ log( d1+d2)). Let
+(Zi,˜Zi)i∈[n]benindependent copies of (Z,˜Z). Then, there exists a constant C=C(c1, c2)>0
+such that with probability at least 1−e−t,
+1
+nX
+i∈[n]Zi˜Z⊤
+i−E[Z˜Z⊤]
+op≤C∥ΣZ∥1/2
+op∥Σ˜Z∥1/2
+opr
+(re(ΣZ) +re(Σ˜Z)(t+ log( d1+d2))
+n
+hold.
+Note that if a random variable Ztaking values in Rdsatisfies γ⊤ΣZγ≥c∥γ⊤Z∥2
+ψ2for any γ∈Rd
+with some constant c >0,AZalso satisfies γ′⊤ΣAZγ′≥c∥γ′⊤AZ∥2
+ψ2for any γ′∈Rd′and any
+matrix A∈Rd′×dand arbitrary d′∈N+, where ΣAZ=AΣZA⊤.
+We then prove the following lemma to show the existance of a ‘good’ high probability event to bound
+multiple inequalities.
+Lemma G.3. Suppose that Assumptions F .1 and F .2 hold. Fix any S⊂[dℓ]. Then, there exists an
+eventFwithP(F) = 1−exp 
+−Ω(log2(n+p+q))
+such that on the event F, forΦ∈ {Φ′,Φ′′
+S},
+∥Φ⊤ˆDˆΣ(i)
+xWpre⊤
+ℓ−1∥op≲∥DΣ(i)1/2
+x∥op∥A∥op,∥ˆA†∥op≲∥A†∥op, (29)
+and
+∥(ˆA2)†−(A2)†∥op≲κ2
+∗(A)
+λ2∗(A)s
+re(A2) log2(n+p+q)
+n, (30)
+∥ˆA−A∥op≲κ2
+∗(A)∥A∥ops
+re(A2) log2(n+p+q)
+n, (31)
+∥ˆA†−A†∥op≲κ∗(A)
+λ∗(A)s
+re(A2) log2(n+p+q)
+n(32)
+hold. Furthermore,
+∥Φ⊤(ˆDˆΣ(i)1/2
+x−DΣ(i)1/2
+x)Wpre⊤
+ℓ−1∥op
+≲∥Σ(i)
+ϵ∥1/2
+op∥A∥ops
+(re(Φ⊤Σ(i)
+ϵΦ) + re(A2)) log2(n+p+q)
+n
++∥DΣ(i)
+xD⊤∥1/2
+op∥A∥ops
+(re(Φ⊤DΣ(i)
+xD⊤Φ) + re(A2)) log2(n+p+q)
+n(33)
+holds on the event F.
+Proof. We only prove for Φ = Φ′without loss of generality. Before proving Lemma G.3, we first
+derive several concentration inequalities. Assumption F.2 implies
+n≫re(A2) log2(n+p+q),
+n≫re(Σ(i)
+x) log2(n+p+q),
+n≫(re(Σ(i)
+ϵ)∧re(Σ(i)
+x)) log2(n+p+q),
+n≫(re(Φ⊤Σ(i)
+ϵΦ)∧re(A2)) log2(n+p+q),
+n≫(re(Φ⊤DΣ(i)
+xD⊤Φ)∧re(A2)) log2(n+p+q).
+32Using Lemma G.2, we obtain
+∥ˆA2−A2∥op=∥Wpre
+ℓ−1ˆΣ(i)
+xWpre⊤
+ℓ−1−Wpre
+ℓ−1Σ(i)
+xWpre⊤
+ℓ−1∥op
+≲∥A∥2
+ops
+re(A2) log2(n+p+q)
+n, (34)
+and
+∥ˆΣ(i)
+ϵ,x∥op≲∥Σ(i)
+ϵ∥1/2
+op∥Σ(i)
+x∥1/2
+ops
+(re(Σ(i)
+ϵ) +re(Σ(i)
+x)) log2(n+p+q)
+n, (35)
+∥ˆΣ(i)
+x−Σ(i)
+x∥op≲∥Σ(i)
+x∥ops
+re(Σ(i)
+x) log2(n+p+q)
+n, (36)
+Φ⊤ˆΣ(i)
+ϵ,x(Σ(i)
+x)†Σ(i)
+xWpre⊤
+ℓ−1
+op≲∥Σ(i)
+ϵ∥1/2
+op∥A∥ops
+(re(Φ⊤Σ(i)
+ϵΦ) + re(A2)) log2(n+p+q)
+n, (37)
+Φ⊤D(ˆΣ(i)
+x−Σ(i)
+x)Wpre⊤
+ℓ−1
+op≲∥DΣ(i)
+xD⊤∥1/2
+op∥A∥ops
+(re(Φ⊤DΣ(i)
+xD⊤Φ) + re(A2)) log2(n+p+q)
+n,
+(38)
+with high probability. Hereafter we only focus on the event Fwhere these inequalities hold. We
+divide the proof into 2parts.
+Part 1. In this part we derive (30),(31) and(32). Note that ∥ˆA2−A2∥op≤λ∗(A2)/2holds on
+the event Fsince n≫κ4
+∗(A)re(A2) log2(n+d+p)by Assumption F.2, and hence rank( ˆA2) =
+rank( A2). Using Theorem 5.2 from [62],
+∥(ˆA2)†−(A2)†∥op
+∥(A2)†∥op≲ 
+1−κ∗(A2)∥ˆA2−A2∥op
+∥A∥2op!−1
+κ∗(A2)∥ˆA2−A2∥op
+∥A∥2op.
+Again from Assumption F.2, (34) gives
+∥(ˆA2)†−(A2)†∥op≲κ∗(A2)
+λ∗(A2)s
+re(A2) log2(n+p+q)
+n.
+This yields (30). Proposition 3.2 from [67] and (34) yield,
+∥(Φ′′′⊤ˆA2Φ′′′)1/2−(Φ′′′⊤A2Φ′′′)1/2∥op≤∥Φ′′′⊤(ˆA2−A2)Φ′′′∥op
+λ1/2
+∗(Φ′′′⊤A2Φ′′′)≲∥A∥2
+op
+λ∗(A)s
+re(A2) log2(n+p+q)
+n,
+where Φ′′′:= Φ ∗(A2), and we used λ∗(Φ′′′⊤A2Φ′′′)≥λ∗(A2). Since ˆA=
+Φ′′′(Φ′′′⊤ˆA2Φ′′′)1/2Φ′′′⊤andA1/2= Φ′′′(Φ′′′⊤A2Φ′′′)1/2Φ′′′⊤, we obtain (31) as
+∥ˆA−A∥op≲κ∗(A)∥A∥ops
+re(A2) log2(n+p+q)
+n. (39)
+Again using Theorem 5.2 from [62] combined with Assumption F.2, we obtain (32) as
+∥ˆA†−A†∥op≲κ2
+∗(A)
+λ∗(A)s
+re(A2) log2(n+p+q)
+n.
+This yields ∥ˆA†∥op≲∥A†∥op.
+Part 2. Next we derive (33). By a similar argument as Part 1, (36) and Assumption F.2,
+∥(ˆΣ(i)
+x)†−(Σ(i)
+x)†∥op≲∥Σ(i)
+x∥op
+λ2∗(Σ(i)
+x)s
+re(Σ(i)
+x) log2(n+d+p)
+n. (40)
+33Since ˆD−D=ˇΣ(i)
+ϵ,x=ˆΣ(i)
+ϵ,x(ˆΣ(i)
+x)†,
+∥Φ⊤(ˆDˆΣ(i)
+x−DΣ(i)
+x)Wpre⊤
+ℓ−1∥op
+≤Φ⊤(ˆD−D)Σ(i)
+xWpre⊤
+ℓ−1
+op+Φ⊤D(ˆΣ(i)
+x−Σ(i)
+x)Wpre⊤
+ℓ−1
+op+Φ⊤(ˆD−D)(ˆΣ(i)
+x−Σ(i)
+x)Wpre⊤
+ℓ−1
+op
+=Φ⊤ˆΣ(i)
+ϵ,x(ˆΣ(i)
+x)†Σ(i)
+xWpre⊤
+ℓ−1
+op+Φ⊤D(ˆΣ(i)
+x−Σ(i)
+x)Wpre⊤
+ℓ−1
+op+Φ⊤ˆΣ(i)
+ϵ,x(ˆΣ(i)
+x)†(ˆΣ(i)
+x−Σ(i)
+x)Wpre⊤
+ℓ−1
+op
+≤Φ⊤ˆΣ(i)
+ϵ,x(Σ(i)
+x)†Σ(i)
+xWpre⊤
+ℓ−1
+op+Φ⊤ˆΣ(i)
+ϵ,x
+(Σ(i)
+x)†Σ(i)
+x−(ˆΣ(i)
+x)†Σ(i)
+x
+Wpre⊤
+ℓ−1
+op
++Φ⊤D(ˆΣ(i)
+x−Σ(i)
+x)Wpre⊤
+ℓ−1
+op+Φ⊤ˆΣ(i)
+ϵ,x(ˆΣ(i)
+x)†(ˆΣ(i)
+x−Σ(i)
+x)Wpre⊤
+ℓ−1
+op
+=:Q1+R1+Q2+R2.
+We bound Q1,Q2,R1andR2separately. For the terms Q1andQ2, (37) and (38) give
+Q1≲∥Σ(i)
+ϵ∥1/2
+op∥A∥ops
+(re(Φ⊤Σ(i)
+ϵΦ) + re(A2)) log2(n+p+q)
+n, (41)
+Q2≲∥DΣ(i)
+xD⊤∥1/2
+op∥A∥ops
+(re(Φ⊤DΣ(i)
+xD⊤Φ) + re(A2)) log2(n+p+q)
+n. (42)
+For the term R1, using (35) and (40),
+R1≤ ∥ˆΣ(i)
+ϵ,x∥op∥(Σ(i)
+x)†−(ˆΣ(i)
+x)†∥op∥Σ(i)
+x∥1/2
+op∥Σ(i)1/2
+xWpre⊤
+ℓ−1∥op
+≲∥Σ(i)
+x∥2
+op∥Σ(i)
+ϵ∥1/2
+op∥A∥op
+λ2∗(Σ(i)
+x)s
+(re(Σ(i)
+ϵ) +re(Σ(i)
+x)) log2(n+p+q)
+ns
+re(Σ(i)
+x) log2(n+p+q)
+n
+≲κ2
+∗(Σ(i)
+x)∥Σ(i)
+ϵ∥1/2
+op∥A∥opq
+re(Σ(i)
+x)(re(Σ(i)
+ϵ) +re(Σ(i)
+x)) log2(n+p+q)
+n
+For the term R2, using (35) and (36),
+R2≤ ∥ˆΣ(i)
+ϵ,x∥op∥(ˆΣ(i)
+x)†∥op∥ˆΣ(i)
+x−Σ(i)
+x∥op∥(Σ(i)
+x)†∥1/2
+op∥Σ(i)1/2
+xWpre⊤
+ℓ−1∥op
+≲∥(Σ(i)
+x)†∥3/2
+op∥A∥op∥Σ(i)
+ϵ∥1/2
+op∥Σ(i)
+x∥3/2
+ops
+(re(Σ(i)
+ϵ) +re(Σ(i)
+x)) log2(n+p+q)
+ns
+re(Σ(i)
+x) log2(n+p+q)
+n
+≲κ3/2
+∗(Σ(i)
+x)∥Σ(i)
+ϵ∥1/2
+op∥A∥opq
+re(Σ(i)
+x)(re(Σ(i)
+ϵ) +re(Σ(i)
+x)) log2(n+p+q)
+n,
+where we used ∥(ˆΣ(i)
+x)†∥op≲∥(Σ(i)
+x)†∥opby Assumption F.2 combined with (40). Again from
+Assumption F.2, R1+R2is bounded by the right hand side of (41). Therefore,
+∥Φ⊤(ˆDˆΣ(i)
+x−DΣ(i)
+x)Wpre⊤
+ℓ−1∥op
+≲∥Σ(i)
+ϵ∥1/2
+op∥A∥ops
+(re(Φ⊤Σ(i)
+ϵΦ) + re(A2)) log2(n+p+q)
+n
++∥DΣ(i)
+xD⊤∥1/2
+op∥A∥ops
+(re(Φ⊤DΣ(i)
+xD⊤Φ) + re(A2)) log2(n+p+q)
+n.
+Finally, from Assumption F.2, we obtain ∥Φ⊤ˆDˆΣ(i)
+xWpre⊤
+ℓ−1∥op≲∥DΣ(i)1/2
+x∥op∥Σ(i)1/2
+xWpre⊤
+ℓ−1∥op.
+This concludes the proof.
+34

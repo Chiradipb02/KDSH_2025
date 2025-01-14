@@ -1,0 +1,1338 @@
+Published in Transactions on Machine Learning Research (09/2024)
+On Safety in Safe Bayesian Optimization
+Christian Fiedler∗fiedler@dsme.rwth-aachen.de
+Institute for Data Science in Mechanical Engineering (DSME)
+RWTH Aachen University
+Johanna Menn∗johanna.menn@dsme.rwth-aachen.de
+Institute for Data Science in Mechanical Engineering (DSME)
+RWTH Aachen University
+Lukas Kreisköther
+Sebastian Trimpe trimpe@dsme.rwth-aachen.de
+Institute for Data Science in Mechanical Engineering (DSME)
+RWTH Aachen University
+(* Equal contribution)
+Reviewed on OpenReview: https://openreview.net/forum?id=tgFHZMsl1N
+Abstract
+Safe Bayesian Optimization (BO) is increasingly used to optimize an unknown function un-
+der safety constraints, a central task in robotics, biomedical engineering, and many other
+disciplines. Due to the safety-critical nature of these applications, it is crucial that theo-
+retical safety guarantees for these algorithms translate into the real world. In this work,
+we investigate three safety-related issues in SafeOpt-type algorithms, a popular class of safe
+BO methods. First, these algorithms critically rely on frequentist uncertainty bounds for
+Gaussian Process (GP) regression, but concrete implementations typically utilize heuris-
+tics that invalidate all safety guarantees. We provide a detailed analysis of this problem
+and introduce Real- β-SafeOpt, a variant of the SafeOpt algorithm that leverages recent GP
+bounds and thus retains all theoretical guarantees. Second, we identify a key technical as-
+sumption in SafeOpt-like algorithms, the availability of an upper bound on the reproducing
+kernel Hilbert space (RKHS) norm of the target function, as a central obstacle to real-world
+usage. To address this issue, we propose to rely instead on a known Lipschitz and noise
+bound, and we introduce Lipschitz-only Safe Bayesian Optimization (LoSBO), a SafeOpt-
+type algorithm using the latter two assumptions. We show empirically that this algorithm
+is not only safe, but also outperforms the state-of-the-art on several function classes. Third,
+SafeOpt and derived algorithms rely on a discrete search space, complicating their applica-
+tion to higher-dimensional problems. To broaden the applicability of these algorithms, we
+introduce Lipschitz-only Safe GP-UCB (LoS-GP-UCB), a LoSBO variant that is applicable
+to moderately high-dimensional problems, while retaining safety. By analyzing practical
+safety issues in an important class of safe BO algorithms, and providing ready-to-use al-
+gorithms that overcome these issues, this work contributes to bringing safe and reliable
+machine learning techniques closer to real world applications.
+1 Introduction
+In science, engineering, and business it is often necessary to optimize an unknown target function. Typically,
+such functions are expensive to evaluate and only noisy function values are available. If it is possible to
+actively query the function, i.e., to select the inputs that are to be evaluated, this problem is commonly
+1Published in Transactions on Machine Learning Research (09/2024)
+addressed using Bayesian Optimization (BO), see (Shahriari et al., 2015) or (Garnett, 2023) for an overview.
+However, in many real-world applications, BO algorithms should avoid the use of certain inputs, frequently
+for safety reasons. For example, the target function might be a reward function for a robotic task, with
+the input a control policy for a physical robot. In this example, any inputs leading to physical damage or
+unsafe behavior should be avoided. An important special case of such a safety constraint is the restriction
+of query inputs to those with function values not lower than a given threshold (Kim et al., 2020). Inputs
+that satisfy this constraint are termed safe inputs, and a BO algorithm is considered safe if it queries only
+safe inputs throughout its run. This type of safety constraint has been introduced in (Sui et al., 2015) and
+arises for example in biomedical applications (where the target function is patient comfort and the input
+corresponds to treatment settings) or controller tuning (where the target function is a measure of controller
+performance and the inputs are tuning parameters). A popular BO algorithm for this problem setting is
+SafeOpt (Sui et al., 2015). Starting from a given set of safe inputs, this algorithm iteratively searches
+for a maximum while aiming to avoid unsafe inputs with high probability. It achieves this by utilizing
+Gaussian Processes (GPs) together with a frequentist uncertainty bound (Srinivas et al., 2010; Chowdhury
+& Gopalan, 2017) anda known upper bound on the Lipschitz constant of the target function. Provided
+the algorithmic parameters are set correctly, then with (high) pre-defined probability, SafeOpt demonstrably
+converges to the safely reachable maximum while avoiding unsafe inputs. SafeOpt and its variants have been
+used in various applications, e.g., safe controller optimization (Berkenkamp et al., 2016), automated deep
+brain stimulation (Sarikhani et al., 2021) and safe robot learning (Baumann et al., 2021). To ensure safety,
+SafeOpt and its variants require frequentist uncertainty sets that are valid (i.e., they hold with specified high
+probability) and explicit (i.e., they can be numerically evaluated). However, two issues arise here: First, the
+uncertainty bounds from (Srinivas et al., 2010; Chowdhury & Gopalan, 2017) used in most SafeOpt-type
+algorithms tend to be conservative, even if all necessary ingredients for their computation are available. This
+restriction can entirely prevent exploration of the target function. Second, such uncertainty bounds rely
+upon a particular property of the target function (a known finite upper bound on the Reproducing Kernel
+Hilbert Space (RKHS) norm), which in practice is very difficult to derive from reasonable prior knowledge.
+As a consequence of these issues, algorithmically usable uncertainty sets are not yet available for SafeOpt.
+Indeed, to the best of our knowledge, all implementations of SafeOpt and its variants have instead used
+heuristics (Berkenkamp et al., 2016; Kirschner et al., 2019a; Baumann et al., 2021; Koller et al., 2019; Helwa
+et al., 2019).1This shortcoming means that in practice such implementations lose all their theoretical safety
+guarantees. In this work, we carefully investigate this issue and propose practical solutions, bringing safe
+BO closer to real-world usage.
+Outline In Section 2, we recall some background material. The problem setting and our objectives are
+presented in Section 3, and Section 4 provides a comprehensive discussion of related work. In Section 5, we
+investigate safety issues of SafeOpt-type algorithms arising from using heuristics instead of valid frequentist
+uncertainty bounds. In Section 6, we discuss the practical safety problems arising from the assumption
+of a known upper bound on the RKHS norm of the target function, and propose to rely instead on a
+known Lipschitz and noise bound to address this issue, with Lipschitz-only Safe Bayesian Optimization
+(LoSBO) as an appropriate algorithm for this. To enable this type of safe BO beyond low dimensional input
+spaces, Section 7 introduces another algorithmic variant, called Lipschitz-only Safe Gaussian Process-Upper
+Confidence Bound (LoS-GP-UCB), which is suitable for moderately high dimensions. Finally, Section 8
+closes the article with a summary and outlook. Additional background, discussion and experimental details
+can be found in the appendix, and the source code for all experiments is available in a GitHub repository.2
+2 Background
+In this section, we provide a brief review of Gaussian Process (GP) regression, reproducing kernel Hilbert
+spaces (RKHSs), and frequentist uncertainty bounds for GP regression, as these three components form the
+foundations for SafeOpt-type algorithms.
+1The precise experimental settings are not reported in (Sui et al., 2015). However, based on the descriptions provided, it
+can be inferred that some form of heuristic was used.
+2https://github.com/Data-Science-in-Mechanical-Engineering/LoSBO
+2Published in Transactions on Machine Learning Research (09/2024)
+2.1 Gaussian processes and reproducing kernel Hilbert spaces
+A GP is a collection of R-valued random variables, here indexed by the set D, such that every finite collection
+of those random variables has a multivariate normal distribution. A GP gis uniquely defined by its mean
+functionm(x) =E[g(x)]and covariance function k(x,x′) =E[(g(x)−m(x))((g(x′)−m(x′))], and we denote
+such a GP by g∼GPD(m,k). In GP regression, we start with a prior GP. Assuming independent and
+identically distributed (i.i.d.) additive normal noise, ϵt∼N (0,σ2), this prior GP can be updated with
+data (x1,y1),..., (xt,yt), leading to a posterior GP. Without loss of generality we assume that the prior GP
+has zero mean. Then the posterior mean, posterior covariance and posterior variance are given by µt(x) =
+kt(x)T(Kt+σ2It)−1yt,kt(x,x′) =k(x,x′)−kt(x)T(Kt+σ2It)−1kt(x′), andσ2
+t(x) =kt(x,x), respectively,
+where yt= [y1,...,yt]Tis the vector of observed, noisy function values of f, the kernel matrix Kt∈Rt×thas
+entries [k(x,x′)]x,x′∈Dt, the vector kt(x) = [k(x1,x)···k(xt,x)]Tcontains the covariances between xand the
+observeddatapoints, and Itisthet×tidentitymatrix. Inpractice, thepriormean, priorcovariancefunction,
+and noise level, are (partially) chosen based on prior knowledge. If no specific prior knowledge regarding
+the mean is available, the zero function is usually chosen. Furthermore, in practice these three components
+are only partially specified, usually up to some parameters, which are then called hyperparameters in the
+context. In BO, the latter are often determined during the optimization via hyperparameter optimization
+(Garnett, 2023).
+Ifkis the covariance function of a GP, then it is symmetric and positive semidefinite.3Conversely, if k
+is the reproducing kernel of a RKHS, then kis symmetric and positive semidefinite, and there exists a
+GP having kas its covariance function, and the GP can be chosen with a zero mean function (Berlinet
+& Thomas-Agnan, 2004). Finally, for every symmetric and positive semidefinite function k(and hence for
+every covariance function of a GP) there exists a unique associated Hilbert space of functions, called a
+reproducing kernel Hilbert space (RKHS) and denoted by (Hk,⟨·,·⟩k), with (i)k(·,x)∈Hkfor allx∈D,
+and (ii)f(x) =⟨f,k(·,x)⟩kfor allf∈Hkandx∈D. For the reader’s convenience, Section A.1 contains a
+brief introduction and discussion of these function spaces.
+For more details on GPs, GP regression, and related method, we refer to (Rasmussen & Williams, 2006)
+and (Garnett, 2023), and for more background on RKHSs, we refer to (Steinwart & Christmann, 2008,
+Chapter 4).
+2.2 Frequentist uncertainty bounds
+An important ingredient in SafeOpt-type algorithms are upper and lower bounds on the unknown target
+function, and these bounds have to hold uniformly in both time and input space. If we adopt a stochastic
+setup, then this can be formalized by finding upper and lower bounds such that for a given user-specified
+confidenceδ∈(0,1), we have P[ℓt(x)≤f(x)≤ut(x),∀x∈D,t≥0]≥1−δ, where the probability is with
+respect to the data-generating process, while fis assumed fixed and nonrandom. In GP regression, the
+posterior mean µtcan be interpreted as a nominal estimate of f, and the posterior variance σ2
+tas a measure
+of uncertainty of this estimate. However, using the posterior variance to build upper and lower bounds in the
+SafeOpt setting is not straightforward. Firstly, the posterior variance is a pointwise measure of uncertainty
+about the ground truth, but the upper and lower bounds have to hold uniformly over the input set, and
+also uniformly in time. Secondly, GP regression is by its nature a Bayesian method. However, the SafeOpt
+setting is a typical frequentist setup – we have a fixed, yet unknown ground truth, about which we receive
+noisy information. In particular, any stochasticity arises only through the data-generating process (e.g., via
+random noise on the function values), and not through epistemic uncertainty, as is the case in the Bayesian
+setup. This difficulty is well-known, see (Fiedler et al., 2021a), and is particularly relevant in the context
+of robust control and related areas (Fiedler et al., 2021b). We thus need bounds (νt)t≥1, such that for a
+user-specified δ∈(0,1)we have
+P[|f(x)−µt(x)|≤νt(x)∀x∈D,t≥1]≥1−δ. (1)
+The bounding function νtmust only depend on data collected up to time t, as well as reasonable prior
+knowledge about fand the data-generating process, e.g., about the noise statistics. These bounds are
+3This means that all matrices (k(xi,xj))i,j=1,...,Nforx1,...,x N∈DandN∈N>0are symmetric positive semidefinite.
+3Published in Transactions on Machine Learning Research (09/2024)
+−4−2 0 2 4
+x−202y(a)
+−4−2 0 2 4
+x(b)
+posterior mean
+uncertainty set
+true function
+data points
+Figure 1: Illustration of the required GP error bounds. Consider a fixed ground truth (solid black line),
+of which only finitely many samples are known (gray dots). Applying GP regression leads to a posterior
+GP fully described by the posterior mean (solid blue line) and the posterior variance, from which a high-
+probability uncertainty set can be derived (shaded blue). Left: The ground truth is completely contained in
+the uncertainty set. Right: The ground truth violates the uncertainty bound around x= 1.
+illustrated in Figure 1. All common bounds are of the form
+νt(x) =βtσt(x), (2)
+whereβt∈R≥0is some scaling factor. Let kbe the covariance function used in GP regression, and Hkthe
+unique RKHS with kas its reproducing kernel. Assume that the ground truth is contained in this RKHS,
+i.e.,f∈Hk. Let F= (Ft)t≥0be a filtration defined on the underlying probability space, and assume that
+the sequence of inputs (xt)t≥0chosen by the algorithm is adapted to F.4The first bound of the form (2)
+was introduced in the seminal work (Srinivas et al., 2010), cf. their Theorem 6, which holds in the case
+of bounded noise. This is also the bound that was used in the original SafeOpt paper (Sui et al., 2015).
+At the moment, the most commonly used uncertainty bound in the analysis of SafeOpt-type algorithms
+is (Chowdhury & Gopalan, 2017, Theorem 2). Assume that (ϵt)tis a martingale difference sequence that
+is conditionally R-subgaussian w.r.t. Ffor someR∈R≥0, which holds for example for i.i.d. bounded or
+normal noise. Additionally, assume that λ>1, orλ≥1and the covariance function kis positive definite,
+whereλis the nominal noise variance used in GP regression. Under these conditions, the uncertainty bound
+(1) holds with
+βt=∥f∥k+R/radicalbig
+2(γt−1+ 1 + log(1 /δ)) (3)
+in (2), where γtis themaximum information gain aftertrounds, cf. (Srinivas et al., 2010) for a thorough
+discussion of this quantity. In contrast to (Srinivas et al., 2010, Theorem 6), this bound allows subgaus-
+sian noise (including bounded noise and normal noise) and involves only fairly small numerical constants.
+However, it still requires the maximum information gain or an upper bound thereof, which can be difficult
+to work with in practice, and it introduces some conservatism. Motivated by these shortcomings, Fiedler
+et al. (2021a) proposed a data-dependent scaling factor in (2), based on (Chowdhury & Gopalan, 2017,
+Theorem 2). Assume the same setting as this latter result, and also assume that the covariance function k
+is positive definite, then we can set
+βt=∥f∥k+R√
+λ/radicalig
+ln/parenleftbig
+det(¯λ/λKt+¯λIt)/parenrightbig
+−2 ln(δ), (4)
+where we defined ¯λ= max{1,λ}, andλis again the nominal noise variance used in GP regression, cor-
+responding to the regularization parameter in kernel ridge regression. This bound no longer involves the
+maximum information gain, and numerical experiments demonstrate that the resulting uncertainty bounds
+are rarely significantly larger than common heuristics, see (Fiedler et al., 2021a). In fact, the bounds are
+4Of course, this requires that Dis a measurable space, which is not a problem in practice.
+4Published in Transactions on Machine Learning Research (09/2024)
+sufficiently small to use in algorithms, e.g. (Fiedler et al., 2021b). Finally, from the results in the doctoral
+thesis (Abbasi-Yadkori, 2013), which was published in 2012, an uncertainty bound can be deduced that is
+superior to (Chowdhury & Gopalan, 2017, Theorem 2), and therefore also improves over (4). Consider the
+same setting as introduced above. Combining Theorem 3.11 with Remark 3.13 in (Abbasi-Yadkori, 2013),
+we find that for all δ∈(0,1)we can set
+βt=∥f∥k+R√
+λ/radicaligg
+2 ln/parenleftbigg1
+δdet/parenleftbigg
+It+1
+λKt/parenrightbigg/parenrightbigg
+(5)
+in (2). Like (4), this bound can be easily evaluated, but it appears to have been used only infrequently in
+the machine learning community5, though it has recently been rediscovered, for example, in (Whitehouse
+et al., 2024).
+3 Problem setting and objectives
+We now formalize our problem setting following the seminal paper (Sui et al., 2015), describe SafeOpt-type
+algorithms in detail, and specify our objectives for the remainder of this work. Consider a nonempty set D,
+theinput set , and a fixed, but unknown function f:D→R, thetarget function orground truth . We are
+interested in an algorithm that finds the maximum of fby iteratively querying the function. At time step
+t∈N0, such an algorithm chooses an input xt∈Dand receives a noisy function evaluation yt=f(xt) +ϵt,
+whereϵtis additive measurement noise. As a safety constraint, all chosen inputs must have a function
+value above a given safety threshold h∈R, i.e.,f(xt)≥hfor allt. Furthermore, the algorithm should be
+sample-efficient, i.e., use as few function queries as possible to find an input with a high function value. To
+make progress on this problem, it is clear that some restriction on the function fmust be posed. Central to
+our developments is the next assumption.
+Assumption 1. Dis equipped with a metric d:D×D→R≥0. Additionally, fisL-Lipschitz continuous,
+whereL∈R≥0is a known Lipschitz constant.
+The second assumption means that for all x,x′∈D, we have|f(x)−f(x′)|≤Ld(x,x′). From now on, we
+work under Assumption 1. Furthermore, we assume that we have access to a non-empty set of known safe
+inputsS0⊆D, i.e., for all x∈S0we havef(x)≥h. The SafeOpt algorithm and its derivatives use an
+iteratively updated model Mtthat provides estimated upper and lower bounds utandℓtonf, i.e., with a
+certain confidence it holds that ℓt(x)≤f(x)≤ut(x)for allx∈Dand allt≥1. These bounds are also used
+to provide a measure of uncertainty defined as wt(x) =ut(x)−ℓt(x). In each step t≥1, the previous model
+Mt−1together with the Lipschitz assumption is used to determine a new set St⊆Dof safe inputs, starting
+from the initial safe set S0. Subsequently, a set Mt⊆Stof potential maximizers of the target function, and a
+setGt⊆Stof potential expanders is computed. The latter contains inputs that are likely to lead to new safe
+inputs upon query. Finally, the target function is queried at the input xt= argmaxx∈Gt∪Mtwt(x), a noisy
+function value ytis received, and the model Mt−1is updated with the data point (xt,yt). Different variants
+of SafeOpt result from different choices of models and computations of St,MtandGt. To the best of our
+knowledge, in all SafeOpt-type algorithms, the unknown ground truth fis modeled as a GP. To compute
+appropriate upper and lower bounds, it is assumed that an appropriate scaling factor βtis available, cf. (2).
+For each time step t, defineCt(x) =Ct−1∩Qt(x), whereQt(x) = [µt−1(x)±βtσt−1(x)], and, starting with
+Q0(x) =Rfor allx∈D,C0(x) = [h,∞)for allx∈S0andC0(x) =Rforx∈D\S0. The corresponding
+estimated upper and lower bounds are given by ut(x) = maxCt(x)andℓt(x) = minCt(x), respectively. In
+the original SafeOpt algorithm from (Sui et al., 2015), for each step t≥1, the new safe sets are calculated
+by
+St=/uniondisplay
+x∈St−1{x′∈D|ℓt(x)−Ld(x,x′)≥h}, (6)
+the potential maximizers are given by
+Mt={x∈St|ut(x)≥max
+xS∈Stℓt(xS)}, (7)
+5Note however that for 0<λ< 1andkpositive definite, (5) reduces to (4).
+5Published in Transactions on Machine Learning Research (09/2024)
+xyIteration 0
+x
+Iteration 5
+x
+Iteration 30true function
+uncertainty bounds
+posterior mean
+data points
+optimum
+initial safe set
+safe set
+maximizer set
+expander set
+Figure 2: Illustration of SafeOpt. The safe set (gray bar), expanders (blue bar), and maximizers (green
+bar), derived from the current GP model (with solid blue line the posterior mean, shaded blue areas the
+uncertainty sets), are used to find the safely reachable optimum (red box). In each iteration, the next input
+is chosen from the union of the current expanders and maximizers (a subset of the safe set) by maximizing
+the acquisition function.
+Algorithm 1 SafeOpt
+Require: Lipschitz constant L, algorithm to compute βt, initial safe set S0, safety threshold h
+1:Q0(x)←Rfor allx∈D ▷ Initialization of uncertainty sets
+2:C0(x)←[h,∞)for allx∈S0
+3:C0(x)←Rfor allx∈D\S0
+4:fort= 1,2,...do
+5:Ct(x)←Ct−1(x)∩Qt−1(x)for allx∈D ▷Compute upper and lower bounds for current iteration
+6:ℓt(x)←minCt(x),ut(x)←maxCt(x)for allx∈D
+7:ift>1then ▷Compute new safe set
+8:St=St−1∪{x∈D|∃xs∈St−1:ℓt(xs)−Ld(xs,x)≥h}
+9:else
+10:S1=S0
+11:end if
+12:Gt←{x∈St|∃x′∈D\St:ut(x)−Ld(x,x′)≥h}▷Compute set of potential expanders
+13:Mt={x∈St|ut(x)≥maxxS∈Stℓt(xS)} ▷Compute set of potential maximizers
+14:xt←argmaxx∈Gt∪Mtwt(x) ▷Determine next input
+15:Query function with xt, receiveyt=f(xt) +ϵt
+16:Update GP with new data point (xt,yt), resulting in mean µtandσt
+17:Compute updated βt
+18:Qt(x) = [µt(x)−βtσt(x),µt(x) +βtσt(x)]for allx∈D
+19:end for
+and the potential expanders by
+Gt={xS∈St|∃x∈D\St:ut(xS)−Ld(xS,x)≥h}. (8)
+The resulting algorithm is illustrated in Figure 2. A formal description of the algorithm using pseudocode
+is provided by Algorithm 1. In some popular variants of the SafeOpt algorithm, no Lipschitz bound is used
+in the computation of the safe sets (Berkenkamp et al., 2016). However, since knowledge of such a Lipschitz
+bound is additional knowledge that should be used by the algorithm, and we strongly rely on this assumption
+from Section 6 onwards, we do not consider these algorithmic variants in the present work.
+Our primary objective is to investigate and improve practically relevant safety aspects of SafeOpt-type algo-
+rithms. We will consider three specific objectives, which will be explored in Sections 5, 6 and 7, respectively.
+6Published in Transactions on Machine Learning Research (09/2024)
+(O1)While SafeOpt and related algorithms come with precise theoretical safety guarantees, all known im-
+plementations to date use heuristics (usually by setting βtto some constant) instead of theoretically
+sound uncertainty bounds. These heuristics generally invalidate all theoretical safety guarantees,
+raising the question of whether their use leads to safety problems in practice.
+(O2)Since SafeOpt and its variants are adopted for scenarios with stringent safety requirements where
+no failure should occur with high probability and no tuning phase is allowed, it is important that
+all underpinning assumptions are reasonable and verifiable by users. The most delicate of these
+assumptions is knowledge of an upper bound of the RKHS norm of the target function, raising the
+question of whether the RKHS norm bound assumption is reasonable, and if not, how it can be
+replaced.
+(O3)In many relevant applications of safe BO, the input space is a continuous domain in moderately
+high dimensions. Since SafeOpt-type algorithms rely on a discrete input space, they cannot be
+used in these settings. It is therefore necessary to devise alternatives that work in moderately high
+dimensions, while retaining safety guarantees.
+4 Related work
+In the following, related work will be reviewed. We first provide an overview of safe BO methods, particularly
+those closely related to the present setting. As Lipschitz bounds play a central role from Section 6 onwards,
+we also review previous work on methods that rely on such an assumption.
+4.1 Safety in Bayesian optimization
+We first consider safety in the context of Bayesian optimization (BO) (Shahriari et al., 2015; Garnett, 2023).
+The type of safety constraint considered in this work was first introduced in the seminal paper (Sui et al.,
+2015), which also proposed and analyzed the original SafeOpt algorithm. Several variations to the original
+algorithm have been proposed, with a SafeOpt-variant that does not use a Lipschitz constant (Berkenkamp
+et al., 2016) proving particularly popular in the robotics community. While the original SafeOpt algorithm
+from Sui et al. (2015) interleaves safe exploration and function optimization over certified safe sets, a two-
+stage variant was introduced and analyzed in (Sui et al., 2018). Since SafeOpt relies on a discrete input
+space, and hence requires discretization in the case of a continuous optimization problem, applying this
+algorithm to continuous problems in even moderate dimensions can be very challenging, cf. also Section
+7. This motivated the introduction of a variant based on swarm-optimization (Duivenvoorden et al., 2017),
+albeit with heuristic safety guarantees, as well as a variant tailored to dynamical problems in high dimensions
+(Sukhija et al., 2023). A method based on random projections was also proposed and analyzed in (Kirschner
+et al., 2019a), and applied to tuning of a particle accelerator (Kirschner et al., 2019b). In terms of problem
+formulations, instead of just one safety constraint for the input function, multiple safety constraints can also
+be enforced, each encoded by an unknown constraint function (Sui et al., 2018; Berkenkamp et al., 2023).
+In many applications of SafeOpt-type algorithms, properties of a dynamical system need to be optimized
+under safety constraints, for example, in controller tuning with BO. The dynamic aspect can be included
+in the optimization algorithm and its safety mechanisms, for example, in order to use a backup controller
+(Baumann et al., 2021). Furthermore, while formally SafeOpt-type algorithms are BO algorithms having
+input constraints, this is different from constrained BO as considered for example in (Hernández-Lobato
+et al., 2016). In the latter type of BO, the focus is on finding good inputs (i.e., corresponding to a high
+objective function value) that fulfill the (usually unknown) constraints, and violation of the constraints
+during the optimization process is not considered problematic (though of course it can be advantageous
+to avoid this). By contrast, safe BO aims to avoid constraint violations during the optimization process
+since these are considered problematic or even harmful. For an in-depth discussion of this difference, and
+further connections between the two problem settings, we refer to the excellent survey (Kim et al., 2020).
+SafeOpt-type algorithms are motivated by problems where safety violations are considered to be very costly,
+soanysafety violations should be avoided with very high probability. This contrasts with a whole spectrum
+of related, but different safe BO (and reinforcement learning) settings. For example, in robot learning a
+7Published in Transactions on Machine Learning Research (09/2024)
+small amount of crashes might deemed acceptable, in which case a crash-aware BO algorithm (Marco et al.,
+2021) would be preferable over a SafeOpt-type algorithm. Similarly, in the context of bandit algorithms
+(Slivkins et al., 2019; Lattimore & Szepesvári, 2020), instead of avoiding a bad option at all costs, one might
+instead want to be conservative , carefully exploring alternatives, starting from a default strategy. This
+setting is formalized in the context of conservative bandits (Wu et al., 2016), and again, is related to, but
+distinct from, the SafeOpt setting. Corresponding bandit formulations in the context of hard safety are also
+available (Amani et al., 2019), where the focus is on regret bounds under safety constraints. Finally, parallel
+to the situation of conservative bandits, there are cautious variants of BO (Fröhlich et al., 2021).
+4.2 Lipschitz-based methods
+In order to address safety-related issues uncovered and discussed in Sections 5.1 and 6.1, we will introduce
+algorithms based on a Lipschitz assumption. While regularity properties like Lipschitz (and the more general
+Hölder) continuity play an important role in the theory of statistical learning, especially in nonparametric
+statistical estimation (Tsybakov, 2009), learning algorithms based on Lipschitz assumptions have received
+relatively little attention in the machine learning community. Relevant exceptions to this are Lipschitz
+bandits (Kleinberg et al., 2019) and the original SafeOpt algorithm from Sui et al. (2015). The situation is
+considerably different in the field of global optimization and the systems and control community, respectively.
+In the former, Lipschitz continuity with a specific Lipschitz constant is a standard assumption, used in a
+varietyofalgorithmsfor(certified)globaloptimization, cf. (Hansenetal.,1992;Pintér,1995), thoughusually
+a noise-free setting is assumed in this literature. Global optimization of Lipschitz functions has recently also
+received attention from the machine learning community (Malherbe & Vayatis, 2017). Similarly, a specified
+LipschitzconstantisalsousedinthecontextofLipschitzinterpolation(Beliakov,2006). Furthermore, closely
+relatedtoourapproachtakeninSection6, adeterministicvariantofSafeOpthasbeenconsideredinSergeyev
+et al. (2020). However, the latter reference only works with functions on a compact interval, and does not
+use any BO techniques. In the systems and control community, Lipschitz assumptions have long been used,
+especially in the context of systems identification, where they were explicitly introduced and popularized by
+Milanese & Novara (2004), though similar methods had been used before, e.g., (Cooper, 1995). A known
+bound on the Lipschitz constant and on the size of additive noise is commonly used to derive uncertainty
+bounds in the context of regression. This approach has been further popularized and extended to the case of
+Hölder continuous functions by Calliess (2014), widely known as kinky inference in the systems and control
+community. A central assumption in this context is knowledge of a concrete, numerical upper bound on the
+Lipschitz constant of the target function. This assumption has a clear geometric and practical interpretation,
+namely a bounded rate of change of the target quantity. As such, it is related to the well-established field
+of sensitivity analysis (Da Veiga et al., 2021), for example. Approaches to estimate the Lipschitz constant
+of an unknown function have been proposed both in the context of global optimization (Strongin, 1973)
+and in Lipschitz-based regression methods, particularly in the context of systems identification (Milanese
+& Novara, 2004; Novara et al., 2013; Calliess et al., 2020), see (Huang et al., 2023) for an overview and
+very recent sample-complexity results. We would like to stress that these approaches are not suitable for
+the present setting of hard safety constraints, since the estimation of a Lipschitz constant bound requires
+queries to the target function, which in turn already need to be safe, see also the discussion in Section 6.1.
+The developments in Sections 6 and 7 combine kernel-based methods (here GP regression) with a Lipschitz
+assumption to overcome the requirement of a known bound on the RKHS norm of the target function, see
+Section 6.1 for details. The problematic nature of an RKHS norm bound in the context of learning-based
+control has been recognized for some time (Lederer et al., 2019; Fiedler et al., 2022). In (Lederer et al.,
+2019), using probabilistic Lipschitz bounds together with a space discretization was suggested to derive GP
+uncertainty bounds. However, this approach relies on a probabilistic setting, and is therefore not suitable
+in the context of SafeOpt-type algorithms. The work (Fiedler et al., 2022) proposes the usage of geometric
+constraints as prior knowledge in the context of uncertainty sets for kernel-based regression, with Lipschitz
+constant bounds as a special case. The resulting kernel machines, which provide nominal predictions and
+smoothed uncertainty bounds adhering to the geometric constraints, are not necessary in our setting, though
+using more general geometric constraints than Lipschitz constant bounds might be a promising avenue in
+the context of SafeOpt-type algorithms. Finally, combining kernel methods with Lipschitz assumptions is
+a natural approach as there is a close connection between regularity properties of a kernel and Lipschitz
+8Published in Transactions on Machine Learning Research (09/2024)
+continuity of functions in the RKHS generated by the kernel. For a thorough discussion of this point, we
+refer to (Fiedler, 2023).
+5 Frequentist uncertainty bounds and practical safety issues in SafeOpt
+We now investigate practical safety implications of commonly used heuristics in the frequentist uncertainty
+boundsinSafeOpt-typealgorithms, addressingobjective(O1). InSection5.1, wediscusswhytheseheuristics
+are problematic and demonstrate safety issues using numerical experiments. To overcome these issues, in
+Section 5.2, we propose using state-of-the-art frequentist uncertainty bounds in the actual algorithm.
+5.1 Practical safety issues in SafeOpt
+Safety in SafeOpt-type algorithms is ensured by restricting query inputs to safe sets, which are computed
+using frequentist uncertainty bounds, typically in the form (2) using (3). However, these bounds are often
+too conservative for algorithmic use, which has led to implementations adopting heuristic choices for βt,
+for example, βt≡2in (Berkenkamp et al., 2016; Turchetta et al., 2016), βt≡3in (Helwa et al., 2019;
+Baumann et al., 2021), or βt≡4in (Sukhija et al., 2023). Using such heuristics instead of evaluating βt
+invalidatesallsafetyguarantees . Inpractice, choosingsome βtcanbeausefulheuristic, as demonstrated
+by the reported success of SafeOpt-type algorithms (Berkenkamp et al., 2016; Baumann et al., 2021; Sukhija
+et al., 2023). However, it should be stressed that in the setting of SafeOpt as outlined in Section 3, the
+learning algorithm has to fulfill a hard safety constraint – namely, that no unsafe inputs are queried by
+the algorithm (potentially only with high probability). In particular, no burn-in or tuning phase for βtis
+allowed. Such heuristics not only invalidate the theoretical safety guarantees, but can also actually lead to
+safety violations.
+First, we demonstrate empirically that a simple heuristic like setting βt≡2can lead to a significant propor-
+tion of bound violations. To do so, we follow the general approach adopted in (Fiedler et al., 2021a). We
+randomly generate 100 RKHS functions on [0,1]with RKHS norm 10 using the squared exponential (SE)
+kernel, and for each of the functions, we generate 10000 data sets, run GP regression on it, and finally check
+whether the uncertainty set (2) with βt≡2fully contains the respective function. 2727 ±3882 (average±
+SD) of these runs (all 10000 repetitions for all 100 functions) led to a bound violation, a sizeable proportion.
+Second, we show that these bound violations can indeed lead to safety violations when running SafeOpt. We
+generate an RKHS function fand run SafeOpt with βt≡2, but all other algorithmic parameters set cor-
+rectly (or even conservatively) for 10000 independent runs. This leads to 2862 (out of 10000) runs with safety
+violations (see Table 1), which is unacceptable for most application scenarios of SafeOpt-type algorithms.
+These experiments illustrate that using heuristics in SafeOpt can be highly problematic. Even in the relative
+benign setting used above, both uncertainty bound and safety violations occur. Moreover, in application
+scenarios for SafeOpt-type algorithms, tuning the heuristic scaling factor is not possible, as it is the primary
+mechanism for safety. Dispensing with the need for such heuristics, and retaining safety guarantees both in
+theory and practice, is therefore the primary motivation for this work.
+5.2 Real-β-SafeOpt
+As a first step, we propose using modern uncertainty bounds in SafeOpt that can be computed numerically,
+avoiding the replacement with unreliable heuristics. For this purpose, we investigate the original SafeOpt
+algorithm, as described by Algorithm 1, with βtfrom (5). To clearly distinguish this variant of SafeOpt from
+previous work, we call it Real-β-SafeOpt , emphasizing that we use a theoretically sound choice of βt. The
+bound (5) requires the determinant to be computed, which can be computationally expensive, but typical
+applications of SafeOpt and related algorithms allow few evaluations, so this does not pose a problem.
+Furthermore, the additive noise needs to be a conditionally R-subgaussian (martingale-difference) sequence
+with a (known upper bound on) R. This assumption is standard, has a clear interpretation, and is in many
+cases harmless. Finally, for a frequentist uncertainty bound, we also need the next assumption.
+Assumption 2. SomeB∈R≥0is known with∥f∥k≤B.
+9Published in Transactions on Machine Learning Research (09/2024)
+Combining these ingredients allows us to compute the bound (5), so Real- β-SafeOpt can actually be imple-
+mented. We would like to stress that both the underlying algorithm (SafeOpt) and the used uncertainty
+bound have been known, so we do not claim any new technical developments here. However, to the best
+of our knowledge, this concrete version of SafeOpt has not been considered in the literature so far, and no
+empirical evaluation on it has been conducted so far. To illustrate the advantages of Real- β-SafeOpt, we run
+it on the same function fas before (cf. Section 5.1), and set δ= 0.01, as well as the true RKHS norm in (5).
+Running this experiment results in 0 failures (cf. Table 1), evidently well within the δrange required. An
+obvious question arising at this point is how Real- β-SafeOpt compares in terms of performance with previous
+SafeOpt-variants relying on heuristics. Unfortunately, a meaningful comparison is impossible since the two
+algorithmic variants address different problems. If for the latter the heuristic constant βis determined by
+trial-and-error, and SafeOpt is then run with this constant that leads to no or almost no safety violation, then
+we essentially end up with a different algorithm overall. If the heuristic constant βis chosen arbitrarily or
+based on experience with previous usages of SafeOpt-type algorithms, then the original setting of hard safety
+constraints is abandoned, and instead we end up with a form of cautious BO. By contrast, Real- β-SafeOpt
+tries to stay within the original setting of SafeOpt that requires hard safety constraints. To investigate how
+Real-β-SafeOpt typically behaves, we will perform a careful empirical evaluation of this algorithm variant in
+Section 6.4.
+6 Lipschitz-only safe Bayesian optimization (LoSBO)
+In this section, we address objective (O2), in particular, we investigate the central Assumption 2 of a known
+upper bound on the RKHS norm of the target function, finding that this is a problematic assumption in
+practice. To overcome this issue, we propose to rely instead on a known Lipschitz and noise bound, and
+introduce Lipschitz-only Safe Bayesian Optimization (LoSBO) as an appropriate algorithm, on which we
+perform extensive numerical experiments.
+6.1 Practical problems with the RKHS norm bound
+A central ingredient in the Real- β-SafeOpt algorithm is an upper bound on the RKHS norm of the target
+function. In particular, the safety and exploration guarantees inherited from (Sui et al., 2015) hinge on the
+knowledge of a concrete numerical upper bound on the RKHS norm. Unfortunately, while the RKHS norm is
+verywellunderstoodfromatheoreticalpointofview, inpracticeitiscurrentlynotpossibletoderiveconcrete
+numerical upper bounds on the RKHS norm from realistic assumptions in non-trivial cases, to the best of
+our knowledge, cf. the additional discussion in Section A.2. This issue is known in e.g. the learning-based
+control community (Fiedler et al., 2022), but has not yet been addressed in the context of safe BO. However,
+it has immediate consequences for SafeOpt-type algorithms. These algorithms are intended for hard safety
+settings, i.e., scenarios where anysafety violation is very costly and must be avoided. In these scenarios
+it is not possible to have a tuning phase before the actual optimization run where algorithmic parameters
+are set, since the safety requirements hold from the start. For SafeOpt-type algorithms this means that all
+algorithmic parameters have to be set beforehand, and these parameters need to ensure the safety and lead
+to satisfying exploration behavior. However, this entails an upper bound on the RKHS norm of the target
+function, which currently appears to be impossible to derive from reasonable prior knowledge in practically
+relevant scenarios.
+Furthermore, using an invalid RKHS upper norm bound can indeed easily lead to safety violations. In order
+to illustrate this, we run Real- β-SafeOpt on the same function ffrom Section 5.1, and set δ= 0.01, but
+this time, we use a misspecified RKHS norm of 2.5 in (5). Running this experiment now results in 1338
+failure runs out of 10000, cf. Table 1, which is much more than what would be expected from a safety
+probability of 1−δ= 0.99. For a summary of this experiment, see again Table 1. Finally, simply using a
+very conservative upper bound on the RKHS norm is not a viable strategy to overcome this problem. A
+severe overestimation of the RKHS norm leads to very large and overly conservative uncertainty bounds,
+which in turn leads to performance issues. In particular, since the uncertainty bounds are used to determine
+the safety sets in SafeOpt-type algorithms, a supposed RKHS upper norm bound that is too conservative
+can result in the algorithm “getting stuck”, i.e., no more exploration is possible. It should also be noted
+10Published in Transactions on Machine Learning Research (09/2024)
+that it is not even clear what “very conservative” means in the present context. While an extensive body of
+theory and strong qualitative intuitions on these objects are available, cf. Section A.2, the lack of concrete,
+quantitative bounds amenable to numerical evaluation makes it very difficult for users of BO to judge what
+a conservative estimate of the RKHS norm in a given situation could be.
+We argue that as a consequence, any SafeOpt-like algorithm should not depend on the knowledge of an upper
+bound on the RKHS norm of the target function for safety , at least in the setting of hard safety requirements
+whereanyfailure should be avoided (with high probability). More generally, in order to guarantee safety,
+we should only use assumptions that are judged as reliable and reasonable by practitioners. In particular,
+all assumptions that are used for safety should have a clear interpretation for practitioners and a clear
+connection to established prior knowledge in the application area of the safe BO algorithm. In the end, it is
+up to the user of safe BO to decide which assumptions used in the safety mechanism can be considered as
+reliable.
+6.2 Describing LoSBO and its safety guarantees
+Motivated by the popularity of SafeOpt, which combines GPs with a Lipschitz assumption, and the extensive
+experience of the systems and control community with Lipschitz bounds and bounded noise (cf. Section 4),
+we propose to use an upper bound on the Lipschitz constant of the target function and a known noise bound
+as the ingredients for safety in BO. The key idea is to ensure that the safety mechanism works reliably
+independent of the (statistical) exploration mechanism. In a generic SafeOpt algorithm, safety is guaranteed
+by ensuring that the safe sets Stcontain only safe inputs (potentially only up to high probability), i.e.,
+requiring that f(x)≥hfor allx∈St. Once this property is fulfilled, the rest of the algorithm can no
+longer violate the safety constraints anymore. Based on the earlier discussion, the construction of the safe
+set should only rely on the Lipschitz and noise bound. As is well-known, these two assumption allow the
+construction of lower bounds on the function (Milanese & Novara, 2004), and the corresponding safe sets
+should therefore be defined for all t≥1as
+St=St−1∪{x∈D|yt−1−E−Ld(xt−1,x)≥h}, (9)
+whereL∈R≥0is a bound on the Lipschitz constant of the unknown target function, E∈R≥0a bound on
+the magnitude of the noise, and S0is the initial safe set. We propose using this variant of the safe set, and
+leaving the rest of the generic SafeOpt algorithm unchanged, which leads to an algorithm we call Lipschitz-
+only Safe Bayesian Optimization (LoSBO). Our proposed modification applies to anyalgorithm instantiating
+the generic SafeOpt strategy outlined in Section 3. For concreteness, we focus in the following on the original
+SafeOpt algorithm from (Sui et al., 2015). The algorithm fulfills the following safety guarantee.
+Proposition 1. Letf:D→Rbe anL-Lipschitz function. Assume that |ϵt|≤Efor allt≥1and let
+∅̸=S0⊆Dsuch thatf(x)≥hfor allx∈S0. For any choice of the scaling factors βt>0, running the
+LoSBO algorithm leads to a sequence of only safe inputs, i.e., we have f(xt)≥hfor allt≥1.
+Proof.It is enough to show that ∀t≥0andx∈St, we havef(x)≥h. Induction on t: Fort= 0, this
+follows by assumption. For t≥1, letx∈St=St−1∪{x∈D|yt−1−E−Ld(xt−1,x)≥h}. Ifx∈St−1,
+thenf(x)≥hfollows from the induction hypothesis. Otherwise we have
+f(x) =f(xt) +ϵt−ϵt+f(x)−f(xt)≥yt−E−Ld(xt,x)≥h,
+where we used the L-Lipschitz continuity of fand the noise bound |ϵt|≤Ein the first inequality, and the
+definition of Stin the second inequality.
+The argument in the proof above is well-known in e.g. the systems identification literature, and the resulting
+bounds even fulfill certain optimality properties (Milanese & Novara, 2004). We would like to stress that the
+safety guarantee of LoSBO, as formalized in Proposition 1, is deterministic , i.e., it always holds and not only
+with high probability. This type of safety is often preferred in the context of control and robotics (Hewing
+et al., 2020; Brunke et al., 2022).
+11Published in Transactions on Machine Learning Research (09/2024)
+6.3 Discussion
+While LoSBO arises from a rather minor modification of the generic SafeOpt algorithm class (by changing
+the computation of the safe sets St),on a conceptual level significant differences arise . Inspecting
+the proof of Proposition 1 shows that the safety guarantee of LoSBO is independent of the underlying model
+sequence (Mt)t. As an important consequence, the choice of the uncertainty sets used in the optimization
+of the acquisition function cannot jeopardize safety. One consequence is that the assumption that the target
+functionfis contained in the RKHS of the covariance function used in GP regression is not necessary
+anymore. In particular, in order to ensure safety, we need only Assumption 1 together with a noise bound,
+and not Assumption 2 anymore . Similarly, hyperparameter tuning is not an issue for safety, cf. also to
+our discussion in Section 2.2. Of course, an appropriate function model is important for good exploration
+performance, but this issue is now independent of the safety aspect. As another, even more important
+consequence, in the context of the concrete LoSBO variant described in Algorithm 3 (Appendix), the scaling
+parameterβtisnowapropertuningparameter. Modifyingthem, evenonline, inordertoimproveexploration
+no longer interferes with the safety requirements. This differs from previous variants (and practical usage) of
+SafeOpt, where the scaling factors βtcannotbe freely tuned since they are central for the safety mechanism
+of these algorithms. This aspect is illustrated in Figure 3. In the situation depicted there, the uncertainty
+bounds do not hold uniformly, i.e., the target function is not completely covered by them, and deriving
+safety sets from these uncertainty bounds, regardless of whether to include the additional knowledge of the
+Lipschitz bound (Sui et al., 2015) or not (Berkenkamp et al., 2016), results in potential safety violations.
+However, since in LoSBO these bounds are ignored for the safe sets, this problem does not occur.
+xytrue function
+posterior mean
+uncertainty set
+Lipschitz cone
+data points
+unsafe area
+”wrong” safe set
+safe set
+safe set LoSBO
+Figure 3: Illustration of LosBO being safe, while a safe set based on invalid uncertainty bounds leads to
+potential safety violations. The safe set of LoSBO (gray set) is determined by the constant E(black arrow)
+and the Lipschitz cone (orange). The GP mean and the confidence bounds are illustrated in blue. The points
+in the safe set given by the lower confidence bound are green if they are safe and red if they are unsafe.
+Using aLipschitz bound instead of an RKHS norm bound comes with several advantages. First, a
+(quantitative) Lipschitz bound has a clear interpretation - it is an upper bound on the slope of the target
+function. Second, the Lipschitz assumption can be related to established prior knowledge: A known upper
+bound on the Lipschitz constant corresponds to an a priori bound on the rate of change of a function, i.e.,
+it is related to the sensitivity of the underlying problem. As discussed in-depth in Section 6.1, to the best
+of our knowledge this is not possible for the RKHS norm in non-trivial cases. Third, as already mentioned
+above, the Lipschitz assumption is independent of the internal model used for exploration, and hence much
+less prone to model misspecifications like wrong hyperparameters of kernels. Finally, the exact Lipschitz
+constant is rarely known in practice, and hence an upper bound has to be used. It is clear that a very
+conservative upper bound will inhibit exploration, just as a conservative upper bound on the RKHS norm,
+but this issue appears to be unavoidable with any quantitative a priori assumption.
+12Published in Transactions on Machine Learning Research (09/2024)
+Algorithm SafeOpt Real- β-SafeOpt Real- β-SafeOpt Real- β-SafeOpt LosBO
+Experimental settingβ= 2
+(heuristic)B= 2.5
+(underestimate)B= 10
+(correct)B= 20
+(overestimate)β= 2
+Not started % 1.93 3.16 30.40 68.34 0.018
+Safety violations % 3.95 0.859 0 0 0
+Safety violations
+worst case %28.62 13.38 0 0 0
+Final performance % 88.75 88.76 82.45 76.69 90.90
+Table 1: Safety-performance tradeoff in SafeOpt. We evaluated 100 functions sampled from an SE-kernel
+withB= 10. On each function we ran each algorithm 10000 times, starting from two initial safe points.
+The original SafeOpt algorithm comes with conditional6exploration guarantees . Since our modification
+leading to LoSBO essentially separates the safety and exploration mechanisms, the exploration guarantees
+from SafeOpt are rendered inapplicable in the present context. An inspection of the proof of (Sui et al., 2015,
+Theorem 1) shows that it cannot easily be modified to apply to LoSBO again, as the argument used there
+relies on the GP model interacting with the safety mechanism7. Furthermore, we suspect that pathological
+situations exist where LoSBO fails to properly explore. However, we have not observed such a situation
+in our extensive experiments. While providing (again conditional) exploration guarantees for LoSBO is an
+interesting focus for future work, we argue that the present lack of such theoretical guarantees does not di-
+minishtherelevanceandusefulnessofthisalgorithm. First, LoSBOshowsexcellentexplorationperformance,
+as demonstrated in the experiments described in the next section. Second, since the scaling parameters βt
+(which have an important influence on the exploration performance) are proper tuning parameters in LoSBO,
+unsatisfying performance of the algorithm can be overcome by using this tuning knob. We would like to
+stress again that in the previous variants of SafeOpt, this option is not available as the scaling parameters
+need to lead to valid uncertainty sets.
+6.4 Experimental evaluation
+As discussed in Section 5.2, a meaningful comparison with SafeOpt implementations relying on heuristics is
+impossible, since the latter essentially address a different problem setting. For this reason, we will compare
+LoSBO with Real- β-SafeOpt, which precisely adheres to the original SafeOpt setting. For the empirical
+evaluations a frequentist approach will be used as this is the most natural setting for SafeOpt-like algorithms,
+see (Srinivas et al., 2010; Fiedler et al., 2021a;b) for further discussion on this. Unless noted otherwise, in
+each experiment, we generate 100 RKHS functions (using the pre RKHS and ONB approaches), each with
+RKHS norm 10, and we compute a (slightly) conservative Lipschitz bound as well as an appropriate initial
+safe set. Following the previous safe BO literature, we restrict ourselves to compact subsets of Rd, and in
+this section we use d= 1andD= [0,1]for simplicity. Furthermore, we use independent additive noise,
+uniformly sampled from [−Bϵ,Bϵ], with (5) to compute βtin Real-β-SafeOpt, and E= 2Bϵandβt≡2
+in LoSBO. For each function we run the algorithms 10000 times to allow a frequentist evaluation of the
+behavior. The performance is measured by the (shifted and normalized) gap to the optimal function value
+ˆf∗
+t. Additional details on the experimental setup are provided in the appendix, cf. Section C.
+Well-specified setting We start by comparing LoSBO and Real- β-SafeOpt in a well-specified setting.
+This means that all the algorithmic parameters are set correctly, in particular, the covariance function used
+in GP regression is the kernel generating the RKHS from which the target functions are sampled. In Figure
+4, the results for this setting are presented. The thick solid lines are the means over all 100 functions and
+all of their repetitions, the fine lines are the means for each of the individual 100 target functions (over
+6By this we mean that the exploration guarantee given in (Sui et al., 2015, Theorem 1) is conditional on the choice of
+the kernel. Inspecting the expression for the time t∗in this latter result, we find that this result requires appropriate growth
+behavior of the maximum information gain γtin order to lead to non-vacuous exploration guarantees.
+7More precisely, with LoSBO we cannot ensure that the inequality in the last display in the proof of (Sui et al., 2015,
+Lemma 7) holds.
+13Published in Transactions on Machine Learning Research (09/2024)
+0 10 20
+Iteration0.00.51.0ˆf∗
+t
+ONB SE
+0 10 20
+Iteration
+Pre-RKHS Matern
+RealBetaSafeOpt RealBetaSafeOpt LoSBO LoSBO0 10 20
+Iteration
+Pre-RKHS Matern
+lGP= 4lc
+0 10 20
+Iteration
+Pre-RKHS Matern
+lGP= 0.2lc
+Figure 4: Comparison of LosBO and Real- β-SafeOpt in a well-specified setting. Thick solid lines are the
+means over all functions and repetitions, thin solid lines are the means over all repetitions for each individual
+function, shaded area corresponds to the 10 % and 90 % quantiles over all runs.
+10000 repetitions for each function), and the shaded area shows the 10 % and 90 % quantiles, again over all
+functions. Figure 4, left, displays the results for functions from the Squared Exponential RKHS, sampled
+using the ONB approach. Interestingly, LoSBO exhibits superior performance compared to Real- β-SafeOpt,
+despite providing the latter algorithm with the correct ingredients (Lipschitz bound, kernel, RKHS norm
+bound, noise variance). Sampling functions using the pre RKHS approach shows only minor differences, cf.
+Section C.3 in the appendix. Figure 4, second plot, shows the results for RKHS functions corresponding
+to a Matern-3/2 kernel and sampled with the pre RKHS approach. Qualitatively, we see the same picture,
+though the performance of both LoSBO and Real- β-SafeOpt appear to be slightly weaker compared to the
+previous setting. Intuitively, this is to be expected as Matern RKHS functions are generically less smooth
+than Squared Exponential RKHS functions, and both LoSBO and Real- β-SafeOpt rely on a Lipschitz bound,
+which is in turn related to regularity of functions.
+Misspecified setting We turn to misspecified settings, where the algorithmic parameters do not match
+the true setting of the target function. This is particularly interesting in the present situation, since the
+underlying GP model does not impact the safety of LoSBO, and therefore becomes amenable to tuning. We
+start with the length scale used in the kernel, which is arguably the most important type of hyperparameter
+in practice. In Figure 4, third plot, we show the results for overestimating the length scale in GP regression,
+using Matern kernels. More precisely, a Matern kernel is used both as the kernel for generating the target
+functions and as a covariance function in GP regression, but the length scale of the covariance function in GP
+regressionis4timestheengthscaleusedinthekerneltogeneratethetargetfunction. Thequalitativepicture
+remainsthesame, thoughitappearsthattheperformanceofReal- β-SafeOptsuffersfromthemisspecification
+more than LoSBO. More importantly, in this setting safety violations occur in 12.57 % of all runs. Moreover,
+for the worst-behaving target function 943 out of 10000 runs lead to safety violations, which is unacceptable
+in a real-world use case. Figure 4, rightmost plot, shows the complementary situation of underestimating the
+length scale in GP regression, again using Matern kernels. The length scale of the covariance function used in
+GP regression is 0.2 times the length scale of the kernel that is used to generate the target function. Again,
+the qualitative picture remains the same, but the performance degradation is worse for both algorithms in
+this case. Finally, consider the case where a different kernel is used to generate the target functions than
+the covariance function in the GP regression. We use a Matern-3/2 kernel to generate the target functions,
+and a Squared Exponential kernel as covariance function in the GP regression, with the same length scale
+for both. The results are displayed in Figure 7, lower left. Interestingly, essentially no qualitative difference
+can be noticed compared to the well-specified Matern case, cf. Figure 7 in the appendix. We suspect that
+this is due to the correct specification of the length scale, which in the present setting is more important
+than the kernel misspecification.
+14Published in Transactions on Machine Learning Research (09/2024)
+x1x0x2
+D
+Figure 5: Illustration of safe sets for a 2-dimensional input set. Left: Safe set in LoSBO resulting from three
+function evaluations. Right: Illustration of the acquisition function optimization in LoS-GP-UCB over a safe
+set resulting from four function evaluations. Two initial guesses for the local optimization are used for each
+of the balls that span the safe set according to (12).
+7 LoS-GP-UCB
+In SafeOpt-type algorithms, including our variant LoSBO (Algorithm 3), the central computational step
+is the optimization of the acquisition function over the expander and maximizer sets, see Algorithm 1.
+Inspecting the definition of the latter two sets, see Section 3, makes it clear that computing these sets
+requires a discrete input set D. For many typical application scenarios, at least parts of the input set will
+be continuous (e.g., if the optimization variables include a physical parameter that can vary continuously).
+This means that some form of discretization is necessary before a SafeOpt-type algorithm can be applicable.
+Typically, equidistant gridding of the (continuous parts of the) input set is used as a discretization, see
+(Berkenkamp et al., 2016) for a typical example. As a result, SafeOpt-type algorithms become impractical
+for even moderate dimensions, e.g., D⊆Rdford>3(Kirschner et al., 2019a; Sukhija et al., 2023), and as a
+member of this class, LoSBO inherits this limitation. In this section, we present and investigate an approach
+to overcome this issue. Instead of adapting existing solution approaches like (Duivenvoorden et al., 2017;
+Kirschner et al., 2019a; Sukhija et al., 2023), we suggest a pragmatic and straightforward variant that is
+motivated by three observations.
+First, safety in SafeOpt-type algorithms is ensured by restricting the optimization of the acquisition function
+to (subsets of) safe sets, i.e., sets S⊆Dsuch thatf|S≥h, wherefis the unknown target function. In
+other words, as long as we ensure that the acquisition function optimization is restricted to such sets S,
+the resulting algorithm will be safe, no matter how this optimization is performed or whether an additional
+restriction is added (as in SafeOpt, where the optimization is only over expander and maximizer sets). In
+the case of LoSBO, these safe sets are of a particularly simple form, as they are the union of closed spheres in
+a metric space, see Figure 5, left, for an illustration for the case D⊆R2. In typical application scenarios of
+SafeOpt-type algorithms, the number of input queries is relatively low, and hence the aforementioned union
+is only over relatively few sets. Second, a discrete input set for SafeOpt-type algorithms is necessary due to
+the involved definition of the expander and maximizer sets, which in turn are defined to guarantee proper
+exploration in the original SafeOpt setting (Sui et al., 2015). However, for concrete practical problems,
+such an underexploration might not pose a severe challenge, and an existing BO algorithm can simply be
+made safe by restricting the optimization of the acquisition function to a safe set Sas described above.
+In fact, the original SafeOpt paper (Sui et al., 2015) already discussed a safe variant of GP-UCB (Srinivas
+15Published in Transactions on Machine Learning Research (09/2024)
+et al., 2010). This indicates that it might be possible to avoid the complicated sets involved in SafeOpt-type
+algorithms, and still attain practically useful exploration performance. Third, in the current practice of BO,
+moderately high dimensions of the input space are not problematic for modern BO algorithms8Typically,
+acquisition functions are optimized by running a local optimization method (usually gradient-based) from
+severalinitialguesses(whichmightberandom, orbasedonheuristics). Inparticular, nogriddingisnecessary,
+and this strategy can even deal with moderately high dimensions since local search methods behave well
+despite increasing dimensionality. In fact, state-of-the-art BO libraries like BOTorch (Balandat et al., 2020)
+implement exactly this approach as the default option.
+Based on these three observations, we now propose a straightforward safe BO algorithm that works even in
+moderate input dimensions, is compatible with modern BO libraries, and retains all the safety guarantees
+from LoSBO. In Section 7.1, we describe this algorithm in detail and provide some discussion. In Section
+7.2, we evaluate the algorithm empirically and compare it to LoSBO.
+7.1 Algorithm
+Consider the setting of LoSBO as described in Section 6.2. Motivated by the preceding discussion, we
+start with a standard GP-based BO algorithm that does not need expander and maximizer sets (or similar
+complicated sets requiring discretization). Due to its relation to SafeOpt, we choose GP-UCB (Srinivas
+et al., 2010) for this task, so at step t≥1, the next input is
+xt+1= argmaxx∈Dµt(x) +βtσt(x), (10)
+for an appropriate scaling factor βt∈R>0. As usual, ties are broken arbitrarily. Using the (scaled) posterior
+variance as the acquisition function would be even closer to SafeOpt, but numerical experiments indicate that
+GP-UCB performs slightly better in this context. Next, we restrict the acquisition function optimization to
+the safe sets Stas defined for LoSBO in (9),
+xt+1= argmaxx∈Stµt(x) +βtσt(x). (11)
+Observe now that
+St=Nt/uniondisplay
+j=1¯Brj(zj) (12)
+for someNt∈N>0,r1,...,rNt∈R>0andz1,...,zNt∈D, and ¯Br(z) ={x∈D|dD(z,x)≤r}is the
+closed ball with radius r∈R>0and center z∈Din the metric space D. For example, if the initial safe set
+has only one element x0and no input is repeatedly sampled, then Nt=t+ 1,z1=x0andzj=xj−1for
+j= 2,...,t + 1. Using the decomposition (12), we now have
+xt+1= argmaxj=1,...,Ntargmaxx∈¯Brj(zj)µt(x) +βtσt(x). (13)
+Each of the inner optimization problems maxx∈¯Brj(zj)µt(x) +βtσt(x),j= 1,...,Nt, is a maximization
+problem over the convex sets ¯Brj(zj), and each of these inner problems are independent. In particular, these
+optimizationscanbetriviallyparallelized. Inpractice,oneusuallyhas D⊆Rd(oftenwithasimplegeometry)
+and a differentiable covariance function k, so it is possible to use a gradient-based local optimization method
+started from multiple initial guesses. This is illustrated in Figure 5, right. All of these multistarts are
+independent, and can therefore also be parallelized. We thus arrive at Algorithm 2, which we call Lipschitz-
+only Safe Gaussian Process Upper Confidence Bound (LoS-GP-UCB) algorithm in the following. LoS-
+GP-UCB can easily be implemented with state-of-the-art BO libraries. For the numerical experiments
+described in the next section, we have chosen BoTorch (Balandat et al., 2020), which allows an easy parallel
+implementation of the acquisition function optimization. Finally, LoS-GP-UCB retains the safety guarantees
+from LoSBO. In particular, the scaling factors (βt)tremain tuning factors, and the safety of LoS-GP-UCB
+is independent of their choice. Furthermore, safety of LoS-GP-UCB does not require Assumption 2 .
+8Here we are referring to handling the dimensionality within the algorithm, specifically optimization of the acquisition
+function, and not the exploration performance. Of course, the latter poses challenges, especially if not enough structural or
+qualitative prior knowledge is encoded in the BO function model.
+16Published in Transactions on Machine Learning Research (09/2024)
+Algorithm 2 LoS-GP-UCB
+Require: Lipschitz constant L, algorithm to compute βt, noise bound E, initial safe set S0, safety threshold
+h
+1:ComputeN0,z1,...,zN0,r1,...,rN0,β0
+2:fort= 1,2,...do
+3:xt= argmaxj=1,...,Nt−1argmaxx∈¯Brj(zj)µt−1(x) +βt−1σt−1(x). ▷ Determine next input
+4:Query function with xt, receiveyt=f(xt) +ϵt
+5:Update GP with new data point (xt,yt), resulting in mean µtandσt
+6:Compute updated βt
+7:ComputeNtand add new zj,rj
+8:end for
+7.2 Experimental evaluation
+Analogously to the case of Real- β-SafeOpt and LoSBO, a frequentist setup will be used, i.e., the algorithm
+will be run on a fixed target function for many independent noise realizations. In the experiments two aspects
+will be investigated. First, LoS-GP-UCB will be compared with Real- β-SafeOpt and LoSBO. Second, we
+apply LoS-GP-UCB to several benchmark functions with moderate input dimensions.
+We start with the comparison to Real- β-SafeOpt and LoSBO. Since these two algorithms rely on a discrete
+input space, this comparison necessarily has to be performed on functions with a low dimensional input.
+We choose essentially the same experimental settings as in Section 7.2 and consider only the well-specified
+case. As for LoSBO, we use βt≡2in LoS-GP-UCB, and we consider one-dimensional RKHS functions. The
+algorithms are evaluated on 100 target functions sampled from the pre RKHS corresponding to a Matern-3/2
+kernel, and for each function, we run the algorithms 1000 times9. The results of this experiment are shown in
+Figure 6 (a), where we again use the evaluation metric (16). Thick solid lines are the means over all functions
+and repetitions and shaded areas correspond to the 10 % and 90 % quantiles (again over all functions and
+realizations). To avoid clutter, the means for each individual function are plotted only for LoS-GP-UCB
+(thin lines). It is clear from Figure 6 that the performance of Los-GP-UCB is only slightly inferior to the
+original LosBO algorithm, yet still superior to Real- β-SafeOpt. This outcome indicates that LoS-GP-UCB is
+not severely affected by the under-exploration problem described for a safe variant of GP-UCB in (Sui et al.,
+2015). We suspect that, similar to LoSBO, this is due to the overoptimism resulting from setting βt≡2,
+corresponding to moderately aggressive exploration.
+0 10 20
+Iteration0.00.51.0ˆf∗
+t
+(a)
+Pre-RKHS Matern
+0 50 100
+Iterations(b)
+Gaussian10D
+0 50 100
+Iterations(c)
+Hartmann6D
+0 50 100
+Iterations(d)
+Camelback2D
+RealBeta
+RealBetaLosBO
+LosBOLoS-GP-UCB
+LoS-GP-UCBRandom
+Random
+Figure 6: (a) Comparison of LoS-GP-UCB to Real- β-SafeOpt and LoSBO. (b)-(d) Comparison of Los-GP-
+UCB to random sampling on more high-dimensional test functions.
+9The qualitative picture is already clear for 1000 repetitions, hence we choose to save computational resources and do not
+use 10000 repetitions as in Section 7.2.
+17Published in Transactions on Machine Learning Research (09/2024)
+Let us turn to the evaluation of LoS-GP-UCB on several benchmark functions with moderate to high input
+dimensions. As test functions, we use the standard benchmarks Camelback (2d) and Hartmann (6d). Similar
+to (Kirschner et al., 2019a), we also use a Gaussian function f(x) = exp (−4∥x∥2
+2)in ten dimensions (10d) as
+a benchmark. For the Camelback and Hartmann functions, we choose a random initial point in the safe set.
+For the Gaussian function, we choose a random safe set from the level f(x0) = 0.4. We assume uniformly
+bounded noise with a noise level of 0.01. In this synthetic setting the Lipschitz constant Lis determined by
+evaluating the function on a fine grid. As a model we use a Squared Exponential kernel with output variance
+set to 1 and length scale set to 1/L. For the prior mean we choose 0.5 as the function values are between 0
+and 1. Finally, in all these settings, we compare LoS-GP-UCB to random search, and run both algorithms
+from the same initial safe set for 100 iterations, repeating this 100 times (for different random choices of the
+initial safe set). The results of this experiment is shown in Figure 6 (b), (c) and (d).
+8 Conclusion
+In this work, we are concerned with practically relevant safety aspects of the important class of SafeOpt-type
+algorithms. We identified the use of heuristics to derive uncertainty bounds as a potential source of safety
+violations in the practical application of these algorithms. This prompted us to use recent, rigorous uncer-
+tainty bounds in SafeOpt, which allowed us to numerically investigate the safety behavior of this algorithm.
+We further identified the knowledge of an upper bound on the RKHS norm of the target function as a
+serious obstacle to reliable real-world applicability of SafeOpt-type algorithms. To overcome this obstacle,
+we proposed LoSBO, a BO algorithm class relying only on a Lipschitz bound and noise bound to guarantee
+safety. Numerical experiments demonstrated that this algorithm is not only safe, but also exhibits supe-
+rior performance. However, analogously to related algorithms, LoSBO is only suitable for low dimensional
+problems. We therefore also proposed an additional variant (LoS-GP-UCB) suitable for moderately high
+dimensional problems.
+The two key assumptions to ensure safety are a known Lipschitz bound on the target function and a known
+bound on the additive measurement noise, which have clear interpretations, appear natural in many ap-
+plications, and are established in domains like control engineering. The safety guarantees of the proposed
+algorithms rely on these assumptions, and they have to be judged on a case-by-case base by practitioners.
+Ongoing work is concerned with implementing the presented algorithms for safe learning in an automotive
+context. While this article focuses on safety, providing exploration guarantees for LoSBO is an interesting
+aspect of future work. We expect that the approach outlined in Section 6 applies to most SafeOpt variants.
+The derivation, implementation, and evaluation of the corresponding LoSBO-type algorithms for these vari-
+ants is thus another interesting direction for future work. Our findings in combination with evidence in the
+literature that SafeOpt and related algorithms have been successfully used in various applications indicate
+that this algorithm class does not ensure hard safety constraints (in practice), but instead yields “cautious”
+behavior. The precise connection to conservative bandits and existing cautious BO approaches is another
+interesting topic for further investigations.
+Broader Impact Statement
+This work is concerned with safety issues of a popular BO algorithm that has already found numerous
+applications in real-world scenarios. Henceforth we contribute to the improved safety and reliability of
+machine learning methods for real-world applications. Furthermore, we expect no adverse societal impact of
+our work.
+Acknowledgments
+We thank Paul Brunzema and Alexander von Rohr for very helpful discussions and Sami Azirar for support
+whengeneratingplots. ThisworkwasperformedinpartwithintheHelmholtzSchoolforDataScienceinLife,
+EarthandEnergy(HDS-LEE).Furthermore, theresearchwasinpartfundedbytheGermanFederalMinistry
+for Economic Affairs and Climate Action (BMWK) through the project EEMotion and by the Deutsche
+Forschungsgemeinschaft (DFG, German Research Foundation) under Germany’s Excellence Strategy EXC-
+18Published in Transactions on Machine Learning Research (09/2024)
+2023 Internet of Production 390621612. Computations were performed with computing resources granted
+by RWTH Aachen University under project rwth1459.
+References
+Yasin Abbasi-Yadkori. Online learning for linearly parametrized control problems. 2013.
+Sanae Amani, Mahnoosh Alizadeh, and Christos Thrampoulidis. Linear stochastic bandits under safety
+constraints. Advances in Neural Information Processing Systems , 32, 2019.
+Marc Atteia. Hilbertian kernels and spline functions . Elsevier, 1992.
+Maximilian Balandat, Brian Karrer, Daniel Jiang, Samuel Daulton, Ben Letham, Andrew G Wilson, and
+Eytan Bakshy. BoTorch: A framework for efficient Monte-Carlo Bayesian optimization. Advances in
+neural information processing systems , 33:21524–21538, 2020.
+Dominik Baumann, Alonso Marco, Matteo Turchetta, and Sebastian Trimpe. Gosafe: Globally optimal
+safe robot learning. In 2021 IEEE International Conference on Robotics and Automation (ICRA) , pp.
+4452–4458. IEEE, 2021.
+Gleb Beliakov. Interpolation of Lipschitz functions. Journal of computational and applied mathematics , 196
+(1):20–44, 2006.
+Felix Berkenkamp, Angela P Schoellig, and Andreas Krause. Safe controller optimization for quadrotors
+with gaussian processes. In 2016 IEEE international conference on robotics and automation (ICRA) , pp.
+491–496. IEEE, 2016.
+Felix Berkenkamp, Angela P Schoellig, and Andreas Krause. No-regret Bayesian optimization with unknown
+hyperparameters. Journal of Machine Learning Research , 20:1–24, 2019.
+Felix Berkenkamp, Andreas Krause, and Angela P Schoellig. Bayesian optimization with safety constraints:
+safe and automatic parameter tuning in robotics. Machine Learning , 112(10):3713–3747, 2023.
+Alain Berlinet and Christine Thomas-Agnan. Reproducing kernel Hilbert spaces in probability and statistics .
+Springer Science & Business Media, 2004.
+Ilija Bogunovic and Andreas Krause. Misspecified Gaussian process bandit optimization. Advances in Neural
+Information Processing Systems , 34:3004–3015, 2021.
+Lukas Brunke, Melissa Greeff, Adam W Hall, Zhaocong Yuan, Siqi Zhou, Jacopo Panerati, and Angela P
+Schoellig. Safe learning in robotics: From learning-based control to safe reinforcement learning. Annual
+Review of Control, Robotics, and Autonomous Systems , 5:411–444, 2022.
+Jan-Peter Calliess. Conservative decision-making and inference in uncertain dynamical systems . PhD thesis,
+Oxford University, UK, 2014.
+Jan-Peter Calliess, Stephen J Roberts, Carl Edward Rasmussen, and Jan Maciejowski. Lazily adapted
+constant kinky inference for nonparametric regression and model-reference adaptive control. Automatica ,
+122:109216, 2020.
+Sayak Ray Chowdhury and Aditya Gopalan. On kernelized multi-armed bandits. 34th International Con-
+ference on Machine Learning, ICML 2017 , 2:1397–1422, 2017.
+Duane A Cooper. Learning Lipschitz functions. International journal of computer mathematics , 59(1-2):
+15–26, 1995.
+SébastienDaVeiga, FabriceGamboa, BertrandIooss, andClémentinePrieur. Basics and trends in sensitivity
+analysis: Theory and practice in R . SIAM, 2021.
+19Published in Transactions on Machine Learning Research (09/2024)
+Rikky RPR Duivenvoorden, Felix Berkenkamp, Nicolas Carion, Andreas Krause, and Angela P Schoel-
+lig. Constrained Bayesian optimization with particle swarms for safe adaptive controller tuning. IFAC-
+PapersOnLine , 50(1):11800–11807, 2017.
+Christian Fiedler. Lipschitz and Hölder continuity in reproducing kernel Hilbert spaces. arXiv preprint
+arXiv:2310.18078 , 2023.
+Christian Fiedler, Carsten W. Scherer, and Sebastian Trimpe. Practical and rigorous uncertainty bounds
+for Gaussian process regression. Proceedings of the AAAI conference on artificial intelligence , 35, 2021a.
+ChristianFiedler, CarstenW.Scherer, andSebastianTrimpe. Learning-enhancedrobustcontrollersynthesis.
+60th IEEE Conference on Decision and Control (CDC) , 2021b.
+Christian Fiedler, Carsten W. Scherer, and Sebastian Trimpe. Learning functions and uncertainty sets
+using geometrically constrained kernel regression. In 2022 IEEE 61st Conference on Decision and Control
+(CDC), pp. 2141–2146. IEEE, 2022.
+Christian Fiedler, Michael Herty, and Sebastian Trimpe. On kernel-based statistical learning in the mean
+field limit. In Advances in Neural Information Processing Systems , volume 36, 2024.
+Simon Fischer and Ingo Steinwart. Sobolev norm learning rates for regularized least-squares algorithms. The
+Journal of Machine Learning Research , 21(1):8464–8501, 2020.
+Lukas P Fröhlich, Melanie N Zeilinger, and Edgar D Klenske. Cautious Bayesian optimization for efficient
+and scalable policy search. In Learning for Dynamics and Control , pp. 227–240. PMLR, 2021.
+Roman Garnett. Bayesian optimization . Cambridge University Press, 2023.
+Pierre Hansen, Brigitte Jaumard, and Shi-Hui Lu. Global optimization of univariate Lipschitz functions: I.
+survey and properties. Mathematical programming , 55(1-3):251–272, 1992.
+Trevor Hastie, Robert Tibshirani, Jerome H Friedman, and Jerome H Friedman. The elements of statistical
+learning: data mining, inference, and prediction , volume 2. Springer, 2009.
+Mohamed K. Helwa, Adam Heins, and Angela P. Schoellig. Provably robust learning-based approach for
+high-accuracy tracking control of Lagrangian systems. IEEE Robotics and Automation Letters , 4(2):1587–
+1594, 2019. ISSN 23773766. doi: 10.1109/LRA.2019.2896728.
+José Miguel Hernández-Lobato, Michael A Gelbart, Ryan P Adams, Matthew W Hoffman, Zoubin Ghahra-
+mani, et al. A general framework for constrained bayesian optimization using information-based search.
+Journal of Machine Learning Research , 17(160):1–53, 2016.
+Lukas Hewing, Kim P Wabersich, Marcel Menner, and Melanie N Zeilinger. Learning-based model predictive
+control: Toward safe learning in control. Annual Review of Control, Robotics, and Autonomous Systems ,
+3:269–296, 2020.
+Julien Walden Huang, Stephen J Roberts, and Jan-Peter Calliess. On the sample complexity of Lipschitz
+constant estimation. Transactions on Machine Learning Research , 2023.
+ToniKarvonenandChrisJOates. MaximumlikelihoodestimationinGaussianprocessregressionisill-posed.
+Journal of Machine Learning Research , 24(120):1–47, 2023.
+Toni Karvonen, George Wynne, Filip Tronarp, Chris Oates, and Simo Sarkka. Maximum likelihood es-
+timation and uncertainty quantification for Gaussian process approximation of deterministic functions.
+SIAM/ASA Journal on Uncertainty Quantification , 8(3):926–958, 2020.
+YoungminKim, RichardAllmendinger, andManuelLópez-Ibáñez. Safelearningandoptimizationtechniques:
+Towards a survey of the state of the art. In International Workshop on the Foundations of Trustworthy
+AI Integrating Learning, Optimization and Reasoning , pp. 123–139. Springer, 2020.
+20Published in Transactions on Machine Learning Research (09/2024)
+Johannes Kirschner, Mojmir Mutny, Nicole Hiller, Rasmus Ischebeck, and Andreas Krause. Adaptive and
+safe Bayesian optimization in high dimensions via one-dimensional subspaces. In International Conference
+on Machine Learning , pp. 3429–3438. PMLR, 2019a.
+Johannes Kirschner, Manuel Nonnenmacher, Mojmír Mutn` y, Andreas Krause, Nicole Hiller, Rasmus Is-
+chebeck, and Andreas Adelmann. Bayesian optimisation for fast and safe parameter tuning of SwissFEL.
+InFEL2019, Proceedings of the 39th International Free-Electron Laser Conference , pp. 707–710. JACoW
+Publishing, 2019b.
+Robert Kleinberg, Aleksandrs Slivkins, and Eli Upfal. Bandits and experts in metric spaces. Journal of the
+ACM (JACM) , 66(4):1–77, 2019.
+Torsten Koller, Felix Berkenkamp, Matteo Turchetta, and Andreas Krause. Learning-based model predictive
+control for safe exploration. Proceedings of the IEEE Conference on Decision and Control , 2018-Decem:
+6059–6066, 2019. ISSN 07431546. doi: 10.1109/CDC.2018.8619572.
+Hayri Korezlioglu. Reproducing kernels in separable Hilbert spaces. Pacific Journal of Mathematics , 25(2):
+305–314, 1968.
+Tor Lattimore and Csaba Szepesvári. Bandit algorithms . Cambridge University Press, 2020.
+Armin Lederer, Jonas Umlauft, and Sandra Hirche. Uniform error bounds for Gaussian process regression
+with application to safe control. Advances in Neural Information Processing Systems , 32, 2019.
+Milan Lukić and Jay Beder. Stochastic processes with sample paths in reproducing kernel Hilbert spaces.
+Transactions of the American Mathematical Society , 353(10):3945–3969, 2001.
+CédricMalherbeandNicolasVayatis. GlobaloptimizationofLipschitzfunctions. In International Conference
+on Machine Learning , pp. 2314–2323. PMLR, 2017.
+Alonso Marco, Dominik Baumann, Majid Khadiv, Philipp Hennig, Ludovic Righetti, and Sebastian Trimpe.
+Robot learning with crash constraints. IEEE Robotics and Automation Letters , 6(2):1439–1446, 2021.
+Mario Milanese and Carlo Novara. Set membership identification of nonlinear systems. Automatica , 40(6):
+957–975, 2004.
+Carlo Novara, Lorenzo Fagiano, and Mario Milanese. Direct feedback control design for nonlinear systems.
+Automatica , 49(4):849–860, 2013.
+Baver Okutmuştur. Reproducing kernel Hilbert spaces . PhD thesis, Bilkent Universitesi (Turkey), 2005.
+Vern I Paulsen and Mrinal Raghupathi. An introduction to the theory of reproducing kernel Hilbert spaces ,
+volume 152. Cambridge university press, 2016.
+János D Pintér. Global optimization in action: continuous and Lipschitz optimization. Algorithms, imple-
+mentations and applications , volume 6. Springer Science & Business Media, 1995.
+C E Rasmussen and C K I Williams. Gaussian Processes for Machine Learning . Adaptive Computation and
+Machine Learning. MIT Press, Cambridge, MA, USA, 2006.
+Parisa Sarikhani, Benjamin Ferleger, Jeffrey Herron, Babak Mahmoudi, and Svjetlana Miocinovic. Au-
+tomated deep brain stimulation programing with safety constraints for tremor suppression. Brain
+Stimulation , 14(6):1699–1700, 2021. ISSN 1935861X. doi: 10.1016/j.brs.2021.10.357. URL https:
+//doi.org/10.1016/j.brs.2021.10.357 .
+Yaroslav D Sergeyev, Antonio Candelieri, Dmitri E Kvasov, and Riccardo Perego. Safe global optimization
+of expensive noisy black-box functions in the δ-Lipschitz framework. Soft Computing , 24(23):17715–17735,
+2020.
+Bobak Shahriari, Kevin Swersky, Ziyu Wang, Ryan P Adams, and Nando De Freitas. Taking the human out
+of the loop: A review of Bayesian optimization. Proceedings of the IEEE , 104(1):148–175, 2015.
+21Published in Transactions on Machine Learning Research (09/2024)
+Aleksandrs Slivkins et al. Introduction to multi-armed bandits. Foundations and Trends ®in Machine
+Learning , 12(1-2):1–286, 2019.
+Niranjan Srinivas, Andreas Krause, Sham Kakade, and Matthias Seeger. Gaussian process optimization
+in the bandit setting: No regret and experimental design. ICML 2010 - Proceedings, 27th International
+Conference on Machine Learning , pp. 1015–1022, 2010. doi: 10.1109/TIT.2011.2182033.
+Ingo Steinwart and Andreas Christmann. Support vector machines . Springer Science & Business Media,
+2008.
+IngoSteinwartandClintScovel. Mercer’stheoremongeneraldomains: Ontheinteractionbetweenmeasures,
+kernels, and RKHSs. Constructive Approximation , 35:363–417, 2012.
+Ingo Steinwart, Don R Hush, Clint Scovel, et al. Optimal rates for regularized least squares regression. In
+COLT, pp. 79–93, 2009.
+RG Strongin. On the convergence of an algorithm for finding a global extremum. Eng. Cybernetics , 11:
+549–555, 1973.
+Yanan Sui, Alkis Gotovos, Joel Burdick, and Andreas Krause. Safe exploration for optimization with Gaus-
+sian processes. In International conference on machine learning , pp. 997–1005. PMLR, 2015.
+Yanan Sui, Vincent Zhuang, Joel Burdick, and Yisong Yue. Stagewise safe Bayesian optimization with
+Gaussian processes. In International conference on machine learning , pp. 4781–4789. PMLR, 2018.
+Bhavya Sukhija, Matteo Turchetta, David Lindner, Andreas Krause, Sebastian Trimpe, and Dominik Bau-
+mann. Gosafeopt: Scalable safe exploration for global optimization of dynamical systems. Artificial
+Intelligence , 320:103922, 2023.
+Aretha L Teckentrup. Convergence of Gaussian process regression with estimated hyper-parameters and
+applications in Bayesian inverse problems. SIAM/ASA Journal on Uncertainty Quantification , 8(4):1310–
+1337, 2020.
+Abdullah Tokmak, Christian Fiedler, Melanie N Zeilinger, Sebastian Trimpe, and Johannes Köhler. Au-
+tomatic nonlinear MPC approximation with closed-loop guarantees. arXiv preprint arXiv:2312.10199 ,
+2023.
+Alexandre Tsybakov. Introduction to Nonparametric Estimation . Springer New York, NY, 2009.
+Matteo Turchetta, Felix Berkenkamp, and Andreas Krause. Safe exploration in finite Markov decision
+processes with Gaussian processes. Advances in Neural Information Processing Systems , (Nips):4312–
+4320, 2016. ISSN 10495258.
+Holger Wendland. Scattered data approximation , volume 17. Cambridge university press, 2004.
+Justin Whitehouse, Aaditya Ramdas, and Steven Z Wu. On the sublinear regret of GP-UCB. Advances in
+Neural Information Processing Systems , 36, 2024.
+Yifan Wu, Roshan Shariff, Tor Lattimore, and Csaba Szepesvári. Conservative bandits. In International
+Conference on Machine Learning , pp. 1254–1262. PMLR, 2016.
+George Wynne, François-Xavier Briol, and Mark Girolami. Convergence guarantees for Gaussian process
+means with misspecified likelihoods and smoothness. The Journal of Machine Learning Research , 22(1):
+5468–5507, 2021.
+22Published in Transactions on Machine Learning Research (09/2024)
+A Background on RKHSs
+A.1 A brief introduction
+Consider a function k:D×D→R. We callkpositive semidefinite if for allx1,...,xN∈D,N∈N>0, the
+matrix/parenleftbigk(xi,xj)/parenrightbig
+i,j=1,...,Nis positive semidefinite. Equivalently, the function kis symmetric ( k(xi,xj) =
+k(xj,xi)for alli,j= 1,...,N), and for all α1,...,αN∈Rwe have/summationtextN
+i,j=1αiαjk(xi,xj)≥0. In the
+literature such a function is often called positive definite orof positive type . Additionally, kis calledpositive
+definite, if for all pairwise distinct x1,...,xN∈D, the matrix/parenleftbigk(xi,xj)/parenrightbig
+i,j=1,...,Nis positive definite. This
+property is sometimes referred to as strict positive definiteness in the literature.
+LetHbe a Hilbert space functions on D. We callHareproducing kernel Hilbert space (RKHS) if every
+evaluation functional is continuous, i.e., for all x∈Dthe mapping H∋f∝⇕⊣√∫⊔≀→f(x)∈Ris continuous w.r.t.
+the norm induced by the scalar product in H. Furthermore, kis called a reproducing kernel (for H)if 1)
+k(·,x)∈Hfor allx∈D, and 2)f(x) =⟨f,k(·,x)⟩Hfor allf∈Handx∈D.
+As is well-known, His a RKHS if and only if it has a reproducing kernel, and in this case the latter is unique
+(Steinwart & Christmann, 2008, Lemma 4.19, Theorem 4.20). Furthermore, every reproducing kernel is
+positive semidefinite, and every positive semidefinite function is a reproducing kernel for a unique RKHS
+(Steinwart & Christmann, 2008, Theorem 4.16, 4.21). If kis positive semidefinite, then we denote its unique
+RKHS as (Hk,⟨·,·⟩k), and the induced norm by ∥·∥k. Furthermore, we define the pre RKHS by
+Hpre
+k= span{k(·,x)|x∈D}=/braceleftiggN/summationdisplay
+n=1αnk(·,xn)|N∈N>0,αn∈R,xn∈D, n = 1,...,N/bracerightigg
+,(14)
+and this subspace is dense in Hkw.r.t.∥·∥k. Givenf=/summationtextN
+n=1αnk(·,xn),g=/summationtextM
+m=1βmk(·,ym)∈Hpre
+k,
+we have
+⟨f,g⟩k=N/summationdisplay
+n=1M/summationdisplay
+m=1αnβmk(ym,xn), (15)
+see (Steinwart & Christmann, 2008, Theorem 4.21).
+IfkisthecovariancefunctionofaGP,thenitispositivesemidefinite(sinceeverycovariancematrixispositive
+semidefinite), and hence the reproducing kernel of a unique RKHS. Conversely, if kis the reproducing kernel
+of a RKHS, then kis positive semidefinite, there exists a GP having kas its covariance function, and the
+GP can be chosen with a zero mean function (Berlinet & Thomas-Agnan, 2004).
+Furthermore, consider GP regression with a prior GPD(m,k), thenµt−m∈Hpre
+k, whereµtis the posterior
+mean corresponding to a finite data set with tpoints. In particular, the posterior mean for a zero mean
+prior GP is always in the pre RKHS corresponding to the covariance function. As is customary in machine
+learning with GPs (Rasmussen & Williams, 2006), and also in many BO scenarios (Garnett, 2023), in the
+following we will use a zero mean GP prior, m≡0, without loss of generality.
+A.2 Additional discussion
+Theory for the RKHS norm For an arbitrary kernel, one can use discretization-based variational char-
+acterizations of the RKHS norm (and RKHS functions), for example, by maximization over a family of lower
+bounds on the RKHS norm (Fiedler et al., 2024, Section B), (Atteia, 1992, Chapter I), by minimization over
+certain bounds on function values at finitely many inputs (Okutmuştur, 2005, Theorem A.2.6), by minimiza-
+tion over finite interpolation problems (Paulsen & Raghupathi, 2016, Theorem 3.11), or by minimization over
+certain matrix inequalities (Paulsen & Raghupathi, 2016, Theorem 3.11). For separable RKHSs, the RKHS
+norm can be expressed using a sampling expansion (Korezlioglu, 1968), or as the limit of norms of RKHSs
+over finite inputs (Lukić & Beder, 2001, Lemma 4.6). On the one hand, all of these variational problems have
+an explicit form and they work for anykernel (any kernel with separable RKHS, respectively). However,
+it is not at all clear how to relate these representations to common properties of functions that might be
+used as reliable prior knowledge to derive upper bounds on the RKHS norm. Furthermore, these variational
+23Published in Transactions on Machine Learning Research (09/2024)
+problems generally cannot be used in numerical methods to estimate upper bounds on the RKHS norm,
+but only lower bounds, though they may be used for estimating bounds in heuristics (Tokmak et al., 2023).
+Since these characterizations are based on discretizations of a given RKHS function, in particular, using the
+exact function values, they are not suitable in the present setting of unknown target functions only accessible
+through noisy evaluations.
+If one considers more specific classes of kernels, other characterizations of the RKHS norm become available.
+For example, continuous kernels on a compact metric space equipped with a measure having full support
+(often called a Mercer kernel in this context) allow a description of the RKHS norm as a weighted ℓ2-norm
+(Steinwart & Christmann, 2008, Section 4.5), based on Mercer’s theorem. This has a clear interpretation
+in the context of kernel methods, in particular, giving insight into the regularization behavior of the RKHS
+norm in optimization problems in kernel machines (Hastie et al., 2009, Section 5.8), which in turn can be
+used to derive learning rates for various statistical learning problems (Steinwart et al., 2009). More general
+forms of Mercer’s theorem are available (Steinwart & Scovel, 2012), which in turn lead to improved learning
+theory results (Fischer & Steinwart, 2020). While the RKHS norm representation for Mercer kernels is an
+important tool for statistical learning theory and provides intuition about the regularization behavior, it is
+again unclear how it can be used to derive quantitative RKHS norm bounds. Expressing the RKHS norm
+for Mercer kernels as a weighted ℓ2-norm provides valuable qualitative intuition about the corresponding
+RKHS norm, but we are not aware of any practically relevant example where this has been used to translate
+realistic prior knowledge into a concrete upper bound on the RKHS norm.
+Similarly, forsufficientlyregulartranslation-invariantkernels, theRKHSnormcanbeexpressedasaweighted
+integral over the Fourier transform of RKHS functions (Wendland, 2004, Theorem 10.12). This formulation
+allows an intuitive interpretation of the RKHS norm as a generalized energy, penalizing high-frequency
+behavior of RKHS functions (as determined by the Fourier transforms of the kernel). Several important
+function spaces are related to RKHSs, for example certain Sobolev spaces (Wendland, 2004, Chapter 10)
+or Fock spaces (Steinwart & Christmann, 2008, Section 4.4), which again have their own representations of
+the RKHS norm (potentially after some embedding). Again, all of these representations offer insights into
+the RKHS norm, and are important theoretical tools, but how this can be used to derive practically useful
+quantitative upper bounds on the RKHS norm remains unclear.
+To summarize, while an extensive body of work on characterization and representation results for the RKHS
+norm is available, these results appear to be unsuitable to derive numerical upper bounds on this norm using
+practically meaningful prior knowledge.
+RKHS membership The assumption that the target function fis contained the RKHS Hkis standard
+in the BO literature (Abbasi-Yadkori, 2013; Srinivas et al., 2010; Chowdhury & Gopalan, 2017; Whitehouse
+et al., 2024), where kis a kernel that is used as the covariance function in GP regression. In general, if
+functions from Hkare to be used as models of the underlying target function, the RKHS Hkhas to be
+sufficiently rich. In many cases, as a qualitative assumption, this is quite mild. For example, if Dis a
+compact metric space, then a large variety of universal kernels are available – kernels with an RKHS that
+is dense (w.r.t. the supremum norm) in the set of all continuous functions on D(Steinwart & Christmann,
+2008, Section 4.6). However, the assumption f∈Hkis considerably more stringent and delicate. Specifically,
+even containment of the target function within an RKHS generated by a kernel from the same class as the
+one used as a covariance (e.g., a squared exponential or Matern kernel) may not be sufficient, because
+there can be a mismatch of hyperparameters. For the case of squared exponential kernels, a complete
+characterization of the inclusions of RKHSs w.r.t. different hyperparameters is described in (Steinwart
+& Christmann, 2008, Section 4.4), revealing that this situation can indeed occur. While there is work on
+covariance function misspecification in GP regression (Wynne et al., 2021)10and GP-based BO (Berkenkamp
+et al., 2019; Bogunovic & Krause, 2021), these works do not help in the present situation, because of the
+form of the resulting guarantees in the former case, and the potential for schemes sampling unsafe inputs in
+the latter case. The situation is further complicated by the fact that in practice the hyperparameters are
+adapted during BO (Garnett, 2023), theoretical guarantees of which are only slowly emerging (Teckentrup,
+2020; Karvonen et al., 2020; Karvonen & Oates, 2023). While these issues do not directly apply to LoSBO
+10Even likelihood misspecification.
+24Published in Transactions on Machine Learning Research (09/2024)
+and LoS-GP-UCB, cf. also the discussion in Section 6.3, they are relevant for Real- β-SafeOpt. In Sections 5
+and 6, we work (unless noted otherwise) with the assumption f∈Hk, and do not consider hyperparameter
+adaption during the optimization process. This is justified from two perspectives. First, it is a common
+approach in the BO literature, including safe BO (Sui et al., 2015; 2018). Second, and more importantly,
+the safety-related issues that we are concerned with in this work are independent of this issue (though of
+course, it is an additional problematic factor).
+B Additional implementation details and practical considerations
+Pseudocode for LoSBO For the reader’s convenience, we provide a detailed description of LoSBO in
+Algorithm 3. As discussed in Section 6, the only change compared to SafeOpt (and Real- β-SafeOpt) is in
+the computation of the safe sets.
+Algorithm 3 LoSBO
+Require: Lipschitz constant L, algorithm to compute βt, noise bound E, initial safe set S0, safety threshold
+h
+1:Q0(x)←Rfor allx∈D ▷ Initialization of uncertainty sets
+2:C0(x)←[h,∞)for allx∈S0
+3:C0(x)←Rfor allx∈D\S0
+4:fort= 1,2,...do
+5:Ct(x)←Ct−1(x)∩Qt−1(x)for allx∈D ▷Compute upper and lower bounds for current iteration
+6:ℓt(x)←minCt(x),ut(x)←maxCt(x)for allx∈D
+7:ift>1then ▷Compute new safe set
+8:St=St−1∪{x∈D|yt−1−E−Ld(xt−1,x)≥h}
+9:else
+10:S1=S0
+11:end if
+12:Gt←{x∈St|∃x′∈D\St:ut(x)−Ld(x,x′)≥h}▷Compute set of potential expanders
+13:Mt={x∈St|ut(x)≥maxxS∈Stℓt(xS)} ▷Compute set of potential maximizers
+14:xt←argmaxx∈Gt∪Mtwt(x) ▷Determine next input
+15:Query function with xt, receiveyt=f(xt) +ϵt
+16:Update GP with new data point (xt,yt), resulting in mean µtandσt
+17:Compute updated βt
+18:Qt(x) = [µt(x)−βtσt(x),µt(x) +βtσt(x)]for allx∈D
+19:end for
+Choice of noise bound in LoSBO Proposition 1 states that if E∈R>0is a bound on the noise
+magnitude, then LoSBO is safe. Suppose we know that |ϵt|≤Bϵfor some constant Bϵ∈R>0, then we could
+setE=Bϵ, and assume that the bound Bϵis sharp. For example, we might have ϵt∼1
+2δBϵ+1
+2δ−Bϵ, where
+δxis the Dirac distribution with atom on x. If we choose E=Bϵ, then LoSBO is indeed safe according to
+Proposition 1, i.e., for all inputs xt∈Dthat are queried by the algorithm, we have f(xt)≥h. However,
+if we additionally assume that there are sizeable parts of the input space Dwheref≈h, and since the
+border of the safe sets will be in such a region, it is likely that inputs from this area will be queried. This
+means that it is likely that measurements ytwithyt< hwill be received - this happens if f(xt)≈hand
+ϵt≈−Bϵ. While according to the formal model such an input xtis safe, to the user it looks as if a safety
+violation occurred. Since in practice a detected (not necessarily real) safety violation might lead to some
+costly action (e.g., emergency stop), such a situation is undesirable. To avoid this, we can set E= 2Bϵ.
+While this introduces some conservatism, it avoids the described apparent safety violations - essentially, this
+option mitigates false alarms. Whether to choose in the present situation E=BϵorE= 2Bϵ(or even an
+option in between) is ultimately a practical question to be addressed by the practitioner using the algorithm.
+Assumptions of LoSBO Inspecting the proof of Proposition 1 reveals that considerably more general
+(and weaker) assumptions can be used with the same argument.
+25Published in Transactions on Machine Learning Research (09/2024)
+1. Instead of a fixed noise bound E, one can mutatis mutandis use asymmetric, time-varying and
+heteroscedastic noise. Formally, one can assume that two functions Eℓ,Eu:D×N0→R≥0exist,
+such that for all t≥1andx∈D, it holds that Eℓ(x,t)≤ϵt≤Eu(x,t), ifxis the input used at
+timet.
+2. Instead of Lipschitz continuity, one can assume that there exists a continuous and strictly increasing
+functionϕ:R≥0→R≥0withϕ(0) = 0, such that for all x,x′∈Dit holds that f(x′)≥f(x)−
+ϕ(dD(x,x′)). This includes the case of Hölder continuity, which has previously been used in a similar
+context (Calliess, 2014).
+To keep the presentation focused and easy to follow, we do not use this additional flexibility in the present
+work, but all developments in Sections 6 and 7 applies to these more general cases.
+C Additional material on experiments
+C.1 Additional details for Section 5.1
+In Section 5.1, we work exclusively with the squared exponential (SE) kernel on the input set [0,1]with
+length scale 0.2/√
+2. In order to generate a synthetic RKHS function with known RKHS norm, we follow the
+approach from Fiedler et al. (2021a) and use the explicit orthonormal basis (ONB) of the SE kernel RKHS
+as described in (Steinwart & Christmann, 2008, Section 4.4). More precisely, we select a random subset of
+these basis functions, generate randomly a vector of coefficients and rescale it (to achieve the required RKHS
+norm), and then form the weighted sum of the selected basis functions.
+For the first experiment, in order to generate the data sets, 100inputs are uniformly sampled from [0,1], the
+corresponding RKHS function is evaluated on these inputs, and finally i.i.d. normal noise with variance 0.01
+is added to the function values. For each data set, we apply GP regression with a zero mean prior, and the
+SE kernel as covariance function, using the same length scale as for the generation of the target functions,
+and we use the actual noise variance in the GP regression. Finally, we use the uncertainty set (2) with
+βt≡2, and check on a fine grid on [0,1]whether the target function from the RKHS is completely contained
+within this uncertainty set. As soon as the function value of one input is not covered by the uncertainty, we
+count this run as a failure. Note that this might be even slightly optimistic, since a bound violation might
+happen in the between the grid points (which is very unlikely in this setup, however).
+For the second experiment, we use the same approach as above to generate RKHS functions f. We define
+the safety threshold hby setting h= ˆµ(f)−0.2/hatwidestSD(f), where ˆµ(f)and/hatwidestSD(f)are the empirical mean
+and standard deviation of the test function fevaluated on a fine grid of the input space. This procedure is
+necessary to ensure that we get non-empty safe sets, but that the problem instance is sufficiently challenging.
+We further evaluate |f′|on a fine grid on the input space, take the maximum of this, and multiply it by 1.1
+to find a (slightly conservative) upper bound of the Lipschitz constant of f, which is used as the Lipschitz
+bound in the algorithm. We then run SafeOpt on 10000 times from a random safe initial state, again using
+i.i.d. additive normal noise with variance 0.01 (and using the correct noise variance in the GP regression).
+Finally, we select a target function that exhibits significant safety violations. Note that this approach is
+appropriate in this context, since the safety property has to hold for allpotential target functions, and due
+to the large number of independent runs, no multiple testing problem arises.
+C.2 Additional details for Section 6.4
+A target function is therefore fixed, and the algorithms are run multiple times on this same function with
+independentnoiserealizations. Toenabletheperformanceofthealgorithmstobeclearlyevaluated, synthetic
+targetfunctionswillbeused, andsincewewanttocompareLoSBOwithReal- β-SafeOpt-thelatterrequiring
+a target function from an RKHS and with a known RKHS norm upper bound - we generate target functions
+from an RKHS. Unless noted otherwise, in each experiment we generate 100 RKHS functions, each with
+RKHS norm 10, and we compute a (slightly) conservative Lipschitz bound as well as an appropriate initial
+safe set. Following the previous safe BO literature, we restrict ourselves to compact subsets of Rd, and in
+this section for simplicity we further restrict ourselves to d= 1.
+26Published in Transactions on Machine Learning Research (09/2024)
+The frequentist setup is inherently worst-case, but for numerical experiments it is necessary to restrict
+ourselves to finitely many RKHS functions. Nevertheless, the RKHS functions used should be somewhat
+representative to give a meaningful indication of the algorithmic performance. Specifically, any bias due to
+thefunctiongeneratingmethodshouldbeminimized. Inthefollowingexperiments, wesamplefunctionsfrom
+thepreRKHS,i.e.,givenakernel k,werandomlychoosesome M∈N>0,α1,...,αM∈Randx1,...,xM∈D
+and then use f=/summationtextM
+i=1αik(·,xi)∈Hkas a target function, which works for anykernel. In the case of the
+squaredexponentialkernel, wealsoutilizetheONBdescribedinSteinwart&Christmann(2008, Section4.4),
+which we have already used for some of the experiments in Sections 5.1 and 6.1. Generating RKHS functions
+with more than one method ensures more variety of the considered RKHS functions. Moreover, with both
+approaches, theexactRKHSnormisavailable(andcanbesetbynormalization), andthegeneratedfunctions
+can be evaluated at arbitrary inputs. Unless noted otherwise, we generate RKHS functions with an RKHS
+norm of 10, i.e., we consider target functions f∈Hkwith∥f∥k= 10. For a more thorough discussion of
+generating RKHS functions and subtle biases due to the chosen method, we refer to (Fiedler et al., 2021a).
+LoSBO and Real- β-SafeOpt work on arbitrary metric spaces, as long as a kernel can be defined on that space.
+Following the previous safe BO literature, we restrict ourselves to compact subsets of Rd, and in this section
+for simplicity we further restrict ourselves to d= 1. To run LoSBO and Real- β-SafeOpt, we need a bound on
+theLipschitzconstantofthetargetfunction, aswellasaninitialsafeset. Fortheformer, werestrictourselves
+to kernels inducing continuously differentiable RKHS functions, since the latter are Lipschitz continuous due
+to the compact domain. To determine a bound on the Lipschitz constant, we evaluate the target function on
+a fine discretization of the input domain, numerically compute an approximation of the Lipschitz constant,
+and multiply the result by 1.1 to counterbalance the discretization error. Since the target functions are
+randomly generated, we compute an appropriate safety threshold for each function so that some portions of
+the input space are safe, and some are unsafe. This avoids trivial situations for safe BO. More precisely, for
+a given target function f, we compute its empirical mean ˆµ(f)and empirical standard deviation /hatwidestSD(f)on
+a fine grid, and then set h= ˆµ(f)−0.2/hatwidestSD(f). Next, for each target function fand safety threshold h, we
+need to generate an initial safe set. Similar to the choice of the safety threshold, trivial situations should
+be avoided, particularly cases where no safe exploration is possible. To achieve this goal, we first determine
+somex0∈argmaxx∈Df(x), then consider the set D∩Ix0, whereIx0is the largest interval such that x0∈Ix0
+andf|Ix0≥h+E. Finally, one input is randomly selected from this set, and the singleton set containing
+this latter input is then selected as the initial safe set. Using a singleton initial safe set is common in the
+literature on SafeOpt-type algorithms, see (Berkenkamp et al., 2016).
+The typical application scenario for SafeOpt-type algorithms is the optimization of some performance mea-
+sure by interacting with a physical system. In particular, each function query is relatively expensive, hence in
+these scenarios only a few function values are sampled. Motivated by this, in all of the following experiments,
+for each target function, LoSBO and Real- β-SafeOpt are run for 20 iterations, starting from the same safe
+set. For each target function, this is repeated 10000 times to allow a frequentist evaluation of the behavior.
+Finally, each type of experiment is run with 100 different randomly generated target functions. To make runs
+with different target functions comparable, we evaluate the performance in a given run of a target function
+fby
+ˆf∗
+t=f/parenleftbig
+argmaxx∈Stµt(x)/parenrightbig
+−h
+f∗−h, (16)
+whereµt(x)is the predictive mean (in LoSBO and Real- β-SafeOpt the posterior mean) at time t≥1,
+evaluated at input x, andf∗is the maximum of f. This metric will be averaged over all runs for a given f,
+and over all target functions, respectively, in the following plots.
+For simplicity, independent additive noise, uniformly sampled from [−Bϵ,Bϵ], is used in all of the following
+experiments. As is well-known, bounded random variables are subgaussian, and we can set R=Bϵin Real-
+β-SafeOpt. Additionally, we choose δ= 0.01and the true RKHS norm as the RKHS norm upper bound
+in Real-β-SafeOpt, unless noted otherwise. We further set the nominal noise variance equal to Rin both
+LoSBO and Real- β-SafeOpt. Following the discussion in Section B, we choose E= 2Bϵin LoSBO. Finally,
+we must specify a strategy to compute βtin LoSBO. Recall from Section 6.2 that these scaling factors are
+now proper tuning parameters. In all of the following experiments, we use β≡2in LoSBO, as this is a
+common choice in the literature on SafeOpt and GP-UCB. Choosing such a simple rule also simplifies the
+27Published in Transactions on Machine Learning Research (09/2024)
+0 10 20
+Iteration0.00.51.0ˆf∗
+t
+Pre-RKHS SE
+0 10 20
+Iteration
+Misspeciﬁed Kernel lGP=lc
+RealBetaSafeOpt
+RealBetaSafeOpt
+LoSBO
+LoSBO
+Figure 7: Additional experimental results for LoSBO. Left: Well-specified setting using the SE covariance
+functionandsamplingtargetfunctionsusingthepreRKHSapproach. Left: Misspecifiedcovariancefunction.
+experimental evaluation, as no additional tuning parameters or further algorithmic choices are introduced.
+Unless noted otherwise, in all of the following experiments Bϵ= 0.01is used.
+C.3 Additional experimental results for LoSBO
+We have repeated the first experiment from Section 6.4, however, now with the RKHS functions sampled
+using the pre RKHS approach. Figure 7, left, displays the results. While no real difference in performance
+is noticable for LoSBO, Real- β-SafeOpt appears to perform slightly better compared to target functions
+generated using the ONB approach. A potential explanation lies in the shapes of functions that typically
+arise in the two different sampling methods. As observed in (Fiedler et al., 2021a), functions sampled from
+the ONB look more "bumpy" compared to pre RKHS functions, and appear to be more challenging for
+the uncertainty bounds. Since Real- β-SafeOpt needs to precisely adhere to these bounds, its exploration
+performance is diminished. By contrast, LoSBO behaves overly optimistically as βt≡2is used, but the
+underlying RKHS functions have RKHS norm 10, see also the evaluations in (Fiedler et al., 2021a). It
+appears that this over-optimism leads to better performance, and since for safety LoSBO does not rely on
+scalingfactors βtthatcorrespondtovalidfrequentistuncertaintysets, thisover-optimismdoesnotjeopardize
+safety.
+28

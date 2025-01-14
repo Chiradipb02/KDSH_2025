@@ -1,0 +1,885 @@
+Gaussian Splatting SLAM
+Hidenobu Matsuki1∗Riku Murai2∗Paul H. J. Kelly2Andrew J. Davison1
+1Dyson Robotics Laboratory, Imperial College London
+2Software Performance Optimisation Group, Imperial College London
+{h.matsuki20, riku.murai15, p.kelly, a.davison }@imperial.ac.uk
+Figure 1. From a single monocular camera, we reconstruct a high fidelity 3D scene live at 3fps. For every incoming RGB frame, 3D
+Gaussians are incrementally formed and optimised together with the camera poses. We show both the rasterised Gaussians (left) and
+Gaussians shaded to highlight the geometry (right). Notice the details and the complex material properties (e.g. transparency) captured.
+Thin structures such as wires are accurately represented by numerous small, elongated Gaussians, and transparent objects are effectively
+represented by placing the Gaussians along the rim. Our system significantly advances the fidelity a live monocular SLAM system can
+capture.
+Abstract
+We present the first application of 3D Gaussian Splatting
+in monocular SLAM, the most fundamental but the hardest
+setup for Visual SLAM. Our method, which runs live at 3fps,
+utilises Gaussians as the only 3D representation, unifying
+the required representation for accurate, efficient tracking,
+mapping, and high-quality rendering. Designed for chal-
+lenging monocular settings, our approach is seamlessly ex-
+tendable to RGB-D SLAM when an external depth sensor is
+available. Several innovations are required to continuously
+reconstruct 3D scenes with high fidelity from a live camera.
+First, to move beyond the original 3DGS algorithm, which
+requires accurate poses from an offline Structure from Mo-
+tion (SfM) system, we formulate camera tracking for 3DGS
+using direct optimisation against the 3D Gaussians, and
+show that this enables fast and robust tracking with a wide
+basin of convergence. Second, by utilising the explicit na-
+ture of the Gaussians, we introduce geometric verification
+*Authors contributed equally to this work.and regularisation to handle the ambiguities occurring in
+incremental 3D dense reconstruction. Finally, we introduce
+a full SLAM system which not only achieves state-of-the-art
+results in novel view synthesis and trajectory estimation but
+also reconstruction of tiny and even transparent objects.
+1. Introduction
+A long-term goal of online reconstruction with a single
+moving camera is near-photorealistic fidelity, which will
+surely allow new levels of performance in many areas of
+Spatial AI and robotics as well as opening up a whole range
+of new applications. While we increasingly see the ben-
+efit of applying powerful pre-trained priors to 3D recon-
+struction, a key avenue for progress is still the invention
+and development of core 3D representations with advan-
+tageous properties. Many “layered” SLAM methods ex-
+ist which tackle the SLAM problem by integrating multi-
+ple different 3D representations or existing SLAM compo-
+nents; however, the most interesting advances are when a
+new unified dense representation can be used for all aspects
+This CVPR paper is the Open Access version, provided by the Computer Vision Foundation.
+Except for this watermark, it is identical to the accepted version;
+the final published version of the proceedings is available on IEEE Xplore.
+18039
+of a system’s operation: local representation of detail, large-
+scale geometric mapping and also camera tracking by direct
+alignment.
+In this paper, we present the first online visual SLAM
+system based solely on the 3D Gaussian Splatting (3DGS)
+representation [10] recently making a big impact in offline
+scene reconstruction. In 3DGS a scene is represented by
+a large number of Gaussian blobs with orientation, elonga-
+tion, colour and opacity. Other previous world/map-centric
+scene representations used for visual SLAM include occu-
+pancy or Signed Distance Function (SDF) voxel grids [23];
+meshes [28]; point or surfel clouds [9, 29]; and recently
+neural fields [33]. Each of these has disadvantages: grids
+use significant memory and have bounded resolution, and
+even if octrees or hashing allow more efficiency they can-
+not be flexibly warped for large corrections [25, 37]; meshes
+require difficult, irregular topology to fuse new informa-
+tion; surfel clouds are discontinuous and difficult to fuse
+and optimise; and neural fields require expensive per-pixel
+raycasting to render. We show that 3DGS has none of these
+weaknesses. As a SLAM representation, it is most simi-
+lar to point and surfel clouds, and inherits their efficiency,
+locality and ability to be easily warped or modified. How-
+ever, it also represents geometry in a smooth, continuously
+differentiable way: a dense cloud of Gaussians merge to-
+gether and jointly define a continuous volumetric function.
+And crucially, the design of modern graphics cards means
+that a large number of Gaussians can be efficiently rendered
+via “splatting” rasterisation, up to 200fps at 1080p. This
+rapid, differentiable rendering is integral to the tracking and
+map optimisation loops in our system.
+The 3DGS representation has up until now only been
+used in offline systems for 3D reconstruction with known
+camera poses, and we present several innovations to enable
+online SLAM. We first derive the analytic Jacobian on Lie
+group of camera pose with respect to a 3D Gaussians map,
+and show that this can be seamlessly integrated into the
+existing differentiable rasterisation pipeline to enable cam-
+era poses to be optimised alongside scene geometry. Sec-
+ond, we introduce a novel Gaussian isotropic shape regu-
+larisation, to ensure geometric consistency, which we have
+found is important for incremental reconstruction. Third,
+we propose a novel Gaussian resource allocation and prun-
+ing method to keep the geometry clean and enable accu-
+rate camera tracking. Our experimental results demonstrate
+photorealistic online local scene reconstruction, as well as
+state-of-the-art camera trajectory estimation and mapping
+for larger scenes compared to other rendering-based SLAM
+methods. We further show the uniqueness of the Gaussian-
+based SLAM method such as an extremely large camera
+pose convergence basin, which can also be useful for map-
+based camera localisation. Our method works with only
+monocular input, one of the most challenging scenarios inSLAM. To highlight the intrinsic capability of 3D Gaussian
+for camera localisation, our method does not use any pre-
+trained monocular depth predictor or other existing tracking
+modules, but relies solely on RGB image inputs in line with
+the original 3DGS. Since this is one of the most challeng-
+ing SLAM scenario, we also show our method can easily be
+extended to RGB-D SLAM when depth measurements are
+available.
+In summary, our contributions are as follows:
+• The first near real-time SLAM system which works with a
+3DGS as the only underlying scene representation, which
+can handle monocular only inputs.
+• Novel techniques within the SLAM framework, including
+the analytic Jacobian on Lie group for direct camera pose
+estimation, isotropic regularisation of the Gaussian shape,
+and geometric verification.
+• Extensive evaluations on a variety of datasets both for
+monocular and RGB-D settings, demonstrating compet-
+itive performance, particularly in real-world scenarios.
+2. Related Work
+Dense SLAM: Dense visual SLAM focuses on reconstruct-
+ing detailed 3D maps, unlike sparse SLAM methods which
+excel in pose estimation [4, 5, 21] but typically yield maps
+useful mainly for localisation. In contrast, dense SLAM
+creates interactive maps beneficial for broader applications,
+including AR and robotics. Dense SLAM methods are gen-
+erally divided into two primary categories: Frame-centric
+and Map-centric. Frame-centric SLAM minimises pho-
+tometric error across consecutive frames, jointly estimat-
+ing per-frame depth and frame-to-frame camera motion.
+Frame-centric approaches [1, 36] are efficient, as individual
+frames host local rather than global geometry (e.g. depth
+maps), and are attractive for long-session SLAM, but if a
+dense global map is needed, it must be constructed on de-
+mand by assembling all of these parts which are not nec-
+essarily fully consistent. In contrast, Map-centric SLAM
+uses a unified 3D representation across the SLAM pipeline,
+enabling a compact and streamlined system. Compared
+to purely local frame-to-frame tracking, a map-centric ap-
+proach leverages global information by tracking against the
+reconstructed 3D consistent map. Classical map-centric ap-
+proaches often use voxel grids [2, 23, 26, 40] or points [9,
+29, 41] as the underlying 3D representation. While voxels
+enable a fast look-up of features in 3D, the representation
+is expensive, and the fixed voxel resolution and distribution
+are problematic when the spatial characteristics of the en-
+vironment are not known in advance. On the other hand, a
+point-based map representation, such as surfel clouds, en-
+ables adaptive changes in resolution and spatial distribution
+by dynamic allocation of point primitives in the 3D space.
+Such flexibility benefits online applications such as SLAM
+with deformation-based loop closure [29, 41]. However, op-
+18040
+timising the representation to capture high fidelity is chal-
+lenging due to the lack of correlation among the primitives.
+Recently, in addition to classical graphic primitives, neu-
+ral network-based map representations are a promising al-
+ternative. iMAP [33] demonstrated the interesting proper-
+ties of neural representation, such as sensible hole filling
+of unobserved geometry. Many recent approaches combine
+the classical and neural representations to capture finer de-
+tails [8, 27, 46, 47]; however, the large amount of computa-
+tion required for neural rendering makes the live operation
+of such systems challenging.
+Differentiable Rendering: The classical method for
+creating a 3D representation was to unproject 2D obser-
+vations into 3D space and to fuse them via weighted av-
+eraging [16, 23]. Such an averaging scheme suffers from
+over-smooth representation and lacks the expressiveness to
+capture high-quality details. To capture a scene with photo-
+realistic quality, differentiable volumetric rendering [24]
+has recently been popularised with Neural Radiance Fields
+(NeRF) [17]. Using a single Multi-Layer Perceptron (MLP)
+as a scene representation, NeRF performs volume rendering
+by marching along pixel rays, querying the MLP for opac-
+ity and colour. Since volume rendering is naturally differ-
+entiable, the MLP representation is optimised to minimise
+the rendering loss using multiview information to achieve
+high-quality novel view synthesis. The main weakness of
+NeRF is its training speed. Recent developments have in-
+troduced explicit volume structures such as multi-resolution
+voxel grids [6, 14, 34] or hash functions [19] to improve
+performance. Interestingly, these projects demonstrate that
+the main contributor to high-quality novel view synthesis
+is not the neural network but rather differentiable volu-
+metric rendering, and that it is possible to avoid the use
+of an MLP and yet achieve comparable rendering quality
+to NeRF [6]. However, even in these systems, per-pixel
+ray marching remains a significant bottleneck for rendering
+speed. This issue is particularly critical in SLAM, where
+immediate interaction with the map is essential for tracking.
+In contrast to NeRF, 3DGS performs differentiable rasteri-
+sation. Similar to regular graphics rasterisations, by iterat-
+ing over the primitives to be rasterised rather than march-
+ing along rays, 3DGS leverages the natural sparsity of a
+3D scene and achieves a representation which is expres-
+sive to capture high-fidelity 3D scenes while offering sig-
+nificantly faster rendering. Several works have applied 3D
+Gaussians and differentiable rendering to static scene cap-
+ture [11, 38], and in particular more recent works utilise
+3DGS and demonstrate superior results in vision tasks such
+as dynamic scene capture [15, 42, 44] and 3D genera-
+tion [35, 45]. Our method adopts a Map-centric approach,
+utilising 3D Gaussians as the only SLAM representation.
+Similar to surfel-based SLAM, we dynamically allocate the
+3D Gaussians, enabling us to model an arbitrary spatial dis-tribution in the scene. Unlike other methods such as Elastic-
+Fusion [41] and PointFusion [9], however, by using differ-
+entiable rasterisation, our SLAM system can capture high-
+fidelity scene details and represent challenging object prop-
+erties by direct optimisation against information from every
+pixel.
+3. Method
+3.1. Gaussian Splatting
+Our SLAM representation is 3DGS, mapping the scene with
+a set of anisotropic Gaussians G. Each Gaussian Gicontains
+optical properties: colour ciand opacity αi. For continuous
+3D representation, the mean µi
+Wand covariance Σi
+W, de-
+fined in the world coordinate, represent the Gaussian’s po-
+sition and its ellipsoidal shape. For simplicity and speed,
+in our work we omit the spherical harmonics representing
+view-dependent radiance. Since 3DGS uses volume ren-
+dering, explicit extraction of the surface is not required. In-
+stead, by splatting and blending NGaussians, a pixel colour
+Cpis synthesised:
+Cp=X
+i∈Nciαii−1Y
+j=1(1−αj). (1)
+3DGS performs rasterisation, iterating over the Gaussians
+rather than marching along the camera rays, and hence, free
+spaces are ignored during rendering. During rasterisation,
+the contributions of αare decayed via a Gaussian function,
+based on the 2D Gaussian formed by splatting a 3D Gaus-
+sian. The 3D Gaussians N(µW,ΣW)in world coordinates
+are related to the 2D Gaussians N(µI,ΣI)on the image
+plane through a projective transformation:
+µI=π(TCW·µW),ΣI=JWΣ WWTJT,(2)
+where πis the projection operation and TCW∈SE(3)is
+the camera pose of the viewpoint. Jis the Jacobian of the
+linear approximation of the projective transformation and
+Wis the rotational component of TCW. This formulation
+enables the 3D Gaussians to be differentiable and the blend-
+ing operation provides gradient flow to the Gaussians. Us-
+ing first-order gradient descent [12], Gaussians gradually
+refines both their optic and geometric parameters to repre-
+sent the captured scene with high fidelity.
+3.2. Camera Pose Optimisation
+To achieve accurate tracking, we typically require at least 50
+iterations of gradient descent per frame. This requirement
+emphasises the necessity of a representation with computa-
+tionally efficient view synthesis and gradient computation,
+making the choice of 3D representation a crucial part of de-
+signing a SLAM system.
+18041
+TrackingMappingKeyframing3D Gaussian Map
+Input video(RGB or RGB-D)Window Optimisation
+Camera Pose EstimationCo-visibility CheckIs KF?GaussianInsertion & Pruneyes
+Keyframe Management
+(Sec 3.3.1)(Sec 3.3.2)(Sec 3.3.3)Figure 2. SLAM System Overview: Our SLAM system uses 3D Gaussians as the only representation, unifying all components of SLAM,
+including tracking, mapping, keyframe management, and novel view synthesis.
+In order to avoid the overhead of automatic differen-
+tiation, 3DGS implements rasterisation with CUDA with
+derivatives for all parameters calculated explicitly. Since
+rasterisation is performance critical, we similarly derive the
+camera Jacobians explicitly.
+To the best of our knowledge, we provide the first ana-
+lytical Jacobian of SE(3)camera pose with respect to the
+3D Gaussians used in EWA splatting [48] and 3DGS. This
+opens up new applications of 3DGS beyond SLAM.
+We use Lie algebra to derive the minimal Jacobians, en-
+suring that the dimensionality of the Jacobians matches the
+degrees of freedom, eliminating any redundant computa-
+tions. The terms of Eq. (2) are differentiable with respect
+to the camera pose TCW; using the chain rule:
+∂µI
+∂TCW=∂µI
+∂µCDµC
+DTCW, (3)
+∂ΣI
+∂TCW=∂ΣI
+∂J∂J
+∂µCDµC
+DTCW+∂ΣI
+∂WDW
+DTCW.(4)
+where TCWrepresents the 3D position of Gaussian in the
+camera coordinate. We take the derivatives on the manifold
+to derive minimal parameterisation. Borrowing the notation
+from [30], let T∈SE(3)andτ∈se(3). We define the
+partial derivative on the manifold as:
+Df(T)
+DT≜lim
+τ→0Log(f(Exp(τ)◦T)◦f(T)−1)
+τ,(5)
+where◦is a group composition, and Exp ,Log are the expo-
+nential and logarithmic mappings between Lie algebra and
+Lie Group. With this, we derive the following:
+DµC
+DTCW=
+I−µ×
+C
+,DW
+DTCW=
+0−W×
+:,1
+0−W×
+:,2
+0−W×
+:,3
+,(6)where×denotes the skew symmetric matrix of a 3D vector,
+andW:,irefers to the ith column of the matrix.
+3.3. SLAM
+In this section, we present details of full SLAM framework.
+The overview of the system is summarised in Fig. 2. Please
+refer to the supplementary material for the further parameter
+details.
+3.3.1 Tracking
+In tracking only the current camera pose is optimised, with-
+out updates to the map representation. In the monocular
+case, we minimise the following photometric residual:
+Epho=I(G,TCW)−¯I
+1, (7)
+where I(G,TCW)renders the Gaussians GfromTCW, and
+¯Iis an observed image.
+We further optimise affine brightness parameters for
+varying exposure. When depth observations are available,
+we define the geometric residual as:
+Egeo=D(G,TCW)−¯D
+1, (8)
+where D(G,TCW)is depth rasterisation and ¯Dis the ob-
+served depth. Rather than simply using the depth measure-
+ments to initialise the Gaussians, we minimise both photo-
+metric and geometric residuals: λphoEpho+(1−λpho)Egeo,
+where λphois a hyperparameter.
+As in Eq. (1), per-pixel depth is rasterised by alpha-
+blending:
+Dp=X
+i∈Nziαii−1Y
+j=1(1−αj), (9)
+18042
+where ziis the distance to the mean µWof Gaussian ialong
+the camera ray. We derive analytical Jacobians for the cam-
+era pose optimisation in a similar manner to Eq. (3), (4).
+3.3.2 Keyframing
+Since using all the images from a video stream to jointly
+optimise the Gaussians and camera poses online is infeasi-
+ble, we maintain a small window Wkconsisting of carefully
+selected keyframes based on inter-frame covisibility. Ideal
+keyframe management will select non-redundant keyframes
+observing the same area, spanning a wide baseline to pro-
+vide better multiview constraints. The parameters are de-
+tailed in supplementary.
+Selection and Management Every tracked frame is
+checked for keyframe registration based on our simple yet
+effective criteria. We measure the covisibility by measur-
+ing the intersection over union of the observed Gaussians
+between the current frame iand the last keyframe j. If the
+covisibility drops below a threshold, or if the relative trans-
+lation tijis large with respect to the median depth, frame iis
+registered as a keyframe. For efficiency, we maintain only a
+small number of keyframes in the current window Wkfol-
+lowing the keyframe management heuristics of DSO [4].
+The main difference is that a keyframe is removed from
+the current window if the overlap coefficient with the lat-
+est keyframe drops below a threshold.
+Gaussian Covisibility An accurate estimate of covisibil-
+ity simplifies keyframe selection and management. 3DGS
+respects visibility ordering since the 3D Gaussians are
+sorted along the camera ray. This property is desirable for
+covisibility estimation as occlusions are handled by design.
+A Gaussian is marked to be visible from a view if used in
+the rasterisation and if the ray’s accumulated αhas not yet
+reached 0.5. This enables our estimated covisibility to han-
+dle occlusions without requiring additional heuristics.
+Gaussian Insertion and Pruning At every keyframe,
+new Gaussians are inserted into the scene to capture newly
+visible scene elements and to refine the fine details. When
+depth measurements are available, Gaussian means µWare
+initialised by back-projecting the depth. In the monocular
+case, we render the depth at the current frame. For pix-
+els with depth estimates, µWare initialised around those
+depths with low variance; for pixels without the depth es-
+timates, we initialise µWaround the median depth of the
+rendered image with high variance.
+In the monocular case, the positions of many newly in-
+serted Gaussians are incorrect. While the majority will
+quickly vanish during optimisation as they violate multi-
+view consistency, we further prune the excess Gaussians bychecking the visibility amongst the current window Wk. If
+the Gaussians inserted within the last 3 keyframes are un-
+observed by at least 3 other frames, we prune them out as
+they are geometrically unstable.
+3.3.3 Mapping
+The purpose of mapping is to maintain a coherent 3D struc-
+ture and to optimise the newly inserted Gaussians. Dur-
+ing mapping, the keyframes in Wkare used to reconstruct
+currently visible regions. Additionally, two random past
+keyframes Wrare selected per iteration to avoid forgetting
+the global map. Rasterisation of 3DGS imposes no con-
+straint on the Gaussians along the viewing ray direction,
+even with a depth observation. This is not a problem when
+sufficient carefully selected viewpoints are provided (e.g.
+in the novel view synthesis case); however, in continuous
+SLAM this causes many artefacts, making tracking chal-
+lenging. We therefore introduce an isotropic regularisation:
+Eiso=|G|X
+i=1∥si−˜si·1∥1(10)
+to penalise the scaling parameters si(i.e. stretch of the
+ellipsoid) by its difference to the mean ˜si. As shown in
+Fig 3, this encourages sphericality, and avoids the problem
+of Gaussians which are highly elongated along the viewing
+direction creating artefacts. Let the union of the keyframes
+in the current window and the randomly selected one be
+W=Wk∪ W r. For mapping, we solve the following
+problem:
+min
+Tk
+CW∈SE(3),G,
+∀k∈WX
+∀k∈WEk
+pho+λisoEiso. (11)
+If depth observations are available, as in tracking, geometric
+residuals Eq. (8) are added to the optimisation problem.
+4. Evaluation
+We conduct a comprehensive evaluation of our system
+across a range of both real and synthetic datasets. Addi-
+tionally, we perform an ablation study to justify our design
+choices. Finally, we present qualitative results of our sys-
+tem operating live using a monocular camera, illustrating its
+practicality and high fidelity reconstruction.
+4.1. Experimental Setup
+Datasets For our quantitative analysis, we evaluate our
+method on the TUM RGB-D dataset [32] (3 sequences) and
+the Replica dataset [31] (8 sequences), following the evalu-
+ation in [33]. For qualitative results, we use self-captured
+real-world sequences recorded by Intel Realsense d455.
+Since the Replica dataset is designed for RGB-D SLAM
+18043
+w/o 𝐸!"#w/ 𝐸!"#Figure 3. Effect of isotropic regularisation :Top: Rendering
+close to a training view (looking at the keyboard). Bottom: Ren-
+dering 3D Gaussians far from the training views (view from a side
+of the keyboard) without (left) and with (right) the isotropic loss.
+When the photometric constraints are insufficient, the Gaussians
+tend to elongate along the viewing direction, creating artefacts in
+the novel views, and affecting the camera tracking.
+evaluation, it contains challenging purely rotational cam-
+era motions. We hence use the Replica dataset for RGB-D
+evaluation only. The TUM RGB-D dataset is used for both
+monocular and RGB-D evaluation.
+Implementation Details We run our SLAM on a desktop
+with Intel Core i9 12900K 3.50GHz and a single NVIDIA
+GeForce RTX 4090. We present results from our multi-
+process implementation aimed at real-time applications.
+For a fair comparison with other methods on Replica, we
+additionally report result for single-process implementation
+which performs more mapping iterations. As with 3DGS,
+time-critical rasterisation and gradient computation are im-
+plemented using CUDA. The rest of the SLAM pipeline is
+developed with PyTorch. Details of hyperparameters are
+provided in the supplementary material.
+Metrics For camera tracking accuracy, we report the Root
+Mean Square Error (RMSE) of the Absolute Trajectory Er-
+ror (ATE) of the keyframes. To evaluate map quality, we re-
+port standard photometric rendering quality metrics (PSNR,
+SSIM and LPIPS) following the evaluation protocol used
+in [27]. To evaluate the map quality, on every fifth frame,
+rendering metrics are computed. We exclude the keyframes
+(training views). We report the average across three runs for
+all our evaluations. In the tables, the best result is in bold,
+and the second best is underlined.
+Baseline Methods We primarily benchmark our SLAM
+method against other approaches that, like ours, do not have
+explicit loop closure. In monocular settings, we comparewith state-of-the-art classical and learning-based direct vi-
+sual odometry (VO) methods. Specifically, we compare
+DSO [4], DepthCov [3], and DROID-SLAM [36] in VO
+configurations. These methods are selected based on their
+public reporting of results on the benchmark (TUM dataset)
+or the availability of their source code for getting the bench-
+mark result. Since one of our focuses is the online scale esti-
+mation under monocular scale ambiguity, the method which
+uses ground truth poses for the system initialisation such
+as [13] is not considered for the comparison. In the RGB-
+D case, we compare against neural-implicit SLAM meth-
+ods [7, 8, 27, 33, 39, 43, 46] which are also map-centric,
+rendering-based and do not perform loop closure.
+4.2. Quantitative Evaluation
+Camera Tracking Accuracy Table 1 shows the tracking
+results on the TUM RGB-D dataset. In the monocular set-
+ting, our method surpasses other baselines without requiring
+any deep priors. Furthermore, our performance is compara-
+ble to systems which perform explicit loop closure. This
+clearly highlights that there still remains potential for en-
+hancing the tracking of monocular SLAM by exploring fun-
+damental SLAM representations.
+Our RGB-D method shows better performance than any
+other baseline method. Notably, our system surpasses
+ORB-SLAM in the fr1 sequences, narrowing the gap be-
+tween Map-centric SLAM and the state-of-the-art sparse
+frame-centric methods. Table 2 reports results on the syn-
+thetic Replica dataset. Our single-process implementation
+shows competitive performance and achieves the best re-
+sult in 4 out of 8 sequences. Our multi-process implemen-
+tation which performs fewer mapping iterations still per-
+forms comparably. In contrast to other methods, our sys-
+tem demonstrates higher performance on real-world data,
+by optimising the Gaussian positions to compensate for the
+sensor noise.
+Novel View Rendering Table 5 summarises the novel
+view rendering performance of our method with RGB-D
+input. We consistently show the best performance across
+most sequences and is least second best. Our rendering
+FPS is hundreds of times faster than other methods, offer-
+ing a significant advantage for applications which require
+real-time map interaction. While Point-SLAM is compet-
+itive, that method focuses on view synthesis rather than
+novel-view synthesis. Their view synthesis is conditional
+on the availability of depth due to the depth-guided ray-
+sampling, making novel-view synthesis challenging. On
+the other hand, our rasterisation-based approach does not
+require depth guidance and achieves efficient, high-quality,
+novel view synthesis. Fig. 4 provides a qualitative compar-
+ison of the rendering of ours and Point-SLAM (with depth
+guidance).
+18044
+InputLoop-
+closureMethod fr1/desk fr2/xyz fr3/office Avg.Monocularw/oDSO [4] 22.4 1.10 9.50 11.0
+DROID-VO [36] 5.20 10.7 7.30 7.73
+DepthCov-VO [3] 5.60 1.20 68.8 25.2
+Ours 3.78 4.60 3.50 3.96
+w/DROID-SLAM [36] 1.80 0.50 2.80 1.70
+ORB-SLAM2 [20] 1.90 0.60 2.40 1.60RGB-Dw/oiMAP [33] 4.90 2.00 5.80 4.23
+NICE-SLAM [46] 4.26 6.19 3.87 4.77
+DI-Fusion [7] 4.40 2.00 5.80 4.07
+V ox-Fusion [43] 3.52 1.49 26.01 10.34
+ESLAM [8] 2.47 1.11 2.42 2.00
+Co-SLAM [39] 2.40 1.70 2.40 2.17
+Point-SLAM [27] 4.34 1.31 3.48 3.04
+Ours 1.50 1.44 1.49 1.47
+w/BAD-SLAM [29] 1.70 1.10 1.70 1.50
+Kintinous [40] 3.70 2.90 3.00 3.20
+ORB-SLAM2 [20] 1.60 0.40 1.00 1.00
+Table 1. Camera tracking result on TUM for monocular and
+RGB-D. ATE RMSE in cm is reported. In both monocular and
+RGB-D cases, we achieve state-of-the-art performance. In partic-
+ular, in the monocular case, not only do we outperform systems
+which use deep prior, but we achieve comparable performance
+with many of the RGB-D systems.
+Method r0 r1 r2 o0 o1 o2 o3 o4 Avg.
+iMAP [33] 3.12 2.54 2.31 1.69 1.03 3.99 4.05 1.93 2.58
+NICE-SLAM 0.97 1.31 1.07 0.88 1.00 1.06 1.10 1.13 1.07
+V ox-Fusion [43] 1.37 4.70 1.47 8.48 2.04 2.58 1.11 2.94 3.09
+ESLAM [8] 0.71 0.70 0.52 0.57 0.55 0.58 0.72 0.63 0.63
+Point-SLAM [27] 0.61 0.41 0.37 0.38 0.48 0.54 0.69 0.72 0.53
+Ours 0.44 0.32 0.31 0.44 0.52 0.23 0.17 2.25 0.58
+Ours (sp) 0.33 0.22 0.29 0.36 0.19 0.25 0.12 0.81 0.32
+Table 2. Camera tracking result on Replica for RGB-D SLAM.
+ATE RMSE in cm is reported. We achieve best performance across
+most sequences. Here, Ours is our multi-process implementation
+and Ours (sp) is the single-process implementation which ensures
+a certain amount of mapping iteration similar to other works.
+Input Method fr1/desk fr2/xyz fr3/office Avg.
+Monow/oEiso 4.16 4.66 5.73 4.83
+w/o kf selection 13.2 4.36 8.65 8.73
+Ours 3.78 4.60 3.50 3.96RGB-Dw/oEgeo 2.39 0.62 4.98 2.66
+w/o kf selection 1.64 1.49 2.60 1.90
+Ours 1.50 1.44 1.49 1.47
+Table 3. Ablation Study on TUM RGB-D dataset. We analyse
+the usefulness of isotropic regularisation, geometric residual, and
+keyframe selection to our SLAM system. Further isotropic regu-
+larisation ablation is available in supplementary.
+Memory Usage [MB]
+iMAP [33] NICE-SLAM [46] Co-SLAM [39] Ours (Mono) Ours (RGB-D)
+0.8MB 40.3.4MB 6.4MB 2.6MB 3.97MB
+Table 4. Memory Analysis on TUM RGB-D dataset. The base-
+line numbers are computed from the parameter numbers in [39]
+Ablative Analysis In Table 3, we perform ablation to con-
+firm our design choices. Isotropic regularisation and ge-
+ometric residual improve the tracking of monocular and
+RGB-D SLAM respectively, as they aid in constraining the
+geometry when photometric signals are weak. For both
+cases, keyframe selection significantly improves systems
+performance, as it automatically chooses suitable keyframesMethod PSNR[db] ↑SSIM ↑LPIPS ↓Rendering FPS
+NICE-SLAM[46] 24.42 0.809 0.233 0.54
+V ox-Fusion[43] 24.41 0.801 0.236 2.17
+Point-SLAM [27] 35.17 0.975 0.124 1.33
+ours 38.94 0.968 0.070 769
+Table 5. Average rendering performance on Replica (RGB-D).
+Our method outperforms most of the rendering metrics compared
+to existing methods. Note that Point-SLAM uses ground-truth
+depth to guide sampling along rays. The full detail is available
+in supplementary.
+Point-SLAMOursGT
+Figure 4. Rendering examples on Replica. Point-SLAM struggle
+with rendering fine details due to the stochastic ray sampling.
+based on our occlusion-aware keyframe selection and man-
+agement. We further compare the memory usage of dif-
+ferent 3D representations in Table 4. MLP-based iMAP is
+clearly more memory efficient, but it struggles to express
+high-fidelity 3D scenes due to the limited capacity of small
+MLP. Compared with a voxel grid of features used in NICE-
+SLAM, our method uses significantly less memory.
+Method seq1 seq2 seq3 Avg.
+Neural SDF (Hash Grid) 0.13 0.15 0.16 0.14
+Neural SDF (MLP) 0.40 0.38 0.22 0.33
+Ours w/o depth 0.82 0.91 0.65 0.79
+Ours w/ depth 0.83 1.0 0.65 0.82
+Table 6. Camera convergence analysis. We report the ratio of
+successful camera convergence for the different sequences, across
+different differentiable 3D representations.
+Convergence Basin Analysis In our SLAM experiments,
+we discovered that 3D Gaussian maps have a notably large
+convergence basin for camera localisation. To investigate
+further, we conducted a convergence funnel analysis, an
+evaluation methodology proposed in [18] and used in [22].
+Here, we train a 3D representation (e.g. 3DGS) using 9
+fixed views arranged in a square. We set the viewpoint in
+the middle of the square to be the target view. As shown
+in Fig 5, we uniformly sample a position, creating a funnel.
+18045
+Ours w/ depthOurs w/o depth
+Hash Grid SDFMLP SDF
+Camera LayoutFigure 5. Convergence basin analysis :Left: 3D Gaussian map
+from training views (Yellow) and visualisation of the test poses
+(Red) and target pose (Blue). Right: Convergence basin of our
+method. The green marks success, and the red marks failure.
+Figure 6. Monocular SLAM result on fr1/desk sequence: We
+show the reconstructed 3D Gaussian maps (Left) and novel view
+synthesis result (Right).
+From the sampled position, given the RGB image of the
+target view, we perform camera pose optimisation for 1000
+iterations. The optimisation is successful if it converges to
+within 1cm of the target view within the fixed iterations.
+We compare our Gaussian approach with Co-SLAM [39]’s
+network (Hash Grid SDF) and iMAP’s [33] network with
+Co-SLAM’s SDF loss for further geometric accuracy (MLP
+Neural SDF). We render the training views using a synthetic
+Replica dataset and create three sequences for testing (seq1,
+seq2 and seq3). The width of the square formed by the
+training view is 0.5m, and the test cameras are distributed
+with radii ranging from 0.2m to 1.2m, covering a larger
+area than the training view. When training the map, the
+three methods— Ours w/depth, Hash Grid SDF, and MLP
+SDF—use RGB-D images, whereas Ours w/o depth utilises
+only colour images. Fig. 5 shows the qualitative results and
+Table 6 reports the success rate. For both with and without
+depth for training, our method shows better convergence.
+Figure 7. Self-captured Scenes: Challenging scenes and objects,
+for example, transparent glasses and crinkled texture of salad are
+captured by our monocular SLAM running live.
+Unlike hashing and positional encoding which can lead to
+signal conflict, anisotropic Gaussians form a smooth gradi-
+ent in 3D space, increasing the convergence basin. Further
+experimental details are available in supplementary ??.
+4.3. Qualitative Results
+We report both the 3D reconstruction of the SLAM dataset
+and self-captured sequences. In Fig. 6, we visualise the
+monocular SLAM reconstruction of fr1/desk. The place-
+ments of the Gaussians are geometrically sensible and are
+3D coherent, and our rendering from the different view-
+points highlights the quality of our systems’ novel view
+synthesis. In Fig. 7, we self-capture challenging scenes for
+monocular SLAM. By not explicitly modelling a surface,
+our system naturally handles transparent objects which is
+challenging for many other SLAM systems.
+5. Conclusion
+We have proposed the first SLAM method using 3D Gaus-
+sians as a SLAM representation. Via efficient volume ren-
+dering, our system significantly advances the fidelity and di-
+versity of object materials a live SLAM system can capture.
+Our system achieves state-of-the-art performance across
+benchmarks for both monocular and RGB-D cases. Inter-
+esting directions for future research are the integration of
+loop closure for handling large-scale scenes and extraction
+of geometry such as surface normal as Gaussians do not ex-
+plicitly represent the surface.
+Acknowledgements
+Research presented in this paper has been supported by
+Dyson Technology Ltd. We are very grateful to Eric Dex-
+heimer, Kirill Mazur, Xin Kong, Marwan Taher, Ignacio
+Alzugaray, Gwangbin Bae, Aalok Patwardhan, and mem-
+bers of the Dyson Robotics Lab for insightful discussions.
+18046
+References
+[1] J. Czarnowski, T. Laidlow, R. Clark, and A. J. Davi-
+son. Deepfactors: Real-time probabilistic dense monocular
+SLAM. IEEE Robotics and Automation Letters (RAL) , 5(2):
+721–728, 2020.
+[2] Angela Dai, Matthias Nießner, Michael Zollh ¨ofer, Shahram
+Izadi, and Christian Theobalt. BundleFusion: Real-time
+Globally Consistent 3D Reconstruction using On-the-fly
+Surface Re-integration. ACM Transactions on Graphics
+(TOG) , 36(3):24:1–24:18, 2017.
+[3] Eric Dexheimer and Andrew J. Davison. Learning a Depth
+Covariance Function. In Proceedings of the IEEE Confer-
+ence on Computer Vision and Pattern Recognition (CVPR) ,
+2023.
+[4] J. Engel, V . Koltun, and D. Cremers. Direct sparse odom-
+etry. IEEE Transactions on Pattern Analysis and Machine
+Intelligence (PAMI) , 2017.
+[5] C. Forster, M. Pizzoli, and D. Scaramuzza. SVO: Fast Semi-
+Direct Monocular Visual Odometry. In Proceedings of the
+IEEE International Conference on Robotics and Automation
+(ICRA) , 2014.
+[6] Sara Fridovich-Keil, Alex Yu, Matthew Tancik, Qinhong
+Chen, Benjamin Recht, and Angjoo Kanazawa. Plenoxels:
+Radiance fields without neural networks. In Proceedings
+of the IEEE Conference on Computer Vision and Pattern
+Recognition (CVPR) , 2022.
+[7] Jiahui Huang, Shi-Sheng Huang, Haoxuan Song, and Shi-
+Min Hu. Di-fusion: Online implicit 3d reconstruction with
+deep priors. In Proceedings of the IEEE Conference on Com-
+puter Vision and Pattern Recognition (CVPR) , 2021.
+[8] M. M. Johari, C. Carta, and F. Fleuret. ESLAM: Efficient
+dense slam system based on hybrid representation of signed
+distance fields. In Proceedings of the IEEE Conference on
+Computer Vision and Pattern Recognition (CVPR) , 2023.
+[9] M. Keller, D. Lefloch, M. Lambers, S. Izadi, T. Weyrich, and
+A. Kolb. Real-time 3D Reconstruction in Dynamic Scenes
+using Point-based Fusion. In Proc. of Joint 3DIM/3DPVT
+Conference (3DV) , 2013.
+[10] Bernhard Kerbl, Georgios Kopanas, Thomas Leimk ¨uhler,
+and George Drettakis. 3D gaussian splatting for real-time
+radiance field rendering. ACM Transactions on Graphics
+(TOG) , 2023.
+[11] Leonid Keselman and Martial Hebert. Approximate differ-
+entiable rendering with algebraic surfaces. In Proceedings
+of the European Conference on Computer Vision (ECCV) ,
+2022.
+[12] Diederik P. Kingma and Jimmy Ba. Adam: A method for
+stochastic optimization. In Proceedings of the International
+Conference on Learning Representations (ICLR) , 2015.
+[13] Heng Li, Xiaodong Gu, Weihao Yuan, Luwei Yang, Zilong
+Dong, and Ping Tan. Dense rgb slam with neural implicit
+maps. In Proceedings of the International Conference on
+Learning Representations (ICLR) , 2023.
+[14] Lingjie Liu, Jiatao Gu, Kyaw Zaw Lin, Tat-Seng Chua, and
+Christian Theobalt. Neural sparse voxel fields. NeurIPS ,
+2020.[15] Jonathon Luiten, Georgios Kopanas, Bastian Leibe, and
+Deva Ramanan. Dynamic 3d gaussians: Tracking by per-
+sistent dynamic view synthesis. 3DV, 2024.
+[16] J. McCormac, A. Handa, A. J. Davison, and S. Leutenegger.
+SemanticFusion: Dense 3D semantic mapping with convo-
+lutional neural networks. In Proceedings of the IEEE In-
+ternational Conference on Robotics and Automation (ICRA) ,
+2017.
+[17] Ben Mildenhall, Pratul P Srinivasan, Matthew Tancik,
+Jonathan T Barron, Ravi Ramamoorthi, and Ren Ng. Nerf:
+Representing scenes as neural radiance fields for view syn-
+thesis. In Proceedings of the European Conference on Com-
+puter Vision (ECCV) , 2020.
+[18] N. J. Mitra, N. Gelfand, H. Pottmann, and L. J. Guibas. Reg-
+istration of Point Cloud Data from a Geometric Optimization
+Perspective. In Proceedings of the Symposium on Geometry
+Processing , 2004.
+[19] Thomas M ¨uller, Alex Evans, Christoph Schied, and Alexan-
+der Keller. Instant neural graphics primitives with a mul-
+tiresolution hash encoding. ACM Transactions on Graphics
+(TOG) , 2022.
+[20] R. Mur-Artal and J. D. Tard ´os. ORB-SLAM2: An Open-
+Source SLAM System for Monocular, Stereo, and RGB-D
+Cameras. IEEE Transactions on Robotics (T-RO) , 33(5):
+1255–1262, 2017.
+[21] R. Mur-Artal, J. M. M Montiel, and J. D. Tard ´os. ORB-
+SLAM: a Versatile and Accurate Monocular SLAM System.
+IEEE Transactions on Robotics (T-RO) , 31(5):1147–1163,
+2015.
+[22] R. A. Newcombe. Dense Visual SLAM . PhD thesis, Imperial
+College London, 2012.
+[23] R. A. Newcombe, S. Izadi, O. Hilliges, D. Molyneaux, D.
+Kim, A. J. Davison, P. Kohli, J. Shotton, S. Hodges, and A.
+Fitzgibbon. KinectFusion: Real-Time Dense Surface Map-
+ping and Tracking. In Proceedings of the International Sym-
+posium on Mixed and Augmented Reality (ISMAR) , 2011.
+[24] Michael Niemeyer, Lars Mescheder, Michael Oechsle, and
+Andreas Geiger. Differentiable volumetric rendering: Learn-
+ing implicit 3d representations without 3d supervision. In
+Proceedings of the IEEE Conference on Computer Vision
+and Pattern Recognition (CVPR) , 2020.
+[25] M. Nießner, M. Zollh ¨ofer, S. Izadi, and M. Stamminger.
+Real-time 3D Reconstruction at Scale using V oxel Hashing.
+InProceedings of SIGGRAPH , 2013.
+[26] Victor Adrian Prisacariu, Olaf K ¨ahler, Ming-Ming Cheng,
+Carl Yuheng Ren, Julien P. C. Valentin, Philip H. S. Torr,
+Ian D. Reid, and David W. Murray. A framework for the vol-
+umetric integration of depth images. CoRR , abs/1410.0925,
+2014.
+[27] Erik Sandstr ¨om, Yue Li, Luc Van Gool, and Martin R. Os-
+wald. Point-slam: Dense neural point cloud-based slam. In
+Proceedings of the International Conference on Computer
+Vision (ICCV) , 2023.
+[28] Thomas Sch ¨ops, Torsten Sattler, and Marc Pollefeys. Sur-
+felmeshing: Online surfel-based mesh reconstruction. IEEE
+Transactions on Pattern Analysis and Machine Intelligence
+(PAMI) , 2020.
+18047
+[29] Thomas Sch ¨ops, Torsten Sattler, and Marc Pollefeys. Bad
+slam: Bundle adjusted direct rgb-d slam. In Proceedings
+of the IEEE Conference on Computer Vision and Pattern
+Recognition (CVPR) , 2019.
+[30] J. Sol `a, J. Deray, and D. Atchuthan. A micro Lie theory for
+state estimation in robotics. arXiv:1812.01537 , 2018.
+[31] Julian Straub, Thomas Whelan, Lingni Ma, Yufan Chen, Erik
+Wijmans, Simon Green, Jakob J. Engel, Raul Mur-Artal,
+Carl Ren, Shobhit Verma, Anton Clarkson, Mingfei Yan,
+Brian Budge, Yajie Yan, Xiaqing Pan, June Yon, Yuyang
+Zou, Kimberly Leon, Nigel Carter, Jesus Briales, Tyler
+Gillingham, Elias Mueggler, Luis Pesqueira, Manolis Savva,
+Dhruv Batra, Hauke M. Strasdat, Renzo De Nardi, Michael
+Goesele, Steven Lovegrove, and Richard Newcombe. The
+Replica dataset: A digital replica of indoor spaces. arXiv
+preprint arXiv:1906.05797 , 2019.
+[32] J. Sturm, N. Engelhard, F. Endres, W. Burgard, and D. Cre-
+mers. A Benchmark for the Evaluation of RGB-D SLAM
+Systems. In Proceedings of the IEEE/RSJ Conference on In-
+telligent Robots and Systems (IROS) , 2012.
+[33] E. Sucar, S. Liu, J. Ortiz, and A. J. Davison. iMAP: Implicit
+mapping and positioning in real-time. In Proceedings of the
+International Conference on Computer Vision (ICCV) , 2021.
+[34] Cheng Sun, Min Sun, and Hwann-Tzong Chen. Direct voxel
+grid optimization: Super-fast convergence for radiance fields
+reconstruction. In Proceedings of the IEEE Conference on
+Computer Vision and Pattern Recognition (CVPR) , 2022.
+[35] Jiaxiang Tang, Jiawei Ren, Hang Zhou, Ziwei Liu, and Gang
+Zeng. Dreamgaussian: Generative gaussian splatting for ef-
+ficient 3d content creation. Proceedings of the International
+Conference on Learning Representations (ICLR) , 2024.
+[36] Zachary Teed and Jia Deng. DROID-SLAM: Deep Visual
+SLAM for Monocular, Stereo, and RGB-D Cameras. In Neu-
+ral Information Processing Systems (NIPS) , 2021.
+[37] Emanuele Vespa, Nikolay Nikolov, Marius Grimm, Luigi
+Nardi, Paul HJ Kelly, and Stefan Leutenegger. Efficient
+octree-based volumetric SLAM supporting signed-distance
+and occupancy mapping. IEEE Robotics and Automation
+Letters (RAL) , 2018.
+[38] Angtian Wang, Peng Wang, Jian Sun, Adam Kortylewski,
+and Alan Yuille. V oge: a differentiable volume renderer us-
+ing gaussian ellipsoids for analysis-by-synthesis. 2022.
+[39] Hengyi Wang, Jingwen Wang, and Lourdes Agapito. Co-
+slam: Joint coordinate and sparse parametric encodings for
+neural real-time slam. Proceedings of the IEEE Conference
+on Computer Vision and Pattern Recognition (CVPR) , 2023.
+[40] T. Whelan, M. Kaess, H. Johannsson, M. F. Fallon, J. J.
+Leonard, and J. B. McDonald. Real-time large scale dense
+RGB-D SLAM with volumetric fusion. International Jour-
+nal of Robotics Research (IJRR) , 34(4-5):598–626, 2015.
+[41] T. Whelan, S. Leutenegger, R. F. Salas-Moreno, B. Glocker,
+and A. J. Davison. ElasticFusion: Dense SLAM without a
+pose graph. In Proceedings of Robotics: Science and Sys-
+tems (RSS) , 2015.
+[42] Guanjun Wu, Taoran Yi, Jiemin Fang, Lingxi Xie, Xiaopeng
+Zhang, Wei Wei, Wenyu Liu, Qi Tian, and Xinggang Wang.
+4d gaussian splatting for real-time dynamic scene rendering.Proceedings of the IEEE Conference on Computer Vision
+and Pattern Recognition (CVPR) , 2024.
+[43] Xingrui Yang, Hai Li, Hongjia Zhai, Yuhang Ming, Yuqian
+Liu, and Guofeng Zhang. V ox-fusion: Dense tracking and
+mapping with voxel-based neural implicit representation. In
+Proceedings of the International Symposium on Mixed and
+Augmented Reality (ISMAR) , 2022.
+[44] Zeyu Yang, Hongye Yang, Zijie Pan, Xiatian Zhu, and Li
+Zhang. Real-time photorealistic dynamic scene representa-
+tion and rendering with 4d gaussian splatting. Proceedings
+of the International Conference on Learning Representations
+(ICLR) , 2024.
+[45] Taoran Yi, Jiemin Fang, Guanjun Wu, Lingxi Xie, Xiaopeng
+Zhang, Wenyu Liu, Qi Tian, and Xinggang Wang. Gaussian-
+dreamer: Fast generation from text to 3d gaussian splatting
+with point cloud priors. Proceedings of the IEEE Conference
+on Computer Vision and Pattern Recognition (CVPR) , 2024.
+[46] Zihan Zhu, Songyou Peng, Viktor Larsson, Weiwei Xu, Hu-
+jun Bao, Zhaopeng Cui, Martin R. Oswald, and Marc Polle-
+feys. Nice-slam: Neural implicit scalable encoding for slam.
+InProceedings of the IEEE Conference on Computer Vision
+and Pattern Recognition (CVPR) , 2022.
+[47] Zihan Zhu, Songyou Peng, Viktor Larsson, Zhaopeng Cui,
+Martin R Oswald, Andreas Geiger, and Marc Pollefeys.
+Nicer-slam: Neural implicit scene encoding for rgb slam. In-
+ternational Conference on 3D Vision (3DV) , 2024.
+[48] M. Zwicker, H. Pfister, J. van Baar, and M. Gross. Ewa
+splatting. IEEE Transactions on Visualization and Computer
+Graphics , 8(3):223–238, 2002.
+18048

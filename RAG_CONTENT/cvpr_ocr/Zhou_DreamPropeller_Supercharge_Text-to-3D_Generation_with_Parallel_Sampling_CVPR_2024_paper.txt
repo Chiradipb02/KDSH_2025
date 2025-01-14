@@ -1,0 +1,902 @@
+DreamPropeller: Supercharge Text-to-3D Generation with Parallel Sampling
+Linqi Zhou1* Andy Shih1Chenlin Meng1,2Stefano Ermon1
+1Stanford University,2Pika Labs
+1{linqizhou, andyshih, chenlin, ermon }@stanford.edu,2chenlin@pika.art
+Abstract
+Recent methods such as Score Distillation Sampling
+(SDS) and Variational Score Distillation (VSD) using 2D
+diffusion models for text-to-3D generation have demon-
+strated impressive generation quality. However, the long
+generation time of such algorithms significantly degrades
+the user experience. To tackle this problem, we pro-
+pose DreamPropeller, a drop-in acceleration algorithm that
+can be wrapped around any existing text-to-3D generation
+pipeline based on score distillation. Our framework gen-
+eralizes Picard iterations, a classical algorithm for par-
+allel sampling an ODE path, and can account for non-
+ODE paths such as momentum-based gradient updates and
+changes in dimensions during the optimization process as in
+many cases of 3D generation. We show that our algorithm
+trades parallel compute for wallclock time and empirically
+achieves up to 4.7x speedup with a negligible drop in gen-
+eration quality for all tested frameworks. Our implemen-
+tation can be found here.
+1. Introduction
+Diffusion models [9, 38–40] have seen great success in a va-
+riety of domains, including both 2D images [22, 31, 49, 49]
+and 3D shapes [21, 37, 49, 49, 50]. Early attempts of apply-
+ing diffusion frameworks to 3D shape generation require
+training separate models for each data category with 3D
+training samples. This problem is significantly alleviated
+by the use of large-scale text-conditioned 2D diffusion mod-
+els [31]. Such large-scale foundation models, often trained
+on internet-scale data such as LAION-5B [35], have exhib-
+ited remarkable semantic understanding of the visual world,
+which has inspired their use for creating 3D shapes in open-
+vocabulary settings. Among the most remarkable develop-
+ments in recent years involves optimizing NeRF [23] scenes
+using Score Distillation Sampling (SDS) [29] or Score Ja-
+cobian Chaining (SJC) [45], which push the 2D rendering
+*Work done at Pika Labs.
+1We use batch size 16 for higher-quality generation, which requires
+longer time.DreamGaussian [43] ProlificDreamer [46](Complete)
+11 minutes 9 hours 28 minutes(Incomplete)
+2 minutes 2 hours 13 minutes+ DreamPropeller
+2 minutes 2 hours 13 minutes
+”the leaning tower of Pisa,
+aerial view””a pineapple”
+Figure 1. We present two representative examples of applying
+DreamPropeller. Gray rows denote runtime. Our framework
+trades parallel compute for speed and achieves more than 4x
+speedup when applied to both DreamGaussian [43]1and Prolific-
+Dreamer [46] while maintaining the generation quality. At the
+time when DreamPropeller finishes, the baseline versions (Incom-
+plete) exhibit significantly worse appearance and geometry.
+of the 3D models to be more likely under the 2D diffu-
+sion prior through gradient-based optimization. More re-
+cent developments including Variational Score Distillation
+(VSD) [46] further improve the quality of 3D shape gener-
+ation.
+Despite promising results in generation quality, text-to-
+3D methods using SDS/VSD suffer from long generation
+time because gradient-based optimization is computation-
+This CVPR paper is the Open Access version, provided by the Computer Vision Foundation.
+Except for this watermark, it is identical to the accepted version;
+the final published version of the proceedings is available on IEEE Xplore.
+4610
+ally expensive over the parameters of the 3D representa-
+tion, and a large number of iterations are required for con-
+vergence. Recent works [5, 43, 48] have explored using
+a novel efficient 3D representation, namely 3D Gaussian
+Splatting [11], to accelerate the distillation process. Oth-
+ers have explored amortizing the generation process by dis-
+tilling a text-conditioned generator that can generate 3D
+shapes at test time in one step [20]. Orthogonal to these
+methods, we propose a general framework to accelerate
+text-to-3D creation (regardless of the underlying 3D rep-
+resentation) by leveraging parallel compute to perform the
+same number of optimization steps faster (in terms of wall-
+clock time).
+Our method is based on a generalization of Picard itera-
+tions [1] which we adapt to text-to-3D generation. While Pi-
+card iterations were previously shown to be effective in ac-
+celerating image generation from diffusion models through
+faster (parallel-in-time) ODE solving [36], we generalize
+the approach to more complex computation graphs involv-
+ing multiple gradient updates and changes in the dimen-
+sions of the variables. We show that all existing 3D rep-
+resentations for text-to-3D generation can be accelerated
+by our method, including the recently proposed 3D Gaus-
+sian Splatting. Experimentally, we also achieve 4.7x times
+speedup with negligible degradation in generation quality.
+2. Related Works
+Text-to-Image diffusion models. Diffusion models [9, 38–
+40] rose to popularity due to their superior performance and
+training stability compared to GANs [8]. They have been
+scaled up to large-scale foundation models, among the most
+popular of which are text-conditioned latent-diffusion mod-
+els (LDM) [3, 31, 34], which are built on the latent space of
+an autoencoder.
+Such text-conditional LDMs, often trained on internet-
+scale datasets [35], can achieve high generation fidelity with
+reasonable faithfulness to input prompts. This has inspired
+many other remarkable applications such as adding addi-
+tional control signals [49], customizing for subject-specific
+generation [7, 13, 19, 32], and editing [22, 25]. The utiliza-
+tion of large-scale Text-to-Image diffusion models lies at
+the core of modern visual generative modeling, and is also
+central to our method for text-to-3D generation.
+Text/Image-to-3D generation via score distillation.
+DreamFusion [29] and Score Jacobian Chaining [45] were
+among the first to propose lifting 2D diffusion models for
+3D generation by Score Distillation Sampling (SDS), which
+propagates the score of pretrained diffusion models to the
+differentiable rendering of NeRF [23]. ProlificDreamer [46]
+introduces Variational Score Distillation (VSD) which sig-
+nificantly improves the quality of 3D generation by adap-
+tively training a LoRA model. Orthogonal to the distilla-
+tion algorithm, other works such as [4, 15] propose to op-timize a more memory-efficient DMTet representation for
+high-resolution rendering. A more recent work [44] pro-
+poses to volumetrically render signed distance fields (SDF)
+for better texture and mesh extraction. Others [5, 43, 48]
+have also investigated the use of 3D Gaussian Splatting [11]
+as the underlying representation for fast and efficient gener-
+ation, bringing the creation time down to as low as two min-
+utes. Besides other applications such as controllable scene
+composition [2, 6, 28], SDS is also widely applied in the
+Image-to-3D task, where Zero-1-to-3 [17] finetunes a view-
+dependent diffusion model for 3D generation given single
+images. Other works [16, 30, 47] further improved image-
+conditioned generation by integrating multi-view informa-
+tion and additional guidance into the generation process.
+Accelerating sampling with parallelism. Many works
+have studied accelerated sampling of generative models
+by leveraging parallel computation to trade compute for
+speed. For autoregressive models, prior works have used Ja-
+cobi/Gauss iteration [41] or predict/accept mechanisms [42]
+to improve sampling speed. For diffusion models, par-
+allelism based on fixed-point iterations has been shown
+to speed up sampling of pretrained diffusion models [36].
+Similarly, the goal of our work is to accelerate sampling,
+specifically for 3D generation models, which are known to
+have slow sampling speed. Our technique is most related to
+the work of Shih et al. [36], which is inspired by the classic
+technique of Picard iterations to solve ODEs using parallel
+computation, allowing for the utilization of multiple GPUs
+to accelerate sampling. Unfortunately, the method of Picard
+iteration cannot be directly used to parallelize the sequential
+gradient update steps of 3D generation, because of the use
+of momentum-based gradient updates changes in dimension
+during optimization.
+In this work, we seek to overcome the challenges of the
+representational differences of 3D generation and design
+an algorithm that accelerates the generation of all existing
+3D representations. We do so by formulating Picard iter-
+ations [36] for a wider family of sequential computation,
+enabling us to leverage parallel computational resources to
+accelerate 3D generation.
+3. Preliminary
+Recent Text-to-3D generation frameworks mostly rely on
+distilling knowledge from pretrained 2D diffusion models.
+We hereby introduce some backgrounds and notations help-
+ful for our exposition.
+3.1. Text-to-3D Generation via Score Distillation
+2D diffusion models [9, 38–40] learn a distribution of im-
+ages by adding noise to the ground-truth image xat noise
+level t, resulting in noisy images zt, and uses a score net-
+workϵϕ(zt, t, y)with parameter ϕand caption yto esti-
+mate the gradient direction towards higher likelihood given
+4611
+zt. Such diffusion models can faithfully produce realistic
+images highly aligned with the input caption y. Their suc-
+cess has also inspired their use for 3D shape generation,
+which we shall introduce below. Suppose the 3D shape
+(e.g. NeRF) parameterized by θ, can be rendered into an im-
+age following a deterministic transformation g: Θ× C →
+RH×W×Cwhich takes in shape parameter θ∈Θand cam-
+era parameters c∈ C. We seek an update rule for θsuch
+thatg(θ, c)is a realistic image following caption y.
+Score Distillation Sampling. The seminal works [29, 45]
+on lifting 2D diffusion models for 3D creation propose to
+directly propagate diffusion score prediction towards NeRF
+parameters. The most prominent algorithm, Score Distil-
+lation Sampling (SDS), or Score Jacobian Chaining (SJC),
+states that a 3D model parameterized by can be guided to
+generate a scene with caption yby following the update
+ruleθτ+1=θτ−η∇θτLSDS. With t∼ U(0.02,0.98),
+ϵ∼ N(0,I), andzt=αtg(θ, c) +σtϵ,
+∇θLSDS=Et,ϵh
+ω(t)
+ϵpretrain (zt, t, y)−ϵ∂
+∂θg(θ, c)i
+(1)
+where ω(t)is a weighting function. In practice, the gra-
+dient update is done through Adam gradient update, which
+updates 3D models such that their rendering g(θ, c)closely
+follows distributions of the pretrained 2D diffusion prior.
+Variational Score Distillation. Despite success in zero-
+shot 3D NeRF generation, SDS often suffers from over-
+saturation and simplistic geometry. To enhance the genera-
+tive quality, another recent work [46] proposes Variational
+Score Distillation (VSD), which replaces the noise sample ϵ
+with a trainable LoRA diffusion with parameter ϕsuch that
+∇θLVSD=Et,ϵh
+ω(t)
+ϵpretrain (zt, t, y)−
+ϵϕ(zt, t, c, y )∂
+∂θg(θ, c)i (2)
+where the LoRA model is adaptively trained to fit the distri-
+bution of the current render g(θ, c).
+Generative 3D Gaussian Splatting. 3D Gaussian Splat-
+ting [11] is a recently developed 3D representation for effi-
+cient rendering. It is represented by a set of 3D Gaussians
+which are optimized with differentiable rasterizers. More
+recent works [5, 43, 48] have adopted this representation
+for score distillation, which greatly reduces the generation
+time. However, this representation is different from others
+in that the number of Gaussians can change during the opti-
+mization process due to its split-and-prune operations.
+Figure 2. Picard dependency graph. Gray nodes have outgoing
+edges to all subsequent nodes in k+1-th iteration and are indepen-
+dent of each other. This allows parallel computation of s(xk
+τ, τ)
+for all τ∈[0, T−1].
+3.2. Picard Iterations
+The classic Picard iteration approximates the solution tra-
+jectory of an ODE x0:τending at time τ
+xτ=x0+Zτ
+0s(xu, u)du (3)
+via fixed-point iteration, by starting with a guess of the full
+trajectory xk=0
+0:Tand iteratively refining until convergence
+using the following iteration rule for each iteration k:
+xk
+τ=xk−1
+0+Zτ
+0s(xk−1
+u, u)du (4)
+which under mild conditions will converge to a unique ODE
+solution given initial condition x0. The discrete-time ap-
+proximation is
+xk
+τ=xk−1
+0+1
+Tτ−1X
+i=0s(xk−1
+i,i
+T) (5)
+which is guaranteed to converge in Tsteps, but in practice
+often converges much faster in K≪Titerations. This pro-
+cedure allows us to leverage parallel computation to con-
+verge to the solution in O(K)steps. In Figure 2 we depict
+the computation graph of Picard iterations, where we see
+long-range dependencies allowing for information to prop-
+agate quickly to the end of the sequence.
+Previously, Shih et al. [36] leveraged Picard iterations to
+accelerate sampling for diffusion models on images. Once
+converged, we simply extract the endpoint of the solution
+trajectory of the final iteration xk=K
+τ=Tas the sample of the
+diffusion model.
+In this work, we seek to extend the method of Picard
+iterations to Text-to-3D generation via score distillation.
+However, generalizing this process to 3D generation is non-
+trivial because, unlike Shih et al. [36], solution trajectories
+for 3D generation is not in data space, but rather in “pa-
+rameter” space. This presents key challenges: 1) for meth-
+ods such as 3D Gaussian Splatting, the parameter space has
+changing dimensionality over the length of the trajectory,
+2) all score distillation methods involve sequential gradient
+4612
+update using Adam optimizer, as opposed to a trivial prefix
+sum. Therefore, we must investigate more deeply to come
+up with a generalized formulation of Picard iteration that is
+applicable to 3D generation.
+4. Method
+Despite the impressive quality of the generation results from
+VSD and SDS, all of score distillation methods suffer from
+long generation time ( e.g. 10 hours for one generation from
+VSD on an NVIDIA A100), making them prohibitively ex-
+pensive to use in practice. Motivated by this problem, we
+seek to design an acceleration algorithm for all existing 3D
+representations suitable for score distillation.
+4.1. Score Distillation as Sequential Computation
+Our key insight is that the parameter update rules for
+SDS/VSD can roughly be written as a sequential compu-
+tation θτ+1=θτ+η∇θτLof a form that is similar to Pi-
+card iterations, where Lcan either be LSDSorLVSDandη
+is step size. However, we cannot directly apply Picard iter-
+ations because these methods have further complications in
+their sequential computations. For example, SDS/VSD rely
+on momentum-based optimizers such as Adam [12] to per-
+form the parameter update, where the momentum prevents
+us from directly using vanilla Picard iteration. Special rep-
+resentations such as Gaussian Splatting intertwine gradient
+updates with splitting operations, which increase the dimen-
+sionality of θ, a property that similarly prevents the na ¨ıve
+use of Picard.
+4.2. Generalizing Picard Iterations
+We now present a generalized version of Picard iterations
+that will enable us to apply the same parallelization tech-
+niques to more complicated computation graphs, encom-
+passing cases such as Gaussian Splatting and SDS/VSD.
+In standard Picard iterations, our goal is to parallelize an
+ODE that takes additive sequential updates of the form
+θτ+1=g(θτ) =θτ+ηs(θτ) (6)
+where s(·)is the drift function of the ODE, and the eventual
+computational unit that we will parallelize over. To take the
+first step towards generalizing Picard iteration, we rearrange
+to write this computational unit sexplicitly:
+s(θτ) =1
+η(g(θτ)−θτ) (7)
+where g(·)denotes the underlying function outputting the
+next parameter θτ. Choosing the computational unit sas
+the drift is natural for ODEs, and is convenient because un-
+rolling drifts can be easily done via a summation. However,
+this choice of computing the drift cannot be generalized toAlgorithm 1 Generalized Picard Iteration
+Input: Initial parameter θ, pseudo-inverse h†, drift s,
+maximum time T
+Output: Score distillation output
+θ0
+τ←θ,∀τ∈[0, T]
+τ, k←0,0
+while not converged do
+forτfrom 0toT−1docompute s(θk
+τ)in parallel
+forτfrom 0toT−1doθk+1
+τ+1←h†(s(θk
+τ), θk
+τ)
+k←k+ 1
+return θk
+T
+settings such as expanding/shrinking of dimensions and dis-
+crete domains, where subtraction operator can be unnatural
+or even undefined. Moreover, in settings using momentum-
+based updates (Adam), applying drift-based error accumu-
+lation to the momentum terms can lead to very poor perfor-
+mance.
+To generalize Picard iterations, our insight is that we can
+consider many different choices of the computational unit
+s. We can write sas some general function of g(θτ)andθτ:
+s(θτ) =h(g(θτ), θτ) (8)
+where his equipped with h†(·,·), a pseudo-inverse of h
+w.r.t. the first argument g(θτ). Under this condition, we can
+write the following iteration rule:
+θk
+τ=h† 
+s(θk−1
+τ−1), h† 
+s(θk−1
+τ−2), . . . h†(s(θk−1
+0), θk−1
+0)
+(9)
+This iteration rule can be understood as the generalized
+form of Picard iterations. Similar to Picard iterations, we
+1) perform the computation units s(θk−1
+0:T)in parallel and
+2) do a sequential unrolling of the trajectory from iteration
+k−1to arrive at iteration k. In contrast, Picard iteration
+has a simple form for the sequential unrolling, i.e. cumula-
+tive sum (as in Table 1).
+We further show in Appendix A that the existence of h†
+paired with the iteration rule in Eq. (9) is well-defined and
+guarantees a fixed-point solution.
+Finally, we proceed by demonstrating two concrete
+choices of sfor generalized Picard iterations on 3D Gaus-
+sian Splatting and SDS, both of which pose problems for
+naive Picard iteration.
+Example 1: 3D Gaussian Splatting
+Recently, 3D Gaussian Splatting [11] has been adopted
+for 3D generative models using SDS [5, 43, 48]. A unique
+property of this representation is its ability to dynamically
+change its dimension ( i.e. number of Gaussians) during the
+optimization process. This poses significant challenges to
+4613
+Figure 3. Overview of DreamPropeller. Starting from top left, for iteration k, we initialize a window of 3D shapes (in green) with dimension
+Dand dispatch them to pGPUs for parallelly computing the SDS/VSD gradients, which are gathered for rollout using the rule in Eq. (9).
+The resulting shapes (in orange) for iteration k+ 1are compared to those in iteration k. The window is slid forward until the error at that
+time step is not smaller than the threshold e, which is adaptively updated with the mean/median error of the window. Optionally, in the
+case of VSD, we keep independent copies of LoRA diffusion on all GPUs which are updated independently without extra communication.
+Picard Generalized
+Sequential output θk+1
+τ+1 g(θk
+τ) g(θk
+τ)
+Update function s(θk
+τ) s(θk
+τ) =1
+η(g(θk
+τ)−θk
+τ) s(θk
+τ) =h(g(θk
+τ), θk
+τ)
+Output parameterization θk+1
+τ+1=θk
+τ+ηs(θk
+τ) θk+1
+τ+1=h†(s(θk
+τ), θk
+τ)
+Iteration rule θk
+τ=θk−1
+0+ηPτ−1
+i=0s(θk−1
+i)θk
+τ=h†(s(θk−1
+τ−1), . . . h†(s(θk−1
+0), θk−1
+0). . .)
+Table 1. Comparison between Picard and generalized iterations.
+the classical Picard iterations as it assumes fixed dimensions
+throughout ( i.e.θτ, θτ+1have the same dimension).
+Concretely, in the case of 3D Gaussian Splatting where
+the number of points may increase, the difference in di-
+mension θk
+τandg(θk
+τ)can be addressed by designing
+h(g(θk
+τ), θk
+τ)to be
+s(θk
+τ) =1
+η(proj(g(θk
+τ))−θk
+τ) (10)
+where proj :RN→RM,N≥M, is a projection func-
+tion from RNtoRMby deleting a subset of points from its
+input. Its pseudo-inverse can be
+θk+1
+τ+1=unproj (θk
+τ+ηs(θk
+τ)) (11)
+where unproj :RM→RNis a dimensionality-increasing
+function that adds new points to the current parameter. Fol-
+lowing Tang et al. [43], we use the split-and-clone function
+as our unproj (·)function.
+Example 2: Adam gradient updatesWith methods that use optimizers such as Adam, the se-
+quential update involves a momentum term (here denoted
+asmk
+τ) which necessitates the use of the generalized form
+of Picard iterations, since applying vanilla Picard iterations
+ons((θk
+τ, mk
+τ))will lead to poor updating of the additional
+momentum parameters.
+To incorporate the additional momentum update rules,
+we can simply design h(g(θk
+τ, mk
+τ),(θk
+τ, mk
+τ))to be∇θkτL,
+which gives us (assuming learning rate η) the natural
+pseudo-inverse
+θk+1
+τ+1, mk+1
+τ+1=Adam (s((θk
+τ, mk
+τ)),(θk
+τ, mk
+τ)) (12)
+and the generalized Picard update becomes
+θk+1
+τ+1, mk+1
+τ+1←g(θk
+τ, mk
+τ) =Adam (∇θkτL,(θk
+τ, mk
+τ))
+(13)
+For clarity, we additionally provide a high-level algo-
+rithm in Algorithm 1. Because of parallel computation of
+s(·), this algorithm can converge in O(K)where K≪T.
+4614
+4.3. Practical Decisions
+We note several practical considerations that are significant
+for empirical success.
+Sliding window. Although one can in theory parallelize the
+entire trajectory, it is impractical to start by keeping all of
+{θ0
+τ}T
+τ=0in memory. In 3D generation settings, Tcan usu-
+ally be on the order of 10K and each parameter can cost
+large amounts of memory. We therefore similarly take in-
+spiration from [36] and employ a batched window scheme
+such that the Picard iteration is only performed on θk
+τ:τ+p
+and the window is slid across until the fixed-point conver-
+gence error at the starting time step is above a threshold e.
+More details on the distance metric and how to handle di-
+mension mismatch can be found in Appendix C.
+In addition, to maximize efficiency, we want to paral-
+lelize the expensive calculation of SDS/VSD gradients, so
+we need to put one pretrained diffusion model on each GPU.
+We set the window size to be one less than the total number
+of GPUs, and use the remaining one for sequential rollout.
+Eliminating stochasticity. As Picard iterations’ conver-
+gence depends on the deterministic fixed-point iteration
+scheme, which requires deterministic gradient for the same
+θk
+τat each τ. However, the calculation of both ∇θτLSDSand
+∇θτLVSDare stochastic due to Monte Carlo approximation
+of the expectation. To resolve this, we simply fix the ran-
+dom seed for each iteration, which works well empirically.
+Parallelizing Variational Score Distillation. Variational
+Score Distillation requires training an additional LoRA
+model to adapt to the distribution of the current generated
+results. There are two possible solutions for parallelization:
+(1) we can update LoRA parameters similarly as our 3D pa-
+rameters, by calculating their gradients on separate GPUs
+and aggregating them on the remaining GPU; (2) we can
+keep different LoRA models on different GPUs and sepa-
+rately update each without passing them back for aggrega-
+tion. The first approach results in more accurate gradients as
+it seeks to parallelize updates of a single LoRA model, but
+we find that passing around LoRA parameters across GPUs
+is very expensive and can undermine any speed gain for the
+actual 3D model updates. We therefore avoid this approach.
+The second solution provides less accurate LoRA gradients
+in theory because our 3D model parameters can be passed to
+different LoRA models on different GPUs at any iteration,
+which can provide different LoRA updates at any point in
+time. However, we observe that since each of our 3D model
+parameters in the window is randomly allocated to different
+GPUs for gradient calculation, there is approximately equal
+probability that each LoRA model will observe all models
+in the window. This means, roughly speaking, each LoRA
+model will learn the distribution of all 3D models in the cur-
+rent window. Therefore, updating LoRA separately on dif-
+ferent GPUs gives valid guidance and eliminates the need
+for communicating additional parameters across GPUs.Adaptive threshold. Fixed-point errors control how close
+one is to the true trajectory. Smaller thresholds lead to slow
+convergence and larger thresholds lead to worse generation
+quality. In practice, we observe the threshold can be differ-
+ent for different prompts and 3D representations. To avoid
+the need for excessively tuning thresholds, we propose to
+adaptively update the threshold by the exponential moving
+average (EMA) of the mean or median error of the current
+window. With EMA decay rate γ, window of size pstart-
+ing at time τand iteration k, and assume the parameter has
+dimension D, we update threshold eby
+e←γe+ (1−γ)∗M({1
+Dd(θk+1
+τ+i, θk
+τ+i)2}p
+i=1)(14)
+where Mis a mean or median function. We investigate the
+effect of the EMA parameters in ablation studies.
+Our final method is depicted in Figure 3, and we provide
+a detailed practical algorithm in Appendix B.
+5. Experiments
+Running DreamPropeller for Titerations is guaranteed to
+give the same results as the original method, and it em-
+pirically often requires much fewer steps for convergence,
+a property we empirically investigate in this section. We
+first show that our method achieves consistent more than
+4x speedup when applied to a variety of 3D representations
+and different score distillation frameworks. We then con-
+duct ablation studies on the proposed practical decisions.
+5.1. Accelerating Text-to-3D Generation
+We choose baselines that represent the most promi-
+nent 3D representations, namely NeRF from DreamFu-
+sion [29], DMTet from Magic3D [15], SDF from coarse-
+stage TextMesh [44] (see Appendix D for detail), and 3D
+Gaussian Splatting from DreamGaussian [43], and directly
+apply our wrapper to them. In addition, we show that
+our algorithm can similarly be adapted to the recently pro-
+posed VSD from ProlificDreamer [46]. Our DreamPro-
+peller wrapper is modular and agnostic to the calculation of
+gradient updates via score distillation, and we test its per-
+formance by comparing each of the baselines’ runtime and
+quality with and without our wrapper.
+Data and metrics. We use 30 prompts from the DreamFu-
+sion gallery to test each algorithm. We run each framework
+with each individual prompt and record its wallclock run-
+time in seconds. Following [10, 24, 44], we use CLIP R-
+Precision [27] for measuring semantic alignment between
+the generated asset and its input prompt. CLIP R-Precision
+is the retrieval accuracy of a prompt from the set of prompts
+given a generated image conditioned on this prompt, and
+we use top-1 retrieval accuracy for all experiments. We ad-
+ditionally use CLIP FID score [14] compared against the
+ImageNet 2012 validation set [33] for generation quality.
+4615
+DreamFusion [29] + DreamPropeller DreamFusion [29] + DreamPropeller
+2 hours 10 minutes 32 minutes 2 hours 9 minutes 31 minutes
+”a delicious croissant” ”a small saguaro cactus planted in a clay”
+Magic3D [15] + DreamPropeller Magic3D [15] + DreamPropeller
+3 hours 34 minutes 52 minutes 3 hours 35 minutes 54 minutes
+”a DSLR photo of a blue jay standing on a macaron” ”a DSLR photo of a blue tulip”
+TextMesh [44] + DreamPropeller TextMesh [44] + DreamPropeller
+2 hours 5 minutes 30 minutes 2 hours 6 minutes 30 minutes
+”a ceramic upside down yellow octopus
+holding a blue-green ceramic cup””a highly detailed stone bust of the tiger”
+DreamGaussian [43] + DreamPropeller DreamGaussian [43] + DreamPropeller
+11 minutes 2 minutes 11 minutes 2 minutes
+”a photo of an ice cream ” ”a ripe strawberry ”
+ProlificDreamer [46] + DreamPropeller ProlificDreamer [46] + DreamPropeller
+9 hours 21 minutes 2 hours 10 minutes 9 hours 13 minutes 2 hours 15 minutes
+”fries and a hamburger” ”an imperial state crown of England ”
+Figure 4. Visual comparisons. Methods using DreamPropeller achieve equally high-quality generation with a much shorter runtime.
+Speedup is calculated as the ratio of wall-clock runtime for
+baseline to our method – higher is better.
+Evaluation. As larger batch size can lead to higher-quality
+generation [4, 15, 26, 46], we use batch size 16 for all base-
+lines but ProlificDreamer, for which, due to memory con-
+straints, we use batch size 8 for the first 5000 steps (ren-
+dered at 64×64resolution) and batch size 2 for the re-
+maining steps (rendered at 512×512resolution). We use 8
+NVIDIA A100 PCIe GPUs for all experiments, which de-
+fault to window size 7. More details can be found in Ap-
+pendix D. We evaluate R-Precision and FID CLIP using all
+rendered images from all generated shapes. Quantitative
+results can be found in Table 2 and qualitative results areshown in Figure 4.
+Notice that with competitive generation quality, we con-
+sistently achieve more than 4x speedup for all frameworks
+and algorithms, with the most speedup for ProlificDreamer.
+This is in line with the intuition that our parallelization al-
+gorithm is more effective when each iteration’s GPU work-
+load becomes heavier, which is the case for ProlificDreamer
+due to it keeping and updating another LoRA model on the
+fly. The heavy workload is effectively delegated to differ-
+ent GPUs. In theory, the heavier the GPU workload is, the
+more the optimization benefits from our framework. Also
+note that DreamGaussian experiences competitive speedup
+as ProlificDreamer. This is because its original implementa-
+4616
+(a) Ablation on window size.
+ (b) Ablation on threshold EMA rate.
+ (c) Ablation on batch size.
+Figure 5. Ablation studies on practical choices. Speedup is the ratio of baseline wall-clock runtime to our wall-clock runtime. Relative
+quality is the ratio of baseline FID CLIPto our FID CLIP.
+R-Precision ↑FID↓Runtime (s) ↓Speedup
+DreamFusion [29] 82.70 60.91 80804.22x+ DreamPropeller 79.57 59.88 1910
+Magic3D [15] 88.45 59.24 134704.17x+ DreamPropeller 87.18 59.19 3230
+TextMesh [44] 88.06 64.19 76904.18x+ DreamPropeller 84.43 62.12 1830
+DreamGaussian [43] 83.28 58.33 7004.67x+ DreamPropeller 83.85 58.26 150
+ProlificDreamer [46] 94.11 49.66 73904.69x+ DreamPropeller 96.12 49.65 3710
+Table 2. Quantitative evaluation on 30 prompts from the DreamFu-
+sion gallery. Runtime is reported in seconds. Our method achieves
+competitive quality while provide more than 4x speedup.
+tion requires sequential rendering of each instance within a
+batch. This scales its GPU runtime linearly with batch size,
+so our framework gives better speedup. We also notice that
+our results do not exactly match those of baselines. This
+is likely due to the fixed-point error not being low enough
+for converging to the fixed-point solution, and Adam takes
+the parameters to slightly different but equally valid local
+optima through momentum-based gradient updates.
+5.2. Ablation Studies
+We further conduct ablation studies for the practical choices
+to investigate their effectiveness.
+Effect of window size. By default, we set the window size
+to be 1 less than the number of GPUs, since we need the re-
+maining one for sequential rollout. Allowing all other GPUs
+to do independent work intuitively maximizes speedup.
+However, how does the speedup scale when window size
+is independent of the number of GPUs? For our experi-
+ment in Figure 5a, we assume access to 8 NVIDIA A100
+PCIe GPUs and adjust the window size from 1 to beyond 7.
+The speedup of our framework peaks at window size 7, be-
+cause we fully utilize all GPU resources for maximum par-
+allelization. We also observe a drop in speedup for window
+size beyond 7. We hypothesize that this is due to longersliding windows not advancing far enough under GPU re-
+source constraints while requiring more FLOPs, thus caus-
+ing slower speedup.
+Effect of threshold adaptivity. The adaptivity parame-
+ter aims to stabilize speedup while maintaining generation
+quality. We show in Figure 5b its ablation study. Rela-
+tive quality is calculated as the ratio of baseline FID CLIP
+to our FID CLIP – a higher ratio means better relative qual-
+ity. For each model, 5 settings are tested with γ∈
+{0.2,0.4,0.6,0.8,1.0}and initial thresholds set to 1% of
+the default thresholds. This is to maximally bottleneck our
+framework to test how much γcounteracts an ill-initialized
+threshold. We observe a large gap between results from
+γ= 1andγ <1(in red region), implying as long as γ <1
+(i.e. our framework is adaptive), all models achieve similar
+speedup without significantly degrading quality.
+Effect of batch size. As SDS/VSD requires evaluating
+expectation over diffusion time t, one is motivated to use
+a large batch size of tfor more accurate estimate of the
+guidance score, which can lead to higher-quality genera-
+tion [4, 15, 26, 46]. As such, this increases computational
+demand for GPU per iteration, a regime where our method
+is particularly beneficial. As shown Figure 5c, the speedup
+of our method scales with increasing batch sizes because
+of the increase in computational intensity per iteration. In
+particular, our method benefits VSD more even when batch
+size is small because the LoRA training is costly and is ef-
+fectively amortized across GPUs because their parameters
+are never communicated across processes.
+6. Conclusion
+In this work, we introduce DreamPropeller, a drop-in ac-
+celeration framework for all existing score distillation-
+based text-to-3D generation methods. DreamPropeller can
+achieve more than 4x speedup for various predominant 3D
+representations and benefits more from heavier demand for
+GPU computation per iteration. We hope our framework
+serves as a significant step towards usable high-quality text-
+to-3D methods and inspires more advancements to come.
+4617
+References
+[1] Monther Alfuraidan and Qamrul Ansari. Fixed Point The-
+ory and Graph Theory: Foundations and Integrative Ap-
+proaches . Academic Press, 2016. 2
+[2] Haotian Bai, Yuanhuiyi Lyu, Lutao Jiang, Sijia Li, Hao-
+nan Lu, Xiaodong Lin, and Lin Wang. CompoNeRF: Text-
+guided multi-object compositional NeRF with editable 3D
+scene layout. 2023. 2
+[3] Yogesh Balaji, Seungjun Nah, Xun Huang, Arash Vahdat, Ji-
+aming Song, Qinsheng Zhang, Karsten Kreis, Miika Aittala,
+Timo Aila, Samuli Laine, Bryan Catanzaro, Tero Karras, and
+Ming-Yu Liu. EDiff-I: Text-to-image diffusion models with
+an ensemble of expert denoisers. 2022. 2
+[4] Rui Chen, Yongwei Chen, Ningxin Jiao, and Kui Jia. Fan-
+tasia3D: Disentangling geometry and appearance for high-
+quality Text-to-3D content creation. 2023. 2, 7, 8
+[5] Zilong Chen, Feng Wang, and Huaping Liu. Text-to-3D us-
+ing gaussian splatting. 2023. 2, 3, 4
+[6] Dana Cohen-Bar, Elad Richardson, Gal Metzer, Raja Giryes,
+and Daniel Cohen-Or. Set-the-Scene: Global-Local training
+for generating controllable NeRF scenes. 2023. 2
+[7] Rinon Gal, Yuval Alaluf, Yuval Atzmon, Or Patashnik,
+Amit H Bermano, Gal Chechik, and Daniel Cohen-Or. An
+image is worth one word: Personalizing Text-to-Image gen-
+eration using textual inversion. 2022. 2
+[8] Ian Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing
+Xu, David Warde-Farley, Sherjil Ozair, Aaron Courville, and
+Yoshua Bengio. Generative adversarial nets. Adv. Neural Inf.
+Process. Syst. , 27, 2014. 2
+[9] Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising dif-
+fusion probabilistic models. Adv. Neural Inf. Process. Syst. ,
+33:6840–6851, 2020. 1, 2
+[10] Ajay Jain, Ben Mildenhall, Jonathan T Barron, Pieter
+Abbeel, and Ben Poole. Zero-shot text-guided object genera-
+tion with dream fields. In Proceedings of the IEEE/CVF Con-
+ference on Computer Vision and Pattern Recognition , pages
+867–876. openaccess.thecvf.com, 2022. 6
+[11] Bernhard Kerbl, Georgios Kopanas, Thomas Leimkuehler,
+and George Drettakis. 3D gaussian splatting for Real-Time
+radiance field rendering. ACM Trans. Graph. , 42(4):1–14,
+2023. 2, 3, 4
+[12] Diederik P Kingma and Jimmy Ba. Adam: A method for
+stochastic optimization. 2014. 4
+[13] Nupur Kumari, Bingliang Zhang, Richard Zhang, Eli
+Shechtman, and Jun-Yan Zhu. Multi-concept customization
+of text-to-image diffusion. pages 1931–1941, 2022. 2
+[14] Tuomas Kynk ¨a¨anniemi, Tero Karras, Miika Aittala, Timo
+Aila, and Jaakko Lehtinen. The role of ImageNet classes
+in fr´echet inception distance. 2022. 6
+[15] Chen-Hsuan Lin, Jun Gao, Luming Tang, Towaki Takikawa,
+Xiaohui Zeng, Xun Huang, Karsten Kreis, Sanja Fidler,
+Ming-Yu Liu, and Tsung-Yi Lin. Magic3D: High-Resolution
+Text-to-3D content creation. 2022. 2, 6, 7, 8
+[16] Minghua Liu, Chao Xu, Haian Jin, Linghao Chen, Varma T
+Mukund, Zexiang Xu, and Hao Su. One-2-3-45: Any single
+image to 3D mesh in 45 seconds without Per-Shape opti-
+mization. 2023. 2, 3[17] Ruoshi Liu, Rundi Wu, Basile Van Hoorick, Pavel Tok-
+makov, Sergey Zakharov, and Carl V ondrick. Zero-1-to-3:
+Zero-shot one image to 3d object. In Proceedings of the
+IEEE/CVF International Conference on Computer Vision ,
+pages 9298–9309. openaccess.thecvf.com, 2023. 2, 3, 4
+[18] Ying-Tian Liu, Yuan-Chen Guo, Vikram V oleti, Ruizhi
+Shao, Chia-Hao Chen, Guan Luo, Zixin Zou, Chen Wang,
+Christian Laforte, Yan-Pei Cao, and Others. threestudio:
+a modular framework for diffusion-guided 3D generation.
+cg.cs.tsinghua.edu.cn . 1
+[19] Zhiheng Liu, Ruili Feng, Kai Zhu, Yifei Zhang, Kecheng
+Zheng, Yu Liu, Deli Zhao, Jingren Zhou, and Yang Cao.
+Cones: Concept neurons in diffusion models for customized
+generation. 2023. 2
+[20] Jonathan Lorraine, Kevin Xie, Xiaohui Zeng, Chen-Hsuan
+Lin, Towaki Takikawa, Nicholas Sharp, Tsung-Yi Lin, Ming-
+Yu Liu, Sanja Fidler, and James Lucas. ATT3D: Amortized
+Text-to-3D object synthesis. 2023. 2
+[21] Shitong Luo and Wei Hu. Diffusion probabilistic models for
+3D point cloud generation. pages 2837–2845, 2021. 1
+[22] Chenlin Meng, Yutong He, Yang Song, Jiaming Song, Jia-
+jun Wu, Jun-Yan Zhu, and Stefano Ermon. SDEdit: Guided
+image synthesis and editing with stochastic differential equa-
+tions. 2021. 1, 2
+[23] Ben Mildenhall, Pratul P Srinivasan, Matthew Tancik,
+Jonathan T Barron, Ravi Ramamoorthi, and Ren Ng. NeRF:
+representing scenes as neural radiance fields for view synthe-
+sis.Commun. ACM , 65(1):99–106, 2021. 1, 2, 3, 4
+[24] Nasir Mohammad Khalid, Tianhao Xie, Eugene Belilovsky,
+and Tiberiu Popa. CLIP-Mesh: Generating textured meshes
+from text using pretrained image-text models. In SIGGRAPH
+Asia 2022 Conference Papers , number Article 25 in SA ’22,
+pages 1–8, New York, NY , USA, 2022. Association for Com-
+puting Machinery. 6
+[25] Ron Mokady, Amir Hertz, Kfir Aberman, Yael Pritch, and
+Daniel Cohen-Or. Null-text inversion for editing real images
+using guided diffusion models. pages 6038–6047, 2022. 2
+[26] Zijie Pan, Jiachen Lu, Xiatian Zhu, and Li Zhang. Enhancing
+High-Resolution 3D generation through pixel-wise gradient
+clipping. 2023. 7, 8
+[27] Dong Huk Park, Samaneh Azadi, Xihui Liu, Trevor Darrell,
+and Anna Rohrbach. Benchmark for compositional Text-to-
+Image synthesis. 2021. 6
+[28] Ryan Po and Gordon Wetzstein. Compositional 3D scene
+generation using locally conditioned diffusion. 2023. 2
+[29] Ben Poole, Ajay Jain, Jonathan T Barron, and Ben Milden-
+hall. DreamFusion: Text-to-3D using 2D diffusion. 2022. 1,
+2, 3, 6, 7, 8
+[30] Guocheng Qian, Jinjie Mai, Abdullah Hamdi, Jian Ren,
+Aliaksandr Siarohin, Bing Li, Hsin-Ying Lee, Ivan Sko-
+rokhodov, Peter Wonka, Sergey Tulyakov, and Bernard
+Ghanem. Magic123: One image to High-Quality 3D object
+generation using both 2D and 3D diffusion priors. 2023. 2,
+3
+[31] Robin Rombach, Andreas Blattmann, Dominik Lorenz,
+Patrick Esser, and Bj ¨orn Ommer. High-resolution image
+synthesis with latent diffusion models. In Proceedings of
+4618
+the IEEE/CVF conference on computer vision and pattern
+recognition , pages 10684–10695. openaccess.thecvf.com,
+2022. 1, 2
+[32] Nataniel Ruiz, Yuanzhen Li, Varun Jampani, Yael Pritch,
+Michael Rubinstein, and Kfir Aberman. DreamBooth: Fine
+tuning text-to-image diffusion models for subject-driven
+generation. pages 22500–22510, 2022. 2
+[33] Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, San-
+jeev Satheesh, Sean Ma, Zhiheng Huang, Andrej Karpathy,
+Aditya Khosla, Michael Bernstein, Alexander C Berg, and Li
+Fei-Fei. ImageNet large scale visual recognition challenge.
+2014. 6
+[34] Chitwan Saharia, William Chan, Saurabh Saxena, Lala
+Li, Jay Whang, Emily L Denton, Kamyar Ghasemipour,
+Raphael Gontijo Lopes, Burcu Karagol Ayan, Tim Salimans,
+and Others. Photorealistic text-to-image diffusion models
+with deep language understanding. Adv. Neural Inf. Process.
+Syst., 35:36479–36494, 2022. 2
+[35] Christoph Schuhmann, Romain Beaumont, Richard Vencu,
+Cade Gordon, Ross Wightman, Mehdi Cherti, Theo
+Coombes, Aarush Katta, Clayton Mullis, Mitchell Worts-
+man, Patrick Schramowski, Srivatsa Kundurthy, Katherine
+Crowson, Ludwig Schmidt, Robert Kaczmarczyk, and Jenia
+Jitsev. LAION-5B: An open large-scale dataset for train-
+ing next generation image-text models. pages 25278–25294,
+2022. 1, 2
+[36] Andy Shih, Suneel Belkhale, Stefano Ermon, Dorsa Sadigh,
+and Nima Anari. Parallel sampling of diffusion models.
+2023. 2, 3, 6
+[37] J Ryan Shue, Eric Ryan Chan, Ryan Po, Zachary Ankner,
+Jiajun Wu, and Gordon Wetzstein. 3D neural field generation
+using triplane diffusion. pages 20875–20886, 2022. 1
+[38] Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan,
+and Surya Ganguli. Deep unsupervised learning using
+nonequilibrium thermodynamics. In Proceedings of the
+32nd International Conference on Machine Learning , pages
+2256–2265, Lille, France, 2015. PMLR. 1, 2
+[39] Yang Song and Stefano Ermon. Generative modeling by esti-
+mating gradients of the data distribution. Advances in neural
+information processing systems , 32, 2019.
+[40] Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Ab-
+hishek Kumar, Stefano Ermon, and Ben Poole. Score-Based
+generative modeling through stochastic differential equa-
+tions. 2020. 1, 2
+[41] Yang Song, Chenlin Meng, Renjie Liao, and Stefano Ermon.
+Accelerating feedforward computation via parallel nonlinear
+equation solving. In International Conference on Machine
+Learning , pages 9791–9800. PMLR, 2021. 2
+[42] Mitchell Stern, Noam Shazeer, and Jakob Uszkoreit. Block-
+wise parallel decoding for deep autoregressive models. Ad-
+vances in Neural Information Processing Systems , 31, 2018.
+2
+[43] Jiaxiang Tang, Jiawei Ren, Hang Zhou, Ziwei Liu, and Gang
+Zeng. DREAMGAUSSIAN: GENERATIVE GAUSSIAN
+SPLAT- TING FOR EFFICIENT 3D CONTENT CRE-
+ATION. 1, 2, 3, 4, 5, 6, 7, 8[44] Christina Tsalicoglou, Fabian Manhardt, Alessio Tonioni,
+Michael Niemeyer, and Federico Tombari. TextMesh: Gen-
+eration of realistic 3D meshes from text prompts. 2023. 2, 6,
+7, 8
+[45] Haochen Wang, Xiaodan Du, Jiahao Li, Raymond A Yeh,
+and Greg Shakhnarovich. Score jacobian chaining: Lift-
+ing pretrained 2d diffusion models for 3d generation. In
+Proceedings of the IEEE/CVF Conference on Computer Vi-
+sion and Pattern Recognition , pages 12619–12629. openac-
+cess.thecvf.com, 2023. 1, 2, 3
+[46] Zhengyi Wang, Cheng Lu, Yikai Wang, Fan Bao, Chongxuan
+Li, Hang Su, and Jun Zhu. ProlificDreamer: High-Fidelity
+and diverse Text-to-3D generation with variational score dis-
+tillation. 2023. 1, 2, 3, 6, 7, 8
+[47] Haohan Weng, Tianyu Yang, Jianan Wang, Yu Li, Tong
+Zhang, C L Philip Chen, and Lei Zhang. Consistent123:
+Improve consistency for one image to 3D object synthesis.
+2023. 2
+[48] Taoran Yi, Jiemin Fang, Guanjun Wu, Lingxi Xie, Xiaopeng
+Zhang, Wenyu Liu, Qi Tian, and Xinggang Wang. Gaussian-
+Dreamer: Fast generation from text to 3D gaussian splatting
+with point cloud priors. 2023. 2, 3, 4
+[49] Lvmin Zhang, Anyi Rao, and Maneesh Agrawala. Adding
+conditional control to text-to-image diffusion models. pages
+3836–3847, 2023. 1, 2
+[50] Linqi Zhou, Yilun Du, and Jiajun Wu. 3D shape genera-
+tion and completion through point-voxel diffusion. In 2021
+IEEE/CVF International Conference on Computer Vision
+(ICCV) , pages 5826–5835. IEEE, 2021. 1
+4619

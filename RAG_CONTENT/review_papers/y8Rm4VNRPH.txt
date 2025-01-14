@@ -1,0 +1,1590 @@
+Parallelizing Linear Transformers with the Delta Rule
+over Sequence Length
+Songlin Yang⋄Bailin Wang⋄Yu Zhang†Yikang Shen‡Yoon Kim⋄
+⋄Massachusetts Institute of Technology†Soochow University‡MIT-IBM Watson AI Lab
+yangsl66@mit.edu
+Abstract
+Transformers with linear attention (i.e., linear transfor mers) and state-space mod-
+els have recently been suggested as a viable linear-time alt ernative to transformers
+with softmax attention. However, these models still underp erform transformers
+especially on tasks that require in-context retrieval. Whil e more expressive vari-
+ants of linear transformers which replace the additive upda te in linear transformers
+with the delta rule [DeltaNet; 99] have been found to be more effective at associa-
+tive recall, existing algorithms for training such models d o not parallelize over
+sequence length and are thus inefﬁcient to train on modern ha rdware. This work
+describes a hardware-efﬁcient algorithm for training line ar transformers with the
+delta rule, which exploits a memory-efﬁcient representati on for computing prod-
+ucts of Householder matrices [ 11]. This algorithm allows us to scale up DeltaNet
+to standard language modeling settings. We train a 1.3B mode l for 100B tokens
+and ﬁnd that it outperforms recent linear-time baselines su ch as Mamba [ 30] and
+GLA [ 116] in terms of perplexity and zero-shot performance on downst ream tasks.
+We also experiment with two hybrid models which combine Delt aNet layers with
+(1) sliding-window attention layers every other layer or (2 ) two global attention
+layers, and ﬁnd that these hybrids outperform strong transf ormer baselines.
+1 Introduction
+The attention mechanism [ 8,112] has been shown to be an important primitive for accurate seq uence
+modeling. Attention is moreover efﬁcient during training a s it is rich in matrix multiplications and
+can thus take advantage of highly parallel processing capab ilities and specialized accelerators on
+modern GPUs. However, the complexity of attention is quadra tic in sequence length, and hence it is
+a fundamentally expensive primitive. And while recent tech niques have made it possible to scale at-
+tention to longer sequences through hardware-aware restru cturing of the intermediate computations
+[19,17,57,14], these methods still require storing the key/value vector s of previous elements, and
+this “KV cache” (whose size grows linearly) can be unwieldy t o manage for long sequences.
+Linear attention transformers [ 47] replace the exponential kernel in softmax attention with a dot-
+product over (possibly transformed) key and query vectors. This makes it possible to formulate
+linear attention as a linear RNN with matrix-valued hidden s tates, thus obviating the need for a KV
+cache and enabling constant-memory inference. While initia l variants of linear attention generally
+underperformed softmax attention on language modeling, ga ted variants of linear attention which
+incorporate a data-dependent gating factor have recently b een shown to be competitive against strong
+transformer baselines [ 116,89,9,77]. These gated linear transformers, along with time-varyin g state
+space models such as Mamba [ 30,18] (which can be reparameterized as a gated linear transforme r
+[116]), have been suggested as a potential alternative to ordina ry transformers. However, despite
+The parallel DeltaNet layer is made available as part of the F LASH LINEAR ATTENTION library [ 116,115]:
+https://github.com/sustcsonglin/flash-linear-attent ion
+38th Conference on Neural Information Processing Systems (NeurI PS 2024).the competitive language modeling performance, these mode ls have been shown to underperform
+transformers on recall-intensive tasks [ 6,7], which is important for many practical downstream
+tasks of interest (e.g., in retrieval-augmented generatio n [52]).
+To enhance associative recall over long contexts, Schlag et al. [99] propose DeltaNet, a variant
+of a linear transformer which uses a delta rule-like update [ 114] to retrieve and update a value
+vector that is associated with the current key. DeltaNet was found to be effective on synthetic
+tasks and small scale language modeling/machine translati on. However, the original work used
+a sequential algorithm that did not parallelize across sequ ence length, thus resulting in hardware-
+inefﬁcient training, and it has not been clear how to scale De ltaNet to larger models and datasets.
+This work describes a hardware-efﬁcient training algorith m for DeltaNets which parallelizes the for-
+ward/backward passes across sequence length. We reparamet erize the DeltaNet as a matrix-valued
+RNN whose recurrence is given by a generalized Householder t ransformation. This reparameteriza-
+tion enables the use of the compact WY representation [ 11] for products of Householder matrices,
+eliminating the need to materialize the hidden states of mat rix size at each time step during paral-
+lel training, which would otherwise result in high I/O costs . The memory-efﬁcient representation
+makes it possible to straightforwardly extend the chunkwis e parallel strategy for training linear at-
+tention models [ 33,105,116] to the DeltaNet case. We scale DeltaNets to moderate-scale language
+modeling benchmarks (1.3B models trained on 100B tokens), w here DeltaNet is found to obtain
+better language modeling and zero-shot downstream task per formance than strong linear recurrent
+models such as Mamba [ 30] and GLA [ 116]. For in-context retrieval and learning evaluation, we
+evaluate DeltaNet on synthetic and real benchmarks [ 4,2,82,6], where it is again found to perform
+well against linear recurrent baselines. Finally, we exper iment with a hybrid approach where we
+combine DeltaNet layers with sliding attention layers or gl obal attention layers, and ﬁnd that these
+hybrid models can improve upon ordinary transformers, as we ll as the pure DeltaNet transformer.
+2 Background
+2.1 Linear Transformer: Transformers with Linear Attentio n
+Given a sequence of d-dimensional input vectors x1,...,xL, transformers use the softmax attention
+mechanism to attend over the entire past,
+qt,kt,vt=WQxt,WKxt,WVxt, ot=t/summationdisplay
+i=1exp(kT
+iqt)/summationtextt
+j=1exp(kT
+jqt)vi,
+whereWQ,WK,WV∈Rd×d,qt,kt,vt,ot∈Rd. (Here we assume a single attention head for
+simplicity). Linear attention [ 47] replaces the exponential kernel exp(kT
+iqt)with the dot-product
+φ(ki)Tφ(qt)whereφ:Rd→Rnis a feature map. This makes it possible to rearrange computa tions
+to represent linear attention as a linear RNN with matrix-va lued hidden states,
+ot=t/summationdisplay
+i=1φ(ki)Tφ(qt)/summationtextt
+j=1φ(kj)Tφ(qt)vi=/parenleftBig/summationtextt
+i=1viφ(ki)T/parenrightBig
+φ(qt)
+/parenleftBig/summationtextt
+j=1φ(kj)T/parenrightBig
+φ(qt)=Stφ(qt)
+zT
+tφ(qt),
+whereSt=/summationtextt
+i=1viφ(ki)T∈Rd×nandzt=/summationtextt
+i=1φ(ki)∈Rn. If we allow nto go to inﬁnity,
+linear attention can use feature maps associated with polyn omial kernels to compute a polynomial
+approximation to the exponential kernel as a dot product, an d can thus approximate softmax attention
+arbitrarily well [ 6]. The denominator zT
+tφ(qt)∈Rcan result in numerical instabilities [ 84] and is
+removed in recent works [ 98,61]. It is also common to use the identity mapping for φ[61,105],
+which results in the following simpliﬁed linear transforme r:St=St−1+vtkT
+t,ot=Stqt.
+Efﬁcient training. LetQ,K,V∈RL×dbe the stacked query, key, value vectors, e.g., Qi=
+qi. We can then compute the output O∈RL×din parallel via O=/parenleftbig
+QKT⊙ML/parenrightbig
+V, where
+ML∈RL×Lis the causal mask. This fully “parallel form” and the above “ recurrent form” have
+different FLOPs and parallelization tradeoffs. The parall el form takes O(L2d+Ld2)and thus
+requires more FLOPs than the recurrent form, which takes O(Ld2). However, the parallel form is
+often much faster in practice for moderate-length sequence s as it can be done in O(1)steps. This
+sequence-level parallellism also enables high GPU occupan cy. The recurrent form requires fewer
+2FLOPs but cannot be parallelized across sequence length1and the elementwise operations involved
+in recurrence moreover cannot make use of specialized matmu l accelerators (e.g., tensor cores).
+Chunkwise parallel form. The chunkwise parallel form [ 33,105,116] strikes a balance between
+the parallel and recurrent forms, allowing for fewer FLOPs t han the parallel form and more sequence-
+level parallelism than the recurrent form. Concretely, sup pose the query/key/value vectors are split
+intoL
+Cchunks where each chunk is of length C. LetQ[t]∈RC×dbe all the query vectors for
+chunkt, and letqi
+[t]=qtC+ibe thei-th query vector within the t’th chunk; the key/value chunks
+are deﬁned similarly. Note that t∈[0,L/C),i∈[1,C]. The state matrices are also re-indexed such
+thatSi
+[t]=StC+i, and we additionally deﬁne S0
+[t]=SC
+[t−1], i.e., the initial state of a chunk is the
+last state of the previous chunk. We can then obtain the follo wing identity for the hidden state and
+output vector for the r-th element within the t-th chunk,
+Sr
+[t]=S0
+[t]+r/summationdisplay
+i=1vi
+[t]kiT
+[t],or
+[t]=S0
+[t]qr
+[t]+r/summationdisplay
+i=1vi
+[t]/parenleftBig
+kiT
+[t]qr
+[t]/parenrightBig
+.
+By further rewriting the intra-chunk computation based on t he parallel form, we obtain following,
+S[t+1]=S[t]+VT
+[t]K[t] ∈Rd×d, (1)
+O[t]=Q[t]ST
+[t]+/parenleftBig
+Q[t]KT
+[t]⊙MC/parenrightBig
+V[t] ∈RC×d(2)
+where we let S[t]=S0
+[t]to reduce notational clutter. With this “chunkwise paralle l form”, informa-
+tion is propagated chunk-to-chunk through S[t], and the intra-chunk states Si
+[t]fori∈[1,C]need
+not be materialized, thus saving memory.
+The complexity of the chunkwise parallel form is O(LCd+Ld2), and the number of steps (without
+chunk-level parallel scan) is O(L
+C). Hence,C=Lrecovers the fully parallel form and C= 1recov-
+ers the recurrent form. The chunkwise parallel form allows u s to interpolate between the two forms,
+in essence trading off the number of sequential computation s against sequence-level parallelism. In
+practiceCis set to a small constant (usually 64 or 128), allowing for su bquadratic training. This
+chunkwise form enables practical speed-ups against parall el-form-only softmax attention even on
+moderate-length sequences, as demonstrated by F LASH LINEAR ATTENTION [116,115]
+2.2 DeltaNet: Linear Transformers with the Delta Update Rul e
+The above linear transformer employs a simple linear recurr ence:St=St−1+vtkT
+t. This can
+be seen as additively updating the memory St−1with new key-value associations at each time step.
+However, a purely additive update rule makes it difﬁcult to d eallocate past key-value associations,
+eventually leading to key “collisions” when L > d , as pointed out by Schlag et al. [ 98]. A model
+should ideally learn to remove less important key-value ass ociations to make room for new ones,
+and this removal should depend on the interaction between th e new key and the memory content.
+DeltaNet uses the delta update rule [ 114] to operationalize this mechanism. Speciﬁcally, it ﬁrst
+retrieves the old value using the current key, vold
+t=St−1kt. It then obtains a new value vnew
+tby
+interpolating between the old value and the current value vt, which replaces vold
+tin the memory:
+vnew
+t=βtvt+(1−βt)vold
+t, St=St−1−vold
+tkT
+t/bracehtipupleft/bracehtipdownright/bracehtipdownleft/bracehtipupright
+remove+vnew
+tkT
+t/bracehtipupleft/bracehtipdownright/bracehtipdownleft/bracehtipupright
+write
+Hereβt=σ(Wβxt)∈(0,1)is a soft “writing strength”: when βt= 1, the old value is completely
+removed and vnew
+t=vt; whenβt= 0, the memory remains unmodiﬁed and we have St=St−1.
+The output computation is the same as vanilla linear attenti on, i.e.,ot=Stqt. The complexity
+of this recurrent form is the same as that of vanilla linear at tention, i.e., O(Ld2). This DeltaNet
+is a special case of fast weight programmers [100], and Schlag et al. [ 98] and Irie et al. [ 36] show
+that this type of linear transformer outperforms ordinary l inear transformers on small-scale language
+modeling and synthetic in-context retrieval tasks.
+1It is possible in theory to use parallel scan [ 13] to parallelize the recurrent form, which would enable
+the computations to be performed in O(logL)steps and O(Ld2)FLOPs. However, this approach requires
+materializing the 2D hidden state for each time step, which would incur signiﬁca nt memory I/O cost unless the
+state size is small enough such that materialization can happen in faster mem ory (i.e., as in Mamba [ 30]).
+3Since the old value vector depends on the previous hidden sta teSt−1, it is not possible to straight-
+forwardly apply the above chunkwise parallel strategy for t raining DeltaNet transformers. While the
+ofﬁcial implementation from Schlag et al. [ 98] avoids materializing the St’s (thus minimizing I/O
+cost) by using the linear-time-constant-memory algorithm from Katharopoulos et al. [ 47, §3.3.1], it
+still uses the pure recurrent form and thus does not parallel ize across the sequence dimension, which
+makes it difﬁcult to scale DeltaNet to modern language model ing settings.
+3 Parallelizing DeltaNet Across the Sequence Dimension
+In the same spirit as the chunkwise form of linear attention, we derive a chunkwise form for DeltaNet
+that enables hardware-efﬁcient training through parallel izing across the sequence dimension.
+3.1 A Memory-efﬁcient Reparameterization
+We ﬁrst observe that Stadmits a purely additive representation of the form St=/summationtextt
+i=1uikT
+ifor
+ui,ki∈Rd, since we can simply set ui=vnew
+i−vold
+i=βi(vi−vold
+i). Recall from § 2.1that
+simple linear attention has the form St=/summationtextt
+i=1vikT
+i. Thus, DeltaNet simply replaces the value
+vectorviin linear attention with the “pseudo” value vector ui. Once the ui’s have been constructed,
+the rest of computation can proceed as in ordinary linear att ention, i.e., O=/parenleftbig
+QKT⊙M/parenrightbig
+Uwhere
+U∈RL×dis the row-wise concatenation of the uivectors.
+However, computing utnaïvely requires explicitly materializing St−1to compute vold
+t, which would
+requireO(d2)memory. We now show that we can obtain the ut’swithout explicitly materializing
+St−1inO(d)memory. Our simple proof (by induction) relies on an applica tion of the WY represen-
+tation for products of Householder matrices [ 11]. The base case is clear since we have S1=β1v1kT
+1,
+sou1=β1v1. For the inductive step, we ﬁrst observe that the DeltaNet up date is given by,
+St=St−1−vold
+tkT
+t+vnew
+tkT
+t=St−1−βt(St−1kt)kT
+t+βtvtkT
+t=St−1(I−βtktkT
+t)+βtvtkT
+t,
+which can be seen as applying a generalized Householder tran sformation (i.e., matmul with an iden-
+tity plus rank-one matrix) to the previous state. The induct ive step is then given by,
+St=St−1(I−βtktkT
+t)+βtvtkT
+t=t−1/summationdisplay
+i=1uikT
+i+βt/parenleftBigg
+vt−t−1/summationdisplay
+i=1ui/parenleftBig
+kT
+ikt/parenrightBig/parenrightBigg
+/bracehtipupleft/bracehtipdownright/bracehtipdownleft/bracehtipupright
+utkT
+t=t/summationdisplay
+i=1uikT
+i(3)
+Note that utdoes not require materializing any of the hidden states and r equiresO(d)memory to
+compute, thus completing the proof. While we have avoided mat erializing St’s, computing ut’s for
+allL(that is,U) takesO(L2d)and moreover cannot be fully parallelized, unlike in linear attention
+where we can calculate all the value vectors Vin parallel in O(1)steps. We now show that the
+above trick still enables an efﬁcient chunkwise parallel fo rm for DeltaNet.
+3.2 Chunkwise Parallel Form for DeltaNet
+To derive the chunkwise parallel form, we ﬁrst unroll the rec urrence,
+St=St−1(I−βtktkT
+t)+βtvtkT
+t=t/summationdisplay
+i=1βi(vikT
+i)
+t/productdisplay
+j=i+1(I−βjkjkT
+j)
+. (4)
+We then deﬁne the following variables: Pj
+i=/producttextj
+t=i(I−βtktkT
+t)∈Rd×d,Hj
+i=/summationtextj
+t=iβt(vtkT
+t)Pj
+t+1∈Rd×d, where we let Pj
+i=Iwhenever i > j . Intuitively, Pj
+iis the “de-
+cay factor” to be applied to Sifor obtaining Sj, andHj
+irepresents the contributions to Sjstarting
+from token i. (HenceSt=Ht
+1). The chunkwise recurrence can then be written as,
+Sr
+[t]=S0
+[t]Pr
+[t]+Hr
+[t] (5)
+where we deﬁne the chunkwise variables Si
+[t]=StC+i,Pr
+[t]=PtC+r
+tC+1,Hr
+[t]=HtC+r
+tC+1. Here we
+haveL
+Cchunks of size C. The trick is to now efﬁciently represent the Pr
+[t],Hr
+[t]∈Rd×dmatrices
+4using a similar approach described in § 3.1, so that these matrices can be stored in O(d)memory,
+Pr
+[t]=I−r/summationdisplay
+i=1wi
+[t]kiT
+[t],Hr
+[t]=r/summationdisplay
+t=1ui
+[t]kiT
+[t]∈Rd×d(6)
+wr
+[t]=βr
+[t]/parenleftBigg
+kr
+[t]−r−1/summationdisplay
+i=1wi
+[t](kiT
+[t]kr
+[t])/parenrightBigg
+,ur
+[t]=βr
+[t]/parenleftBigg
+vr
+[t]−r−1/summationdisplay
+i=1ui
+[t](kiT
+[t]kr
+[t])/parenrightBigg
+∈Rd(7)
+The derivations for the above can be found in the appendix. Su bsequently, based on Eq. 5, we can
+obtain the chunk-level recurrence for hidden states and out puts as,
+Sr
+[t]=S0
+[t]−/parenleftBigg
+S0
+[t]r/summationdisplay
+i=1wi
+[t]kiT
+[t]/parenrightBigg
++r/summationdisplay
+i=1ui
+[t]kiT
+[t]=S0
+[t]+r/summationdisplay
+i=1/parenleftBig
+ui
+[t]−S0
+[t]wi
+[t]/parenrightBig
+kiT
+[t],
+or
+[t]=Sr
+[t]qr
+[t]=S0
+[t]qr
+[t]+r/summationdisplay
+i=1/parenleftBig
+ui
+[t]−S0
+[t]wi
+[t]/parenrightBig/parenleftBig
+kiT
+[t]qi
+[t]/parenrightBig
+.
+LettingS[t]=S0
+[t], the above can be simpliﬁed to matrix notations similarly to Eq.1-2,
+S[t+1]=S[t]+/parenleftBig
+U[t]−W[t]ST
+[t]/parenrightBigT
+K[t], (8)
+O[t]=Q[t]ST
+[t]+(Q[t]KT
+[t]⊙M)/parenleftBig
+U[t]−W[t]ST
+[t]/parenrightBig
+(9)
+where/square[t]=/square1:C
+[t]∈RC×dfor/square∈ {Q,K,V,O,U,W}deﬁnes the chunkwise matrices that are
+formed from stacking the qt,kt,vt,ot,ut,wtvectors.
+Practical considerations. In the above, Eq. 7is fully recurrent and thus cannot use tensor cores
+written as is. To solve this, we further leverage the UT transform [43,22]:
+T[t]=/parenleftBig
+I−tril(Diag( β[t])K[t]KT
+[t],−1)/parenrightBig−1
+Diag/parenleftbig
+β[t]/parenrightbig
+(10)
+W[t]=T[t]K[t], U[t]=T[t]V[t] (11)
+to rewrite most operations in matmuls. The inverse of lower t riangular matrices could be solved efﬁ-
+ciently using forward substitution. Once computed, the hid den state updates (Eq. 8) and the output
+computations (Eq. 9) are largely the same as in vanilla linear attention. We adap t FLASH LINEAR AT-
+TENTION [116] to implement Eq. 8and9with hidden states recomputed during the backward pass
+for saving GPU memory. The PyTorch pseudocode for the forwar d pass is shown in Listing 1.
+0.5 1 2 4 8 16102030
+Sequence Length (K)Speed- up (x)head dim=64
+head dim=128
+head dim=256
+Figure 1: Speed-up of the chunkwise
+parallel form vs. the recurrent form.Speed comparison. We implement both the pure recurrent
+form2and the chunkwise parallel form in Triton [ 109] and show
+the speed-ups for various sequence lengths (L) and head dime n-
+sions (dhead) in the right ﬁgure, where the model dimension dis
+2048 and we vary batch size and sequence length so that they
+multily to 16384.3Our chunkwise algorithm achieves greater
+speed-ups as sequence length Land head dimension dheadin-
+crease, where the use of sequence-level parallelism (for hi gh
+GPU occupancy) and tensor core (for fast matmuls) become
+more important [ 116, §3].
+Fully Parallel Form for DeltaNet. For completeness, we
+also discuss the fully parallel form of DeltaNet. While we use
+the concept of a “pseudo” value, it is possible to avoid modif ying values. From Eq. 4, it is straightfor-
+ward to compute the attention matrix A:Aij=kT
+jPi
+j+1qiifj≤iand0otherwise. Notably, Ahas
+the matrix form A=/parenleftbig
+QKT⊙M/parenrightbig
+T, obtained by combining Eq. 3and11. However, computing
+Trequires a matrix inverse (Eq. 10), which scales cubically with sequence length without furt her
+algorithmic changes. Due to the above we avoid using the full y parallel form for training DeltaNet;
+however the “attention” matrix derived from this form could be of interest to the interpretability
+research community studying RNNs, as explored in Ali et al. [ 3] and Zimerman et al. [ 123].
+2Note that our recurrent kernel is already 2 ×faster than the original CUDA kernel from Schlag et al. [ 99].
+3So far we have been assuming a single head ( dhead=d) for easier exposition. In practice we use multiple
+heads where the head dimension dheadis smaller than the model dimension d. We thus have St∈Rd×dhead.
+53.3 DeltaNet Transformer
+We describe how the DeltaNet layer primitive is used to build up a transformer-like model using
+standard modules. We largely follow the LLaMA-architectur e [Transformer++, 111] and simply
+replace the self-attention layer with the DeltaNet layer. W e also apply normalization before output
+projection for stable training [ 84,66]. As the additional parameters for computing scalar βtterms are
+negligible, parameter allocation is roughly the same as in T ransformer++, i.e., 4d2for the DeltaNet
+layer and 8d2for the SwiGLU FFN layer [ 101].
+Feature map and normalization. Our key/query vectors are given by kt=SiLU(WKxt)
+/bardblSiLU(WKxt)/bardbl2,qt=
+SiLU(WQxt)
+/bardblSiLU(WQxt)/bardbl2. Schlag et al. [ 98] originally follow Katharopoulos et al. [ 47] and apply a “ELU +1”
+[16] to nonlineary transform the key/query vectors. We instead use the SiLU activation [ 23], which
+was found to perform better [ 86,18]. For stability, it is crucial to ensure that the norm of each
+eigenvalue of the transition matrices does not exceed one. T he eigenvalues of I−βtktkT
+tare 1
+with multiplicity d−1and1−βt/bardblkt/bardbl2with multiplicity 1. Schlag et al. [ 98] used the L1norm to
+normalize query/key vectors, ensuring that 0≤1−βt/bardblkt/bardbl2≤1. We instead apply L2normalization,
+which we found to perform better and offers a more intuitive i nterpretation: when βt= 1,I−ktkT
+t
+becomes a projection matrix, erasing information in one sub space while preserving the other d−1
+subspaces. This is beneﬁcial for retaining information whi le enabling more targeted forgetting.
+3.4 Hybrid Models
+Following recent work on combining subquadratic token-mix ing layers with existing neural network
+primitives [ 6,20,53], we also experiment with hybridizing DeltaNet models.
+Convolutional layers. Recent linear recurrent models typically incorporate a lig htweight
+depthwise-separable convolution layer after the query/ke y/value projections [ 30,9,18]. This “short
+convolution” layer [ 81] generalizes the shift SSM [ 25], and is efﬁcient in both number of parameters
+and computational cost. We also add a short convolution laye r after the query/key/value projections.
+Local sliding window and global attention. Linear attention largely uses a content-based ad-
+dressing mechanism [ 28] and lacks positional information [ 120]. Arora et al. [ 6] also argue that
+linear attention lacks the ability to perform precise local token shifts and comparisons, thus facing
+difﬁculties on retrieval-intensive tasks. Motivated by th is, we experiment with two different hybrid
+architectures that incorporate softmax attention. We ﬁrst explore sliding window attention (SWA)
+which has been shown to signiﬁcantly improve linear attenti on [84,6,55,72]; we follow Grifﬁn
+[20] and Samba [ 93] to interleave DeltaNet layers and SWA layers. We also exper iment with global
+attention , which has been found to be helpful [ 50,34] even if only few of the recurrent layers are
+replaced with global attention [ 53]. We follow Fu et al. [ 25] to replace only two layers with global
+attention: the second layer and the (N
+2+1) -th layer, where Nis total number of layers.
+4 Empirical Study
+We compare the DeltaNet against strong baselines in both syn thetic and real-world language model-
+ing settings. Our main baselines include: LLaMA-architect ure Transformer++ [ 111]; RetNet [ 105],
+a linear attention Transformer with non-data-dependent ex ponential decay and large head dimension;
+GLA [ 116], a linear attention Transformer with data-dependent deca y; and Mamba [ 30], a selective
+state-space model with data-dependent decay.
+4.1 Synthetic Benchmarks
+64 128 256 5120255075100
+Model dimensionAccuracy (%)Sequence Length: 512, Key-Value Pairs: 64
+DeltaNet
+Mamba
+GLA
+RetNet
+RWKV4
+Hyena
+Figure 2: Accuracy (%) on MQAR.We evaluate on three synthetic benchmarks: Multi-query as-
+sociative recall [MQAR; 4], Mechanistic Architecture De-
+sign [MAD; 82], and in-context language learning [Reg-
+Bench; 2].
+MQAR evaluates language models’ ability to (in-context) re -
+call information within a context when faced with multiple
+recall queries. We use Arora et al. [ 4]’s training setting and for DeltaNet we use 2 heads. We do
+not use convolutions for these experiments. Figure 2shows that DeltaNet performs perfectly (even
+without convolution) in the hardest setting and outperform s Mamba (which uses convolutions) in
+the low-dimension setting. Next, we consider the MAD benchm ark [82], a suite of synthetic token
+6Model Compress Fuzzy Recall In-Context Recall Memorize Noisy Recall Selective Copy Average
+Transformer 51.6 29.8 94.1 85.2 86.8 99.6 74.5
+Hyena [ 81] 45.2 7.9 81.7 89.5 78.8 93.1 66.0
+Multihead Hyena [ 63] 44.8 14.4 99.0 89.4 98.6 93.0 73.2
+Mamba [ 30] 52.7 6.7 90.4 89.5 90.1 86.3 69.3
+GLA [ 116] 38.8 6.9 80.8 63.3 81.6 88.6 60.0
+DeltaNet 42.2 35.7 100 52.8 100 100 71.8
+Table 1: Results on the synthetic MAD benchmark. Results other than DeltaNet are dir ectly borrowed from
+Poli et al. [ 82]. (Multi-head) Hyena, DeltaNet and Mamba make use of convolutions, w hereas GLA does not.
+Model Wiki. LMB. LMB. PIQA Hella. Wino. ARC-e ARC-c Avg. SWDE SQuAD FDA State
+ppl↓ppl↓acc↑acc↑acc_n↑acc↑ acc↑acc_n↑ acc↑ acc↑ acc↑exp.
+340M params / 15B tokens
+Transformer++ 28.39 42.69 31.0 63.3 34.0 50.4 44.5 24.2 41.2 42.2 22.1 21.4 N/A
+RetNet ( w/o. conv ) 32.33 49.19 28.6 63.5 33.5 52.5 44.5 23.4 41.0 13.3 27.6 2.9 512x
+Mamba ( w. conv ) 28.39 39.66 30.6 65.0 35.4 50.1 46.3 23.6 41.8 12.4 23.0 2.1 64x
+GLA ( w/o. conv ) 28.65 43.35 30.3 64.8 34.5 51.4 45.1 22.7 41.5 18.6 27.2 8.1 128x
+(w. conv ) 29.47 45.53 31.3 65.1 33.8 51.6 44.4 24.6 41.8 24.0 24.7 7.3 128x
+DeltaNet ( w/o. conv ) 29.08 50.87 30.0 63.6 33.6 51.7 46.0 23.0 41.3 24.6 26.9 4.5 128x
+DeltaNet ( w. conv ) 28.24 37.37 32.1 64.8 34.3 52.2 45.8 23.5 42.1 26.4 28.9 12.8 128x
++ Sliding Attn 27.06 38.17 33.4 64.0 35.3 50.9 45.9 23.2 42.1 39.3 32.5 18.8 N/A
++ Global Attn (2 layers) 27.51 35.04 33.5 64.0 34.5 51.7 46.0 23.3 42.1 42.9 32.1 23.1 N/A
+1.3B params / 100B tokens
+Transformer++ 16.85 13.44 48.9 70.8 49.6 53.6 56.0 26.5 50.9 66.6 31.5 27.4 N/A
+RetNet ( w/o. conv ) 18.64 17.27 43.3 70.0 47.3 52.5 54.8 25.6 48.9 42.8 34.7 14.3 512x
+Mamba ( w. conv ) 17.06 13.89 46.2 72.2 40.1 54.1 59.0 28.2 50.0 41.4 35.2 6.2 64x
+GLA ( w/o. conv ) 17.22 14.47 46.9 71.8 49.8 53.9 57.2 26.6 51.0 50.6 42.6 19.9 256x
+(w. conv ) 17.25 14.92 46.2 70.6 49.9 53.0 55.3 27.0 50.4 52.4 37.4 22.3 256x
+DeltaNet ( w. conv ) 16.87 12.21 48.9 71.2 50.2 53.6 57.2 28.3 51.6 49.5 37.4 17.2 128x
++ Sliding Attn 16.56 11.74 49.2 71.8 51.1 52.8 58.9 28.8 52.1 53.3 43.3 22.3 N/A
++ Global Attn (2 layers) 16.55 12.40 48.8 70.8 50.7 54.2 58.4 28.1 51.8 71.0 43.0 29.8 N/A
+DeltaNet Ablations (340M)
+w.L1-norm & 1+ELU 31.12 55.96 26.3 63.9 33.0 50.9 44.3 21.8 40.1 14.5 23.9 6.2 128x
+w.L2-norm & 1+ELU 28.03 37.62 32.2 65.7 34.7 51.8 45.4 22.5 42.1 23.8 28.6 13.1 128x
+w.L2-norm & ReLU 28.75 43.53 30.2 64.0 33.9 48.9 45.6 22.8 40.9 27.2 26.7 9.0 128x
+Table 2: Main language modeling results against Transformer++, RetNet [ 105], Mamba [ 30], and GLA [ 116].
+All models are trained on the same subset of the SlimPajama dataset with the M istral tokenizer. The Trans-
+former++, RetNet, Mamba, GLA ( w/o. conv ) results are taking from Yang et al. [ 116]. For hybrid models,
+“Sliding Attn” interleaves a sliding window attention every other layer, and “Glo bal Attn” uses full global at-
+tention on two layers. The 340M/1.3B models are trained for 15B/100B toke ns respectively. All results are
+obtained through lm-evaluation-harness [26]. The last column denotes the expansion ratio of the recurrent
+state size relative to the product of the number of layers and model dimen sion (see Zhang et al. [ 122, App. C]).
+manipulation tasks designed to probe capabilities of model architectures. The results are shown in
+Table 1. Compared with other architectures, including MHA, DeltaN et is better at recalling tasks,
+especially on Fuzzy Recall as expected, although it struggl es on the “Memorize” task.
+5 10 15 205075100
+Training examples (K)Accuracy ( %)Transformer++
+DeltaNet ( w. conv )
+DeltaNet ( w/o. conv )
+GLA ( w. conv )
+GLA ( w/o. conv )
+Mamba ( w. conv )
+Mamba ( w/o. conv )
+Figure 3: Accuracy (%) on RegBench.Finally, we consider RegBench [ 2], a synthetic data set de-
+signed to assess the in-context language learning capabil-
+ity of different model architectures. Each input sequence
+in this benchmark consists of 10 to 20 strings drawn from
+a distinct language deﬁned by a probabilistic ﬁnite au-
+tomaton (PFA), so that a model needs to infer the underly-
+ing language from the context on the ﬂy. During testing,
+a model is evaluated on predicting the next token of test-
+ing sequences generated from held-out PFAs. Here again we ﬁn d that DeltaNet performs strongly
+compared to baselines, as shown in Figure 3.
+4.2 Language Modeling
+Experimental setup. Following prior work [ 30,116], we evaluate on Wikitext perplexity and
+zero-shot common sense reasoning tasks, including LAMBADA [LMB.; 74], PiQA [ 12], Hel-
+laSwag [Hella.; 118], WinoGrande [Wino.; 96], ARC-easy (ARC-e) and ARC-challenge (Arc-c)
+[15]. Following Arora et al. [ 6], we also evaluate the models real-world recall-intensive tasks, in-
+cluding FDA [ 5], SWDE [ 58], and SQUAD [ 91]. Both SWDE and FDA focus on extracting struc-
+tured information: SWDE from raw HTML to identify semi-struc tured relationships, and FDA from
+PDFs to retrieve key-value pairs. SQUAD evaluates language models on reading comprehension by
+providing a text passage and a related question. See § Dfor hyperparameter settings.
+7Model ARC HellaSwag OBQA PIQA WinoGrande MMLU Average
+Llama-3.2-3B [ 108] 59.1 73.6 43.4 77.5 69.2 54.1 62.8
+PowerLM-3B [ 102] 60.5 74.6 43.6 79.9 70.0 45.0 62.3
+DeltaNet-3B 60.4 72.8 41.0 78.5 65.7 40.7 59.8
+RecurrentGemma-2B [ 29] 57.0 71.1 42.0 78.2 67.6 31.8 57.9
+RWKV-6-3B [ 77] 49.5 68.6 40.6 76.8 65.4 28.4 54.9
+Mamba-2.7B [ 30] 50.3 65.3 39.4 75.8 63.1 26.1 53.3
+Table 3: Zero-shot model performance across selected benchmarks for 3 B models. Llama-3.2-3B and
+PowerLM-3B are Transformer models, while the others are recurren t models.ARC results are averaged over
+accuracy and normalized accuracy across ARC-Easy and ARC-Cha llenge.
+Results. Our main language modeling results are shown in Table 2. Since Mamba uses convolu-
+tions by default while GLA does not, we retrain the GLA with co nvolution, and also train DeltaNet
+without convolution. For the 1.3B setting we only train the D eltaNet with convolution due to limited
+compute resources. In general we ﬁnd that DeltaNet outperfo rms the strong Mamba/GLA baselines
+in terms of both perplexity and downstream task performance . For recall-intensive tasks (i.e., SWDE,
+SQuAD, FDA), we ﬁnd that under the same state size at the 340M s cale, DeltaNet outperforms GLA,
+conﬁrming the effectiveness of the delta rule. However, at t he 1.3B scale, DeltaNet underperforms
+GLA due to its poorer state size scability (see § 5.3), since state size plays an important role in recall-
+intensive tasks. Finally, we conﬁrm the beneﬁts of hybrid ar chitectures [ 20,53]: both the sliding
+window and global attention hybrids work well, outperformi ng the strong Transformer++ baselines.
+We also scale DeltaNet to the 3B parameter scale trained with 1T tokens using the same settings as
+Shen et al. [ 102]. The results are shown in Table 3, where 3B DeltaNet slightly underperforms a
+Transformer architecture trained with the same setting (Po werLM-3B), but outperforms other RNN
+baselines in the 2B–3B range (though these are trained for a d ifferent number of tokens so are not
+exactly comparable).
+2K×8 4K ×4 8K ×2 16K ×1015K30K45K60K
+Training length ×Batch sizeTokens per second (Kt/s)Transformer++ Mamba
+GLA DeltaNet
+Figure 4: Training throughput of 1.3B mod-
+els on a single H100.Ablations. In Table 2(bottom) we ablate the choice of
+feature map and normalization. We ﬁnd that simply re-
+placing the L1-norm with the L2-norm greatly increases
+performance. For the feature map, we experiment with
+{ReLU,1+ELU,SiLU}and ﬁnd that SiLU performs the
+best, consistent with prior work [ 86].
+Training throughput. Figure 4compares the training
+throughputs of different 1.3B models in different train-
+ing lengths and batch size settings. The training speed
+of DeltaNet is close to GLA and signiﬁcantly faster than
+Mamba. All linear-time models outperform Transformers
+for longer-sequence training.
+5 Discussion and Related Work
+5.1 DeltaNet vs. State Space Models / Linear RNNs
+To discuss DeltaNet against existing linear RNNs (includin g state-space models) we ﬁrst introduce
+a general class of associative RNNs with matrix-valued hidd en states. Given a matrix-valued hidden
+stateSt∈Rd×nand current input xt∈Rd, these models have the following form:
+St=St−1•Mt+vtkT
+t, (recurrence)
+ot=Stqt, (memory read-out)
+where•is an associative operator (e.g., Hadamard product, matrix multiplication, etc.). The matrix
+Mtand vectors vt,kt,qtare (potentially non-linear) functions of the current inpu txt.
+As is the case in vector-valued linear RNNs [ 62,103], the use of an associative operator enables
+the use of parallel scan [ 13] to calculate S1,...,SLinO(logL)steps and O(L)work (ignoring the
+terms associated with the associative operation) if the inp utsx1,...,xLare given (though see our
+discussion in footnote 1). Hence, as long as the associative operator is not too expen sive, training
+can be efﬁcient. However, parallel scan by itself is not sufﬁ cient for training language models at
+practical scale due to some associative operator’s being to o expensive. Recent models such as such
+8Model Recurrence Memory read-out
+Linear Attention [ 47,46]St=St−1+vtkT
+t ot=Stqt
++ Kernel St=St−1+vtφ(kt)Tot=Stφ(qt)
++ Normalization St=St−1+vtφ(kt)T,zt=zt−1+φ(kt) ot=Stφ(qt)/(zT
+tφ(qt))
+DeltaNet [ 98] St=St−1(I−βtktkT
+t)+βtvtkT
+t ot=Stqt
+Gated RFA [ 79] St=gtSt−1+(1−gt)vtkT
+t,zt=gtzt−1+(1−gt)ktot=Stqt/(zT
+tqt)
+S4 [31,103] St=St−1⊙exp(−(α1T)⊙exp(A))+B⊙(vt1T) ot= (St⊙C)1+d⊙vt
+ABC [ 80] Sk
+t=Sk
+t−1+ktφT
+t,Sv
+t=Sv
+t−1+vtφT
+t ot=Sv
+tsoftmax/parenleftbig
+Sk
+tqt/parenrightbig
+DFW [ 61] St=St−1⊙(βtαT
+t)+vtkT
+t ot=Stqt
+RetNet [ 105] St=γSt−1+vtkT
+t ot=Stqt
+Mamba [ 30] St=St−1⊙exp(−(αt1T)⊙exp(A))+(αt⊙vt)kT
+t ot=Stqt+d⊙vt
+GLA [ 116] St=St−1⊙(1αT
+t)+vtkT
+t=St−1Diag(αt)+vtkT
+t ot=Stqt
+RWKV-6 [ 77] St=St−1Diag(αt)+vtkT
+t ot= (St−1+(d⊙vt)kT
+t)qt
+HGRN-2 [ 89] St=St−1Diag(αt)+vt(1−αt)Tot=Stqt
+mLSTM [ 9] St=ftSt−1+itvtkT
+t,zt=ftzt−1+itkt ot=Stqt/max{1,|zT
+tqt|}
+Mamba-2 [ 18] St=γtSt−1+vtkT
+t ot=Stqt
+GSA [ 122] Sk
+t=Sk
+t−1Diag(αt)+ktφT
+t,Sv
+t=Sv
+t−1Diag(αt)+vtφT
+tot=Sv
+tsoftmax/parenleftbig
+Sk
+tqt/parenrightbig
+Table 4: Overview of recent linear recurrent models that have been propose d and applied to autoregressive
+language modeling (ordered in rough chronological order). These w orks make use of a matrix-valued hidden
+stateSt∈Rd×n(or two matrix-valued hidden states Sk
+t,Sv
+t, e.g., [ 80,122]) updated through an associative
+recurrence followed by an outer-product-based addition. Here ⊙is the Hadamard product. Some models make
+use of an additional linear RNN with hidden state vector zt, which used to normalized the query vector qt.
+Variables with the subscript t(e.g.,vt,αt,ft,γt) are (potentially non-linear) functions of the current input
+xt. Non-time-varying parameters (e.g., A,d,γ) are denoted without subscripts; these parameters are either
+learned or set to ﬁxed values. Matrices are denoted with bold upper case letters, vectors with bold lower case,
+and scalars with italic letters. Many models make use of a kernel φ(e.g., [ 98,79]) but we subsume them into
+the key/value vectors to reduce notational clutter.
+as Mamba [ 30] and gated linear attention Transformers [ 105,116,89,77,9] thus make use of cheap
+element-wise recurrence updates, in particular the Hadama rd product, i.e., •=⊙. See Table 4for
+how recent models can be cast into this form.
+Standard matrix multiplications (i.e., St−1•Mt=St−1Mt) on the other hand can model richer
+interactions that go beyond elementwise recurrence. Witho ut any structural assumptions on Mthow-
+ever, these operations would take O(dn2)for each update (as opposed to O(dn)for elementwise
+products), which would be prohibitively expensive. Hence, DeltaNet’s use of Mt=I−βtktkT
+tcan
+be seen as exploiting structured matrices to efﬁciently mod el interactions beyond elementwise re-
+currences. Our chunkwise algorithm could generalize to a br oader class of matrices in the Diagonal-
+Plus-Low-Rank (DPLR) form Mt=D−atbT
+t, which has been explored in S4 [ 31], although
+their DPLR transition matrices are data-independent. We ad opt DeltaNet’s parameterization in this
+work (i.e., D=I,at=βtkt,bt=kt) as we are primarily interested in improving recall (throug h
+DeltaNet’s key-value update rule) while maintaining param eter efﬁciency. We leave the exploration
+of more generalized parameterizations for future work.
+5.2 Towards a Unifying Framework for Efﬁcient Autoregressi ve Sequence Transformations
+While the above class of models makes it possible to unify rece nt models, we do not claim
+that it is the “right” level at which view (autoregressive) s equence transformations of the form
+{xt}L
+t=1/mapsto→ {ot}L
+t=1, whereotcannot depend on any xjifj > t . For example, this framing
+makes it difﬁcult to (neatly) capture other subquadratic mo dels that have been shown to be effec-
+tive [ 117,48,95,81]. An alternative unifying framework might be to view the abo ve sequence
+transformations as a discretization of a continuous state s pace model [ 31,103,30], or as a matrix
+multiplication with a masked structured matrix [ 73,85,45,18]. What does seem important, however,
+is that a framework should ideally expose efﬁcient algorith ms for training, and the algorithm should
+be hardware-efﬁcient, which, in the case of modern GPUs, mea ns that it should be rich in matrix
+multiplications. From this perspective, the state-space d uality (SSD) framework recently proposed
+by Dao and Gu [ 18], which provides a connection between SSM-based sequence t ransformations
+and structured matrix multiplications with a semiseparabl e matrix, seems a promising candidate.
+However, this framework may not capture an important class o f models, e.g., models where the as-
+sociative recurrence involves matrix multiplication with an unstructured matrix, or models that make
+use of more exotic associative operators (e.g., in Peng et al . [78]).
+9Finally, we observe that there have been many recent linear- time models that have been proposed
+which purportedly match or outperform classic transformer s. As can be seen in Table 4, the “se-
+quence mixing” component of these works are closely related to one another. However, the way in
+which the token-mixing primitive is used to build up a transf ormer-like model varies widely. For
+example, while most recent works make use of depthwise-sepa rable convolution layers (not shown
+in Table 4) [30,76,90,9,18], earlier works generally do not [ 47,99,79]. There are also differences
+in the parameterizations of the feedforward layers used for the “channel mixing” component. Such
+variations should be taken into account before declaring a p articular model layer superior to another.
+5.3 Limitations and Future Work
+Our work has several limitations. First, in terms of computa tion, although we propose a new
+hardware-efﬁcient algorithm, the training speed still lag s behind that of GLA. This is due to the over-
+head caused by modeling state-to-state dependencies as des cribed above, which requires “marginal-
+izing” over the head dimension inside the kernel, similar to the case of softmax attention. However,
+for GLA since there are no intra-state dependencies (everyt hing is elementwise), and thus it is easy
+to use tiling to support arbitrary size of head dimension, as implemented in Yang and Zhang [ 115].
+This limitation would potentially limit DeltaNet’s memory size, consequently lowering the recall-
+intensive task performance as we observed in § 4.2. However, it may be feasible to adopt block di-
+agonal generalized Householder transition matrices with b lock sizes ﬁtting GPU SRAM (e.g., 128)
+while maintaining a overall large head dimension (and thus a large recurrent state size).
+We also found that the length generalization of DeltaNet was limited,4while GLA and RetNet (and
+Mamba to an extent) have been found to be able to extrapolate b eyond the training length [ 116]. We
+speculate that this is because DeltaNet lacks explicit deca y factors. This could be improved through
+incorporating a gating term in the recurrence, which we leav e for future work.
+6 Related Work
+We brieﬂy discuss related work here and give an extended disc ussion in Appendix C.
+Linear transformers can be seen as a type of iterated Hopﬁeld networks [ 69], and this connection
+can provide perspectives on the limitations and improvemen ts of linear attention transformers. For
+example, vanilla linear transformers use a Hebbian-like up date rule, which has been shown to have
+limited memory capacity [ 65]. Later works in Hopﬁeld networks use higher-order polynom ials [ 21]
+and exponential kernels [ 92,49] to enhance the memory capacity, which is also related to att ention
+with polynomial kernels explored in PolysketchFormer [ 44] and Based Linear Attention [ 6,1]. On
+the other hand, the delta rule has been shown to have better me mory capacity [ 27,83,54,97]. In this
+sense, given the ﬁxed size recurrent state, using the delta r ule is able to achieve a better frontier of
+the recall-memory tradeoff curve [ 6], and has recently been applied to enhance real-world retri eval
+tasks [ 71,94]. Moreover, it outperforms the additive rule used in vanill a linear transformers across
+multiple domains [ 98,36,39,35,41].
+Despite these advantages, Irie et al. [ 41] revealed theoretical limitations of the delta update rule in
+terms of expressiveness. Recurrent enhancements of DeltaN et, such as Recurrent DeltaNet [ 37] and
+the Modern Self-Referential Weight Matrix [ 40], were proposed and found to be superior in Irie et al.
+[41]. However, these models extend beyond linear RNNs and canno t be parallelized across sequence
+length. This suggests a fundamental trade-off between para llelism and expressiveness [ 67]. How to
+further enhance DeltaNet without sacriﬁcing parallelism r emains an open question, and the hybrid
+cross-chunk nonlinear and intra-chunk linear strategy use d in TTT [ 107] might provide a suitable
+middle ground. Finally, we remark that delta rule is closely related to meta or online learning via
+gradient descent [ 70,38], which has been revisited in recent works like Longhorn [ 56] and TTT
+[107].
+7 Conclusion
+We describe an algorithm that parallelizes DeltaNet traini ng across the sequence length dimension,
+achieving signiﬁcant speed-ups against existing implemen tations on modern hardware. This makes
+it possible to scale up DeltaNet to moderate-scale language modeling settings, where we ﬁnd that it
+performs well compared to recent linear-recurrent baselin es.
+4However we found the DeltaNet + local sliding-window attention hybrid to gen eralize well, which could
+provide an appealing middle ground.
+10Acknowledgements
+This study was supported by funding from the MIT-IBM Watson A I Lab. We are grateful to Mayank
+Mishra for assistance with training and evaluating the 3B mo dels, to Kazuki Irie for valuable feed-
+back on the draft, and to Simran Arora, Liliang Ren and Eric Al caide for their insightful discussions.
+We also thank Michael Poli and Armin Thomas for sharing the ra w results from the MAD benchmark
+experiment.
+References
+[1] Y . Aksenov, N. Balagansky, S. M. L. C. Vaina, B. Shaposhni kov, A. Gorbatovski, and
+D. Gavrilov. Linear Transformers with Learnable Kernel Fun ctions are Better In-Context
+Models, June 2024. URL http://arxiv.org/abs/2402.10644 . arXiv:2402.10644 [cs].
+[2] E. Akyürek, B. Wang, Y . Kim, and J. Andreas. In-context la nguage learning: Arhitectures
+and algorithms. arXiv preprint arXiv:2401.12973 , 2024.
+[3] A. Ali, I. Zimerman, and L. Wolf. The hidden attention of m amba models, 2024.
+[4] S. Arora, S. Eyuboglu, A. Timalsina, I. Johnson, M. Poli, J. Zou, A. Rudra, and C. Ré. Zool-
+ogy: Measuring and improving recall in efﬁcient language mo dels. CoRR , abs/2312.04927,
+2023.
+[5] S. Arora, B. Yang, S. Eyuboglu, A. Narayan, A. Hojel, I. Tr ummer, and C. Ré. Language Mod-
+els Enable Simple Systems for Generating Structured Views o f Heterogeneous Data Lakes,
+Apr. 2023. arXiv:2304.09433 [cs].
+[6] S. Arora, S. Eyuboglu, M. Zhang, A. Timalsina, S. Alberti , D. Zinsley, J. Zou, A. Rudra, and
+C. Ré. Simple linear attention language models balance the r ecall-throughput tradeoff. CoRR ,
+abs/2402.18668, 2024. arXiv: 2402.18668.
+[7] S. Arora, A. Timalsina, A. Singhal, B. Spector, S. Eyubog lu, X. Zhao, A. Rao, A. Rudra, and
+C. Ré. Just read twice: closing the recall gap for recurrent l anguage models, 2024. URL
+https://arxiv.org/abs/2407.05483 .
+[8] D. Bahdanau, K. Cho, and Y . Bengio. Neural machine transl ation by jointly learning to align
+and translate. arXiv preprint arXiv:1409.0473 , 2014.
+[9] M. Beck, K. Pöppel, M. Spanring, A. Auer, O. Prudnikova, M . Kopp, G. Klambauer,
+J. Brandstetter, and S. Hochreiter. xlstm: Extended long sh ort-term memory. arXiv preprint
+arXiv:2405.04517 , 2024.
+[10] R. v. d. Berg, L. Hasenclever, J. M. Tomczak, and M. Welli ng. Sylvester Normalizing
+Flows for Variational Inference, Feb. 2019. URL http://arxiv.org/abs/1803.05649 .
+arXiv:1803.05649 [cs, stat].
+[11] C. H. Bischof and C. V . Loan. The WY representation for pro ducts of householder matrices.
+InSIAM Conference on Parallel Processing for Scientiﬁc Compu ting, 1985. URL https://
+api.semanticscholar.org/CorpusID:36094006 .
+[12] Y . Bisk, R. Zellers, J. Gao, Y . Choi, et al. Piqa: Reasoni ng about physical commonsense in
+natural language. In Proceedings of the AAAI conference on artiﬁcial intelligen ce, volume 34,
+pages 7432–7439, 2020.
+[13] G. E. Blelloch. Preﬁx sums and their applications. 1990 .
+[14] W. Brandon, A. Nrusimha, K. Qian, Z. Ankner, T. Jin, Z. So ng, and J. Ragan-Kelley. Striped
+Attention: Faster Ring Attention for Causal Transformers. ArXiv , abs/2311.09431, 2023.
+[15] P. Clark, I. Cowhey, O. Etzioni, T. Khot, A. Sabharwal, C . Schoenick, and O. Tafjord. Think
+you have solved question answering? try arc, the ai2 reasoni ng challenge. arXiv preprint
+arXiv:1803.05457 , 2018.
+11[16] D.-A. Clevert, T. Unterthiner, and S. Hochreiter. Fast and Accurate Deep Network Learn-
+ing by Exponential Linear Units (ELUs), Feb. 2016. URL http://arxiv.org/abs/1511.
+07289 . arXiv:1511.07289 [cs].
+[17] T. Dao. FlashAttention-2: Faster Attention with Bette r Parallelism and Work Partitioning.
+CoRR , abs/2307.08691, 2023. doi: 10.48550/ARXIV .2307.08691. arXiv: 2307.08691.
+[18] T. Dao and A. Gu. Transformers are ssms: Generalized mod els and efﬁcient algorithms
+through structured state space duality. arXiv preprint arXiv: 2405.21060 , 2024.
+[19] T. Dao, D. Y . Fu, S. Ermon, A. Rudra, and C. Ré. FlashAtten tion: Fast and Memory-Efﬁcient
+Exact Attention with IO-Awareness. In NeurIPS , 2022.
+[20] S. De, S. L. Smith, A. Fernando, A. Botev, G. Cristian-Mu raru, A. Gu, R. Haroun, L. Berrada,
+Y . Chen, S. Srinivasan, G. Desjardins, A. Doucet, D. Budden, Y . W. Teh, R. Pascanu,
+N. De Freitas, and C. Gulcehre. Grifﬁn: Mixing Gated Linear R ecurrences with Local At-
+tention for Efﬁcient Language Models, Feb. 2024. URL http://arxiv.org/abs/2402.
+19427 . arXiv:2402.19427 [cs].
+[21] M. Demircigil, J. Heusel, M. Löwe, S. Upgang, and F. Verm et. On a model of associative
+memory with huge storage capacity. Journal of Statistical Physics , 168(2):288–299, July
+2017. ISSN 0022-4715, 1572-9613. doi: 10.1007/s10955-017 -1806-y. URL http://arxiv.
+org/abs/1702.01929 . arXiv:1702.01929 [math].
+[22] A. E. T. Dominguez and E. S. Q. Orti. Fast blocking of hous eholder reﬂectors on graphics pro-
+cessors. 2018 26th Euromicro International Conference on Parallel, Distributed and Network-
+based Processing (PDP) , pages 385–393, 2018. URL https://api.semanticscholar.
+org/CorpusID:46960439 .
+[23] S. Elfwing, E. Uchibe, and K. Doya. Sigmoid-Weighted Li near Units for Neural Network
+Function Approximation in Reinforcement Learning, Nov. 20 17. URLhttp://arxiv.org/
+abs/1702.03118 . arXiv:1702.03118 [cs].
+[24] M. Fathi, J. Pilault, P.-L. Bacon, C. Pal, O. Firat, and R . Goroshin. Block-state transformer.
+arXiv preprint arXiv:2306.09539 , 2023.
+[25] D. Y . Fu, T. Dao, K. K. Saab, A. W. Thomas, A. Rudra, and C. R é. Hungry Hungry Hip-
+pos: Towards Language Modeling with State Space Models. In The Eleventh International
+Conference on Learning Representations, ICLR 2023, Kigali , Rwanda, May 1-5, 2023 , 2023.
+[26] L. Gao, J. Tow, S. Biderman, S. Black, A. DiPoﬁ, C. Foster , L. Golding, J. Hsu, K. McDonell,
+N. Muennighoff, J. Phang, L. Reynolds, E. Tang, A. Thite, B. W ang, K. Wang, and A. Zou.
+A framework for few-shot language model evaluation, Sept. 2 021.
+[27] E. Gardner. The space of interactions in neural network models. Journal of Physics A , 21:
+257–270, 1988.
+[28] A. Graves, G. Wayne, and I. Danihelka. Neural Turing Mac hines, Dec. 2014. URL http://
+arxiv.org/abs/1410.5401 . arXiv:1410.5401 [cs].
+[29] R. Grifﬁn and G. Teams. Recurrentgemma: Moving past tra nsformers for efﬁcient open
+language models. ArXiv , abs/2404.07839, 2024.
+[30] A. Gu and T. Dao. Mamba: Linear-Time Sequence Modeling w ith Selective State Spaces. In
+Proceedings of COLM , 2023.
+[31] A. Gu, K. Goel, and C. Ré. Efﬁciently modeling long seque nces with structured state spaces.
+InThe Tenth International Conference on Learning Representa tions, ICLR 2022, Virtual
+Event, April 25-29, 2022 . OpenReview.net, 2022.
+[32] K. Helfrich, D. Willmott, and Q. Ye. Orthogonal recurre nt neural networks with scaled cayley
+transform. In International Conference on Machine Learning , pages 1969–1978. PMLR,
+2018.
+12[33] W. Hua, Z. Dai, H. Liu, and Q. V . Le. Transformer Quality i n Linear Time. In K. Chaudhuri,
+S. Jegelka, L. Song, C. Szepesvári, G. Niu, and S. Sabato, edi tors, International Conference
+on Machine Learning, ICML 2022, 17-23 July 2022, Baltimore, Maryland, USA , volume 162
+ofProceedings of Machine Learning Research , pages 9099–9117. PMLR, 2022.
+[34] F. Huang, K. Lu, C. Yuxi, Z. Qin, Y . Fang, G. Tian, and G. Li . Encoding recurrence into
+transformers. In The Eleventh International Conference on Learning Represe ntations , 2022.
+[35] K. Irie and J. Schmidhuber. Images as weight matrices: S equential image generation through
+synaptic learning rules. In The Eleventh International Conference on Learning Represe nta-
+tions, ICLR 2023, Kigali, Rwanda, May 1-5, 2023 . OpenReview.net, 2023. URL https://
+openreview.net/pdf?id=ddad0PNUvV .
+[36] K. Irie, I. Schlag, R. Csord’as, and J. Schmidhuber. Goi ng beyond linear transformers with
+recurrent fast weight programmers. ArXiv , abs/2106.06295, 2021. URL https://api.
+semanticscholar.org/CorpusID:235417174 .
+[37] K. Irie, I. Schlag, R. Csordás, and J. Schmidhuber. Goin g beyond linear transformers with
+recurrent fast weight programmers. Advances in Neural Information Processing Systems , 34:
+7703–7717, 2021.
+[38] K. Irie, R. Csordás, and J. Schmidhuber. The dual form of neural networks revisited: Con-
+necting test time predictions to training patterns via spot lights of attention. In Proc. Int. Conf.
+on Machine Learning (ICML) , Baltimore, MD, USA, July 2022.
+[39] K. Irie, F. Faccio, and J. Schmidhuber. Neural differen tial equations for learning
+to program neural nets through continuous learning rules. I n S. Koyejo, S. Mo-
+hamed, A. Agarwal, D. Belgrave, K. Cho, and A. Oh, editors, Advances in Neural In-
+formation Processing Systems 35: Annual Conference on Neur al Information Process-
+ing Systems 2022, NeurIPS 2022, New Orleans, LA, USA, Novemb er 28 - Decem-
+ber 9, 2022 , 2022. URL http://papers.nips.cc/paper_files/paper/2022/hash/
+fc09b26b85ab3abb2832bd555a2e4215-Abstract-Conference.html .
+[40] K. Irie, I. Schlag, R. Csord’as, and J. Schmidhuber. A mo dern self-referential weight matrix
+that learns to modify itself. In International Conference on Machine Learning , 2022.
+[41] K. Irie, R. Csordás, and J. Schmidhuber. Practical comp utational power of linear transformers
+and their recurrent and self-referential extensions. In H. Bouamor, J. Pino, and K. Bali, editors,
+Proceedings of the 2023 Conference on Empirical Methods in N atural Language Processing ,
+pages 9455–9465, Singapore, Dec. 2023. Association for Com putational Linguistics. doi: 10.
+18653/v1/2023.emnlp-main.588. URL https://aclanthology.org/2023.emnlp-main.
+588.
+[42] L. Jing, C. Gulcehre, J. Peurifoy, Y . Shen, M. Tegmark, M . Soljacic, and Y . Bengio. Gated
+Orthogonal Recurrent Units: On Learning to Forget. Neural Computation , 31(4):765–783,
+Apr. 2019. ISSN 0899-7667, 1530-888X. doi: 10.1162/neco_a _01174. URL https://
+direct.mit.edu/neco/article/31/4/765-783/8458 .
+[43] T. Joffrain, T. M. Low, E. S. Quintana-Ortí, R. A. van de G eijn, and F. G. V . Zee. Accumu-
+lating householder transformations, revisited. ACM Trans. Math. Softw. , 32:169–179, 2006.
+URLhttps://api.semanticscholar.org/CorpusID:15723171 .
+[44] P. Kacham, V . Mirrokni, and P. Zhong. Polysketchformer : Fast transformers via sketches for
+polynomial kernels. arXiv preprint arXiv:2310.01655 , 2023.
+[45] Y . Kang, G. Tran, and H. De Sterck. Fast multipole attent ion: A divide-and-conquer attention
+mechanism for long sequences. arXiv preprint arXiv:2310.11960 , 2023.
+[46] J. Kasai, H. Peng, Y . Zhang, D. Yogatama, G. Ilharco, N. P appas, Y . Mao, W. Chen, and N. A.
+Smith. Finetuning Pretrained Transformers into RNNs. In M. -F. Moens, X. Huang, L. Specia,
+and S. W.-t. Yih, editors, Proceedings of the 2021 Conference on Empirical Methods in N at-
+ural Language Processing, EMNLP 2021, Virtual Event / Punta Cana, Dominican Republic,
+7-11 November, 2021 , pages 10630–10643. Association for Computational Lingui stics, 2021.
+doi: 10.18653/V1/2021.EMNLP-MAIN.830.
+13[47] A. Katharopoulos, A. Vyas, N. Pappas, and F. Fleuret. Tr ansformers are rnns: Fast autore-
+gressive transformers with linear attention. In International conference on machine learning ,
+pages 5156–5165. PMLR, 2020.
+[48] N. Kitaev, Ł. Kaiser, and A. Levskaya. Reformer: The efﬁ cient transformer. arXiv preprint
+arXiv:2001.04451 , 2020.
+[49] D. Krotov and J. Hopﬁeld. Large Associative Memory Prob lem in Neurobiology and Ma-
+chine Learning, Apr. 2021. URL http://arxiv.org/abs/2008.06996 . arXiv:2008.06996
+[cond-mat, q-bio, stat].
+[50] T. Lei. When Attention Meets Fast Recurrence: Training L anguage Models with Reduced
+Compute. In M.-F. Moens, X. Huang, L. Specia, and S. W.-t. Yih , editors, Proceedings of the
+2021 Conference on Empirical Methods in Natural Language Pr ocessing , pages 7633–7648,
+Online and Punta Cana, Dominican Republic, Nov. 2021. Assoc iation for Computational
+Linguistics. doi: 10.18653/v1/2021.emnlp-main.602. URL https://aclanthology.org/
+2021.emnlp-main.602 .
+[51] T. Lei, R. Tian, J. Bastings, and A. P. Parikh. Simple rec urrence improves masked language
+models. arXiv preprint arXiv:2205.11588 , 2022.
+[52] P. Lewis, E. Perez, A. Piktus, F. Petroni, V . Karpukhin, N. Goyal, H. Küttler, M. Lewis,
+W.-t. Yih, T. Rocktäschel, S. Riedel, and D. Kiela. Retrieva l-Augmented Generation for
+Knowledge-Intensive NLP Tasks, Apr. 2021. URL http://arxiv.org/abs/2005.11401 .
+arXiv:2005.11401 [cs].
+[53] O. Lieber, B. Lenz, H. Bata, G. Cohen, J. Osin, I. Dalmedi gos, E. Safahi, S. Meirom, Y . Be-
+linkov, S. Shalev-Shwartz, et al. Jamba: A hybrid transform er-mamba language model. arXiv
+preprint arXiv:2403.19887 , 2024.
+[54] K. C. Lingashetty. Delta learning rule for the active si tes model. arXiv preprint
+arXiv:1007.0417 , 2010.
+[55] L. D. Lingle. Transformer-vq: Linear-time transforme rs via vector quantization. arXiv
+preprint arXiv:2309.16354 , 2023.
+[56] B. Liu, R. Wang, L. Wu, Y . Feng, P. Stone, and Q. Liu. Longh orn: State space models are
+amortized online learners. ArXiv , abs/2407.14207, 2024.
+[57] H. Liu, M. Zaharia, and P. Abbeel. Ring Attention with Bl ockwise Transformers for Near-
+Inﬁnite Context. ArXiv , abs/2310.01889, 2023.
+[58] C. Lockard, P. Shiralkar, and X. L. Dong. OpenCeres: When Open Information Extraction
+Meets the Semi-Structured Web. In J. Burstein, C. Doran, and T. Solorio, editors, Proceedings
+of the 2019 Conference of the North American Chapter of the As sociation for Computational
+Linguistics: Human Language Technologies, Volume 1 (Long a nd Short Papers) , pages 3047–
+3056, Minneapolis, Minnesota, June 2019. Association for C omputational Linguistics. doi:
+10.18653/v1/N19-1309. URL https://aclanthology.org/N19-1309 .
+[59] X. Ma, C. Zhou, X. Kong, J. He, L. Gui, G. Neubig, J. May, an d L. Zettlemoyer. Mega:
+moving average equipped gated attention. arXiv preprint arXiv:2209.10655 , 2022.
+[60] X. Ma, X. Yang, W. Xiong, B. Chen, L. Yu, H. Zhang, J. May, L . Zettlemoyer, O. Levy, and
+C. Zhou. Megalodon: Efﬁcient llm pretraining and inference with unlimited context length.
+arXiv preprint arXiv:2404.08801 , 2024.
+[61] H. H. Mao. Fine-Tuning Pre-trained Transformers into D ecaying Fast Weights. In Proceed-
+ings of the 2022 Conference on Empirical Methods in Natural L anguage Processing , pages
+10236–10242, Abu Dhabi, United Arab Emirates, Dec. 2022. As sociation for Computational
+Linguistics. doi: 10.18653/v1/2022.emnlp-main.697.
+[62] E. Martin and C. Cundy. Parallelizing Linear Recurrent Neural Nets Over Sequence Length.
+In6th International Conference on Learning Representations , ICLR 2018, Vancouver, BC,
+Canada, April 30 - May 3, 2018, Conference Track Proceedings . OpenReview.net, 2018.
+14[63] S. Massaroli, M. Poli, D. Y . Fu, H. Kumbong, R. N. Parnich kun, A. Timalsina, D. W. Romero,
+Q. McIntyre, B. Chen, A. Rudra, C. Zhang, C. Ré, S. Ermon, and Y . Bengio. Laughing hyena
+distillery: Extracting compact recurrences from convolut ions. ArXiv , abs/2310.18780, 2023.
+URLhttps://api.semanticscholar.org/CorpusID:264590326 .
+[64] A. Mathiasen, F. Hvilshøj, J. R. Jørgensen, A. Nasery, a nd D. Mottin. Faster orthogonal
+parameterization with householder matrices. In ICML, Workshop Proceedings , 2020.
+[65] R. J. McEliece, E. C. Posner, E. R. Rodemich, and S. S. Ven katesh. The capacity of the
+hopﬁeld associative memory. IEEE Trans. Inf. Theory , 33:461–482, 1987.
+[66] J. Mercat, I. Vasiljevic, S. Keh, K. Arora, A. Dave, A. Ga idon, and T. Kollar. Linearizing
+large language models. arXiv preprint arXiv:2405.06640 , 2024.
+[67] W. Merrill, J. Petty, and A. Sabharwal. The Illusion of S tate in State-Space Models, Apr.
+2024. URL http://arxiv.org/abs/2404.08819 . arXiv:2404.08819 [cs].
+[68] Z. Mhammedi, A. Hellicar, A. Rahman, and J. Bailey. Efﬁc ient Orthogonal Parametrisation
+of Recurrent Neural Networks Using Householder Reﬂections , June 2017. URL http://
+arxiv.org/abs/1612.00188 . arXiv:1612.00188 [cs].
+[69] B. Millidge. Linear Attention as Iterated Hopﬁeld Netw orks. URL http://www.beren.io/
+2024-03-03-Linear-Attention-as-Iterated-Hopfield-Networks/ .
+[70] T. Munkhdalai, A. Sordoni, T. Wang, and A. Trischler. Me talearned Neural
+Memory. ArXiv , July 2019. URL https://www.semanticscholar.org/paper/
+a513bb6e1967f5a31ad4f38954e66d4169b613e5 .
+[71] T. Munkhdalai, M. Faruqui, and S. Gopal. Leave no contex t behind: Efﬁcient inﬁnite context
+transformers with inﬁni-attention. arXiv preprint arXiv:2404.07143 , 2024.
+[72] Y . Nahshan, J. Kampeas, and E. Haleva. Linear Log-Norma l Attention with Unbiased Con-
+centration, Feb. 2024. URL http://arxiv.org/abs/2311.13541 . arXiv:2311.13541 [cs].
+[73] T. Nguyen, V . Suliafu, S. Osher, L. Chen, and B. Wang. Fmm former: Efﬁcient and ﬂexible
+transformer via decomposed near-ﬁeld and far-ﬁeld attenti on.Advances in neural information
+processing systems , 34:29449–29463, 2021.
+[74] D. Paperno, G. Kruszewski, A. Lazaridou, Q. N. Pham, R. B ernardi, S. Pezzelle, M. Baroni,
+G. Boleda, and R. Fernández. The LAMBADA dataset: Word predi ction requiring a broad dis-
+course context, June 2016. URL http://arxiv.org/abs/1606.06031 . arXiv:1606.06031
+[cs].
+[75] J. Park, J. Park, Z. Xiong, N. Lee, J. Cho, S. Oymak, K. Lee , and D. Papailiopoulos. Can
+mamba learn how to learn? a comparative study on in-context l earning tasks. arXiv preprint
+arXiv:2402.04248 , 2024.
+[76] B. Peng, E. Alcaide, Q. Anthony, A. Albalak, S. Arcadinh o, H. Cao, X. Cheng, M. Chung,
+M. Grella, K. K. G. V , X. He, H. Hou, P. Kazienko, J. Kocon, J. Ko ng, B. Koptyra, H. Lau,
+K. S. I. Mantri, F. Mom, A. Saito, X. Tang, B. Wang, J. S. Wind, S . Wozniak, R. Zhang,
+Z. Zhang, Q. Zhao, P. Zhou, J. Zhu, and R.-J. Zhu. RWKV: Reinven ting RNNs for the
+Transformer Era. CoRR , abs/2305.13048, 2023. doi: 10.48550/ARXIV .2305.13048. arXiv:
+2305.13048.
+[77] B. Peng, D. Goldstein, Q. Anthony, A. Albalak, E. Alcaid e, S. Biderman, E. Cheah, X. Du,
+T. Ferdinan, H. Hou, P. Kazienko, K. K. GV , J. Koco ´n, B. Koptyra, S. Krishna, R. McClel-
+land Jr., N. Muennighoff, F. Obeid, A. Saito, G. Song, H. Tu, S . Wo´ zniak, R. Zhang, B. Zhao,
+Q. Zhao, P. Zhou, J. Zhu, and R.-J. Zhu. Eagle and Finch: RWKV wi th Matrix-Valued
+States and Dynamic Recurrence, Apr. 2024. URL http://arxiv.org/abs/2404.05892 .
+arXiv:2404.05892 [cs].
+[78] H. Peng, R. Schwartz, S. Thomson, and N. A. Smith. Ration al recurrences. ArXiv ,
+abs/1808.09357, 2018.
+15[79] H. Peng, N. Pappas, D. Yogatama, R. Schwartz, N. A. Smith , and L. Kong. Random feature
+attention. arXiv preprint arXiv:2103.02143 , 2021.
+[80] H. Peng, J. Kasai, N. Pappas, D. Yogatama, Z. Wu, L. Kong, R. Schwartz, and N. A. Smith.
+ABC: Attention with Bounded-memory Control. In S. Muresan, P. Nakov, and A. Villavicen-
+cio, editors, Proceedings of the 60th Annual Meeting of the Association fo r Computational
+Linguistics (Volume 1: Long Papers) , Dublin, Ireland, May 2022. Association for Computa-
+tional Linguistics.
+[81] M. Poli, S. Massaroli, E. Nguyen, D. Y . Fu, T. Dao, S. Bacc us, Y . Bengio, S. Ermon, and
+C. Ré. Hyena Hierarchy: Towards Larger Convolutional Langu age Models. In A. Krause,
+E. Brunskill, K. Cho, B. Engelhardt, S. Sabato, and J. Scarle tt, editors, International Confer-
+ence on Machine Learning, ICML 2023, 23-29 July 2023, Honolu lu, Hawaii, USA , volume
+202 of Proceedings of Machine Learning Research , pages 28043–28078. PMLR, 2023.
+[82] M. Poli, A. W. Thomas, E. Nguyen, P. Ponnusamy, B. Deiser oth, K. Kersting, T. Suzuki,
+B. Hie, S. Ermon, C. Ré, C. Zhang, and S. Massaroli. Mechanist ic Design and Scaling of
+Hybrid Architectures, Mar. 2024. arXiv:2403.17844 [cs].
+[83] D. Prados and S. Kak. Neural network capacity using delt a rule. Electronics Letters , 3(25):
+197–199, 1989.
+[84] Z. Qin, X. Han, W. Sun, D. Li, L. Kong, N. Barnes, and Y . Zho ng. The devil in linear
+transformer. arXiv preprint arXiv:2210.10340 , 2022.
+[85] Z. Qin, X. Han, W. Sun, B. He, D. Li, D. Li, Y . Dai, L. Kong, a nd Y . Zhong. Toeplitz neural
+network for sequence modeling. arXiv preprint arXiv:2305.04749 , 2023.
+[86] Z. Qin, D. Li, W. Sun, W. Sun, X. Shen, X. Han, Y . Wei, B. Lv, F. Yuan, X. Luo, et al. Scaling
+transnormer to 175 billion parameters. arXiv preprint arXiv:2307.14995 , 2023.
+[87] Z. Qin, W. Sun, K. Lu, H. Deng, D. Li, X. Han, Y . Dai, L. Kong , and Y . Zhong. Lin-
+earized Relative Positional Encoding, July 2023. URL http://arxiv.org/abs/2307.
+09270 . arXiv:2307.09270 [cs].
+[88] Z. Qin, W. Sun, D. Li, X. Shen, W. Sun, and Y . Zhong. Lightn ing attention-2: A free lunch
+for handling unlimited sequence lengths in large language m odels. 2024.
+[89] Z. Qin, S. Yang, W. Sun, X. Shen, D. Li, W. Sun, and Y . Zhong . HGRN2: Gated Lin-
+ear RNNs with State Expansion. 2024. URL https://api.semanticscholar.org/
+CorpusID:269043328 .
+[90] Z. Qin, S. Yang, and Y . Zhong. Hierarchically gated recu rrent neural network for sequence
+modeling. Advances in Neural Information Processing Systems , 36, 2024.
+[91] P. Rajpurkar, R. Jia, and P. Liang. Know What You Don’t Kno w: Unanswerable Questions
+for SQuAD. In Proceedings of the 56th Annual Meeting of the Association fo r Computational
+Linguistics (Volume 2: Short Papers) , Melbourne, Australia, 2018. Association for Computa-
+tional Linguistics.
+[92] H. Ramsauer, B. Schäﬂ, J. Lehner, P. Seidl, M. Widrich, T . Adler, L. Gruber, M. Holzleitner,
+M. Pavlovi ´c, G. K. Sandve, V . Greiff, D. Kreil, M. Kopp, G. Klambauer, J. Brandstetter, and
+S. Hochreiter. Hopﬁeld Networks is All You Need, Apr. 2021. U RLhttp://arxiv.org/
+abs/2008.02217 . arXiv:2008.02217 [cs, stat].
+[93] L. Ren, Y . Liu, Y . Lu, Y . Shen, C. Liang, and W. Chen. Samba : Simple hybrid state space
+models for efﬁcient unlimited context language modeling. arXiv preprint arXiv:2406.07522 ,
+2024.
+[94] I. Rodkin, Y . Kuratov, A. Bulatov, and M. Burtsev. Assoc iative recurrent memory transformer.
+ArXiv , abs/2407.04841, 2024.
+[95] A. Roy, M. Saffar, A. Vaswani, and D. Grangier. Efﬁcient content-based sparse attention
+with routing transformers. Transactions of the Association for Computational Linguis tics, 9:
+53–68, 2021.
+16[96] K. Sakaguchi, R. L. Bras, C. Bhagavatula, and Y . Choi. Wi nogrande: An adversarial winograd
+schema challenge at scale. Communications of the ACM , 64(9):99–106, 2021.
+[97] I. Schlag, K. Irie, and J. Schmidhuber. Linear transfor mers are secretly fast weight program-
+mers. In M. Meila and T. Zhang, editors, Proceedings of the 38th International Conference on
+Machine Learning, ICML 2021, 18-24 July 2021, Virtual Event , volume 139 of Proceedings
+of Machine Learning Research , pages 9355–9366. PMLR, 2021.
+[98] I. Schlag, K. Irie, and J. Schmidhuber. Linear Transfor mers Are Secretly Fast Weight Pro-
+grammers. In M. Meila and T. Zhang, editors, Proceedings of the 38th International Con-
+ference on Machine Learning, ICML 2021, 18-24 July 2021, Vir tual Event , volume 139 of
+Proceedings of Machine Learning Research , pages 9355–9366. PMLR, 2021.
+[99] I. Schlag, T. Munkhdalai, and J. Schmidhuber. Learning Associative Inference Us-
+ing Fast Weight Memory, Feb. 2021. URL http://arxiv.org/abs/2011.07831 .
+arXiv:2011.07831 [cs].
+[100] J. Schmidhuber. Learning to control fast-weight memo ries: An alternative to dynamic recur-
+rent networks. Neural Computation , 4(1):131–139, 1992.
+[101] N. Shazeer. Glu variants improve transformer. arXiv preprint arXiv:2002.05202 , 2020.
+[102] Y . Shen, M. Stallone, M. Mishra, G. Zhang, S. Tan, A. Pra sad, A. M. Soria, D. D. Cox, and
+R. Panda. Power scheduler: A batch size and token number agno stic learning rate scheduler.
+ArXiv , abs/2408.13359, 2024.
+[103] J. T. H. Smith, A. Warrington, and S. W. Linderman. Simp liﬁed State Space Layers for
+Sequence Modeling. In The Eleventh International Conference on Learning Represe ntations,
+ICLR 2023, Kigali, Rwanda, May 1-5, 2023 . OpenReview.net, 2023.
+[104] W. Sun, Z. Qin, D. Li, X. Shen, Y . Qiao, and Y . Zhong. Line ar attention sequence parallelism.
+arXiv preprint arXiv:2404.02882 , 2024.
+[105] Y . Sun, L. Dong, S. Huang, S. Ma, Y . Xia, J. Xue, J. Wang, a nd F. Wei. Retentive network: A
+successor to transformer for large language models. arXiv preprint arXiv:2307.08621 , 2023.
+[106] Y . Sun, L. Dong, Y . Zhu, S. Huang, W. Wang, S. Ma, Q. Zhang , J. Wang, and F. Wei.
+You only cache once: Decoder-decoder architectures for lan guage models. arXiv preprint
+arXiv:2405.05254 , 2024.
+[107] Y . Sun, X. Li, K. Dalal, J. Xu, A. Vikram, G. Zhang, Y . Dub ois, X. Chen, X. Wang, O. Koyejo,
+T. Hashimoto, and C. Guestrin. Learning to (learn at test tim e): Rnns with expressive hid-
+den states. ArXiv , abs/2407.04620, 2024. URL https://api.semanticscholar.org/
+CorpusID:271039606 .
+[108] L. Team. The llama 3 herd of models. ArXiv , abs/2407.21783, 2024.
+[109] P. Tillet, H. Kung, and D. D. Cox. Triton: an intermedia te language and compiler for tiled
+neural network computations. In Proceedings of the 3rd ACM SIGPLAN International Work-
+shop on Machine Learning and Programming Languages, MAPL@P LDI 2019 , pages 10–19.
+ACM, 2019. doi: 10.1145/3315508.3329973.
+[110] J. M. Tomczak and M. Welling. Improving Variational Au to-Encoders using Householder
+Flow, Jan. 2017. arXiv:1611.09630 [cs, stat].
+[111] H. Touvron, T. Lavril, G. Izacard, X. Martinet, M.-A. L achaux, T. Lacroix, B. Rozière,
+N. Goyal, E. Hambro, F. Azhar, et al. Llama: Open and efﬁcient foundation language models.
+arXiv preprint arXiv:2302.13971 , 2023.
+[112] A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jon es, A. N. Gomez, L. Kaiser, and
+I. Polosukhin. Attention is all you need. Advances in neural information processing systems ,
+30, 2017.
+17[113] E. V orontsov, C. Trabelsi, S. Kadoury, and C. Pal. On or thogonality and learning recurrent
+networks with long term dependencies. In International Conference on Machine Learning ,
+pages 3570–3578. PMLR, 2017.
+[114] B. Widrow, M. E. Hoff, et al. Adaptive switching circui ts. In IRE WESCON convention
+record , volume 4, pages 96–104. New York, 1960.
+[115] S. Yang and Y . Zhang. FLA: A Triton-Based Library for Ha rdware-Efﬁcient Implementations
+of Linear Attention Mechanism, Jan. 2024. URL https://github.com/sustcsonglin/
+flash-linear-attention . original-date: 2023-12-20T06:50:18Z.
+[116] S. Yang, B. Wang, Y . Shen, R. Panda, and Y . Kim. Gated lin ear attention transformers with
+hardware-efﬁcient training. arXiv preprint arXiv:2312.06635 , 2023.
+[117] M. Zaheer, G. Guruganesh, K. A. Dubey, J. Ainslie, C. Al berti, S. Ontanon, P. Pham,
+A. Ravula, Q. Wang, L. Yang, et al. Big bird: Transformers for longer sequences. Advances
+in neural information processing systems , 33:17283–17297, 2020.
+[118] R. Zellers, A. Holtzman, Y . Bisk, A. Farhadi, and Y . Cho i. Hellaswag: Can a machine really
+ﬁnish your sentence? arXiv preprint arXiv:1905.07830 , 2019.
+[119] J. Zhang, Q. Lei, and I. S. Dhillon. Stabilizing Gradie nts for Deep Neural Networks via
+Efﬁcient SVD Parameterization, Mar. 2018. arXiv:1803.093 27 [cs, stat].
+[120] J. Zhang, S. Jiang, J. Feng, L. Zheng, and L. Kong. Linea r Attention via Orthogonal Memory,
+2023. arXiv:2312.11135.
+[121] Q. Zhang, D. Ram, C. Hawkins, S. Zha, and T. Zhao. Efﬁcie nt long-range transformers: You
+need to attend more, but not necessarily at every layer. In H. Bouamor, J. Pino, and K. Bali,
+editors, Findings of the Association for Computational Linguistics : EMNLP 2023 , 2023.
+[122] Y . Zhang, S. Yang, R. Zhu, Y . Zhang, L. Cui, Y . Wang, B. Wa ng, F. Shi, B. Wang, W. Bi,
+P. Zhou, and G. Fu. Gated slot attention for efﬁcient linear- time sequence modeling. In The
+Thirty-eighth Annual Conference on Neural Information Pro cessing Systems , 2024.
+[123] I. Zimerman, A. Ali, and L. Wolf. A uniﬁed implicit atte ntion formulation for gated-linear
+recurrent sequence models. CoRR , abs/2405.16504, 2024.
+18A Derivation of WY representation
+To reduce notational clutter, we only discuss the ﬁrst chunk here.
+We ﬁrst show Pn=I−/summationtextn
+t=1wtkT
+tby induction,
+Pn=n/productdisplay
+t=1(I−βtktkT
+t)
+=Pn−1(I−βnknkT
+n)
+= (I−n−1/summationdisplay
+t=1wtkT
+t)(I−βnknkT
+n)
+=I−n−1/summationdisplay
+t=1wtkT
+t−βnknkT
+n+(n−1/summationdisplay
+t=1wtkT
+t)βnknkT
+n
+=I−n−1/summationdisplay
+t=1wtkT
+t−/parenleftBigg
+βnkn−βnn−1/summationdisplay
+t=1/parenleftBig
+wt(kT
+tkn)/parenrightBig/parenrightBigg
+/bracehtipupleft /bracehtipdownright/bracehtipdownleft /bracehtipupright
+wnkT
+n
+=I−n/summationdisplay
+t=1wtkT
+t
+Similarly, we show Sn=/summationtextn
+t=1utkT
+nby induction,
+Sn=Sn−1(I−βnknkT
+n)+βnvnkT
+n
+=/parenleftBiggn−1/summationdisplay
+t=1utkT
+t/parenrightBigg
+(I−βnknkT
+n)+βnvnkT
+n
+=n−1/summationdisplay
+t=1utkT
+t−/parenleftBiggn−1/summationdisplay
+t=1utkT
+t/parenrightBigg
+βnknkT
+n+βnvnkT
+n
+=n−1/summationdisplay
+t=1utkT
+t+/parenleftBigg
+βnvn−βnn−1/summationdisplay
+t=1ut/parenleftBig
+kT
+tkn/parenrightBig/parenrightBigg
+/bracehtipupleft/bracehtipdownright/bracehtipdownleft /bracehtipupright
+unkT
+n
+=n/summationdisplay
+t=1utkT
+n
+19B Pseudo code
+1defchunk_delta_rule_forward (Q, K, V, beta, C):
+2'''
+3Q/K/V: query, key, value of shape [L, d]
+4beta: beta of shape [L]
+5C: chunk size
+6'''
+7# L: sequence length, d: head dimension
+8L, d=Q.shape
+9
+10# chunking
+11Q, K, V =map(lambdax: x.reshape( -1,C,d), [Q, K, V])
+12beta=beta.reshape( -1, C)
+13K_beta=K*beta.unsqueeze( -1)
+14V_beta=V*beta.unsqueeze( -1)
+15
+16# compute Eq. 10
+17mask=torch.triu(torch .ones(C, C), diagonal =0).bool()
+18T= -(K_beta @K.t()).masked_fill_(mask, 0)
+19# vectorized forword substitution.
+20foriinrange(1, C):
+21 T[i, :i] =T[i, :i] +(T[i, :, None]*T[:, :i]) .sum(-2)
+22T+=torch.eye(C)
+23# compute Eq. 11
+24W=T@K_beta
+25U=T@V_beta
+26# chunkwise parallel. Eq. 8-9
+27S=torch.zeros(d, d)
+28O=torch.empty_like(V)
+29mask=torch.triu(torch .ones(C, C), diagonal =1).bool()
+30foriinrange(L//C):
+31 q_i, k_i, w_i =Q[i], K[i], W[i]
+32 u_i=U[i]-w_i@S
+33 o_inter =q_i@S
+34 A_i=(q_i@k_i.t()).masked_fill_(mask, 0)
+35 o_intra =A_i@u_i
+36 S+=k_i.t()@u_i
+37 O[i]=o_intra +o_inter
+38returnO.reshape(L, d)
+Listing 1: Pytorch-like code snippet of the forward pass of our chunkwise algor ithm for training DeltaNet. We
+omit the dimensions of batch size and number of heads for clarity.
+C Related Work Continued
+Chunkwise linear attention. Hua et al. [ 33] ﬁrst proposed chunkwise form for linear attention;
+however, they used a hybrid linear and nonlinear attention m odel similar to Munkhdalai et al. [ 71].
+It is possible to adapt their algorithm to compute the exact output of the pure linear attention, as
+shown in Sun et al. [ 105] and Yang et al. [ 116]. The chunkwise linear attention algorithm has also
+been independently discovered in several works [ 105,44,18]. Yang et al. [ 116] and Qin et al. [ 88]
+discuss I/O-aware hardware optimization for chunkwise lin ear attention and Sun et al. [ 104] make
+generalization to multi-node distributed training. Inspi red by the chunkwise form, we propose a new
+algorithm for hardware-efﬁcient DeltaNet training, signi ﬁcantly improving the training efﬁciency
+and allowing for large-scale experiments.
+20Hybrid models. There has been much recent work on developing hybrid models b y combining
+linear recurrent layers (state-space models, linear recur rent Transformers, linear RNNs) with local
+chunk attention [ 59,121,24,60,71] or sliding window attention [ 121,6,20,93] or global attention
+[50,51,34,25,53,75,106]. Poli et al. [ 82] systematically study the scaling law of hybrid models.
+We similarly show that combining DeltaNet with classic atte ntion is an effective strategy.
+Householder matrices. Householder matrices, known for preserving norms, are a typ e of orthogo-
+nal matrix extensively used in machine learning [ 64,68,119,110,87,10]. These matrices allow for
+efﬁcient computation of inverses and their Jacobian determ inant of one, making them particularly
+suitable for applications in normalizing ﬂows [ 64,10]. Notably, Mathiasen et al. [ 64] developed a
+chunkwise fast algorithm for computing the cumulative prod uct of Householder matrices for nor-
+malizing ﬂows, leveraging the WY representation. Our approa ch, while sharing the same high-level
+concept, tackles a different problem and is arguably more ge neral.
+There has also been signiﬁcant interest in using orthogonal matrices to parameterize the transition
+matrices of RNNs [ 68,42,113,32] for mitigating vanishing gradients. Mhammedi et al. [ 68] use the
+WY representation to reduce the memory footprint when traini ng nonlinear RNNs with Householder
+transition matrices.
+D Hyperparameters
+We used 8 H100 GPUs for 340M and 1.3B language modeling experi ments. Each model uses
+AdamW for optimization, with a peak learning rate of 3×10−4. The 340M models are trained
+using 15 billion tokens and a batch size of 0.5M tokens, while the 1.3B models are trained with 100
+billion tokens and a batch size of 2M tokens. We use a cosine le arning rate schedule, starting with a
+warm-up phase of 0.5 billion tokens for the 340M models and 1 b illion tokens for the 1.3B models.
+Both conﬁgurations have initial and ﬁnal learning rates set at3×10−5. We apply a weight decay of
+0.01 and use gradient clipping at a maximum of 1.0. The head di mension of DeltaNet is set to 128,
+and the kernel size for convolution layers is set at 4.
+21NeurIPS Paper Checklist
+1.Claims
+Question: Do the main claims made in the abstract and introdu ction accurately reﬂect the
+paper’s contributions and scope?
+Answer: [Yes]
+Justiﬁcation: This paper’s contributions and scope are reﬂ ected in abstract and introduction
+part clearly.
+Guidelines:
+• The answer NA means that the abstract and introduction do no t include the claims
+made in the paper.
+• The abstract and/or introduction should clearly state the claims made, including the
+contributions made in the paper and important assumptions a nd limitations. A No or
+NA answer to this question will not be perceived well by the re viewers.
+• The claims made should match theoretical and experimental results, and reﬂect how
+much the results can be expected to generalize to other setti ngs.
+• It is ﬁne to include aspirational goals as motivation as lon g as it is clear that these
+goals are not attained by the paper.
+2.Limitations
+Question: Does the paper discuss the limitations of the work performed by the authors?
+Answer: [Yes]
+Justiﬁcation: We discuss the limitations of this work in § 5.3.
+Guidelines:
+• The answer NA means that the paper has no limitation while th e answer No means
+that the paper has limitations, but those are not discussed i n the paper.
+• The authors are encouraged to create a separate "Limitatio ns" section in their paper.
+• The paper should point out any strong assumptions and how ro bust the results are to
+violations of these assumptions (e.g., independence assum ptions, noiseless settings,
+model well-speciﬁcation, asymptotic approximations only holding locally). The au-
+thors should reﬂect on how these assumptions might be violat ed in practice and what
+the implications would be.
+• The authors should reﬂect on the scope of the claims made, e. g., if the approach was
+only tested on a few datasets or with a few runs. In general, em pirical results often
+depend on implicit assumptions, which should be articulate d.
+• The authors should reﬂect on the factors that inﬂuence the p erformance of the ap-
+proach. For example, a facial recognition algorithm may per form poorly when image
+resolution is low or images are taken in low lighting. Or a spe ech-to-text system might
+not be used reliably to provide closed captions for online le ctures because it fails to
+handle technical jargon.
+• The authors should discuss the computational efﬁciency of the proposed algorithms
+and how they scale with dataset size.
+• If applicable, the authors should discuss possible limita tions of their approach to ad-
+dress problems of privacy and fairness.
+• While the authors might fear that complete honesty about lim itations might be used by
+reviewers as grounds for rejection, a worse outcome might be that reviewers discover
+limitations that aren’t acknowledged in the paper. The auth ors should use their best
+judgment and recognize that individual actions in favor of t ransparency play an impor-
+tant role in developing norms that preserve the integrity of the community. Reviewers
+will be speciﬁcally instructed to not penalize honesty conc erning limitations.
+3.Theory Assumptions and Proofs
+22Question: For each theoretical result, does the paper provi de the full set of assumptions and
+a complete (and correct) proof?
+Answer: [NA]
+Justiﬁcation: This paper does not include theoretical resu lts that require a full proof.
+Guidelines:
+• The answer NA means that the paper does not include theoreti cal results.
+• All the theorems, formulas, and proofs in the paper should b e numbered and cross-
+referenced.
+• All assumptions should be clearly stated or referenced in t he statement of any theo-
+rems.
+• The proofs can either appear in the main paper or the supplem ental material, but if
+they appear in the supplemental material, the authors are en couraged to provide a
+short proof sketch to provide intuition.
+• Inversely, any informal proof provided in the core of the pa per should be comple-
+mented by formal proofs provided in appendix or supplementa l material.
+• Theorems and Lemmas that the proof relies upon should be pro perly referenced.
+4.Experimental Result Reproducibility
+Question: Does the paper fully disclose all the information needed to reproduce the main
+experimental results of the paper to the extent that it affec ts the main claims and/or conclu-
+sions of the paper (regardless of whether the code and data ar e provided or not)?
+Answer: [Yes]
+Justiﬁcation: The paper provides sufﬁcient details on hype rparameters and training proce-
+dures in § Dto reproduce the results supporting its main conclusions.
+Guidelines:
+• The answer NA means that the paper does not include experime nts.
+• If the paper includes experiments, a No answer to this quest ion will not be perceived
+well by the reviewers: Making the paper reproducible is impo rtant, regardless of
+whether the code and data are provided or not.
+• If the contribution is a dataset and/or model, the authors s hould describe the steps
+taken to make their results reproducible or veriﬁable.
+• Depending on the contribution, reproducibility can be acc omplished in various ways.
+For example, if the contribution is a novel architecture, de scribing the architecture
+fully might sufﬁce, or if the contribution is a speciﬁc model and empirical evaluation,
+it may be necessary to either make it possible for others to re plicate the model with
+the same dataset, or provide access to the model. In general. releasing code and data
+is often one good way to accomplish this, but reproducibilit y can also be provided via
+detailed instructions for how to replicate the results, acc ess to a hosted model (e.g., in
+the case of a large language model), releasing of a model chec kpoint, or other means
+that are appropriate to the research performed.
+• While NeurIPS does not require releasing code, the conferen ce does require all sub-
+missions to provide some reasonable avenue for reproducibi lity, which may depend
+on the nature of the contribution. For example
+(a) If the contribution is primarily a new algorithm, the pap er should make it clear
+how to reproduce that algorithm.
+(b) If the contribution is primarily a new model architectur e, the paper should describe
+the architecture clearly and fully.
+(c) If the contribution is a new model (e.g., a large language model), then there should
+either be a way to access this model for reproducing the resul ts or a way to re-
+produce the model (e.g., with an open-source dataset or inst ructions for how to
+construct the dataset).
+(d) We recognize that reproducibility may be tricky in some c ases, in which case au-
+thors are welcome to describe the particular way they provid e for reproducibility.
+In the case of closed-source models, it may be that access to t he model is limited in
+some way (e.g., to registered users), but it should be possib le for other researchers
+to have some path to reproducing or verifying the results.
+235.Open access to data and code
+Question: Does the paper provide open access to the data and c ode, with sufﬁcient instruc-
+tions to faithfully reproduce the main experimental result s, as described in supplemental
+material?
+Answer: [Yes]
+Justiﬁcation: Our code is publicly available at https://github.com/sustcsonglin/
+flash-linear-attention . Our primary training corpus is Slimpajama, an open-source
+dataset.
+Guidelines:
+• The answer NA means that paper does not include experiments requiring code.
+• Please see the NeurIPS code and data submission guidelines (https://nips.cc/
+public/guides/CodeSubmissionPolicy ) for more details.
+• While we encourage the release of code and data, we understan d that this might not
+be possible, so “No” is an acceptable answer. Papers cannot b e rejected simply for not
+including code, unless this is central to the contribution ( e.g., for a new open-source
+benchmark).
+• The instructions should contain the exact command and envi ronment needed to run
+to reproduce the results. See the NeurIPS code and data submi ssion guidelines
+(https://nips.cc/public/guides/CodeSubmissionPolicy ) for more details.
+• The authors should provide instructions on data access and preparation, including how
+to access the raw data, preprocessed data, intermediate dat a, and generated data, etc.
+• The authors should provide scripts to reproduce all experi mental results for the new
+proposed method and baselines. If only a subset of experimen ts are reproducible, they
+should state which ones are omitted from the script and why.
+• At submission time, to preserve anonymity, the authors sho uld release anonymized
+versions (if applicable).
+• Providing as much information as possible in supplemental material (appended to the
+paper) is recommended, but including URLs to data and code is permitted.
+6.Experimental Setting/Details
+Question: Does the paper specify all the training and test de tails (e.g., data splits, hyper-
+parameters, how they were chosen, type of optimizer, etc.) n ecessary to understand the
+results?
+Answer: [Yes]
+Justiﬁcation: We have detailed all the training and evaluat ion settings before the main
+results in the experimental part.
+Guidelines:
+• The answer NA means that the paper does not include experime nts.
+• The experimental setting should be presented in the core of the paper to a level of
+detail that is necessary to appreciate the results and make s ense of them.
+• The full details can be provided either with the code, in app endix, or as supplemental
+material.
+7.Experiment Statistical Signiﬁcance
+Question: Does the paper report error bars suitably and corr ectly deﬁned or other appropri-
+ate information about the statistical signiﬁcance of the ex periments?
+Answer: [No]
+Justiﬁcation: We do not have enough resources to obtain erro r bars as running the experi-
+ments multiple times is computationally expensive due to th e large model size.
+Guidelines:
+• The answer NA means that the paper does not include experime nts.
+• The authors should answer "Yes" if the results are accompan ied by error bars, conﬁ-
+dence intervals, or statistical signiﬁcance tests, at leas t for the experiments that support
+the main claims of the paper.
+24• The factors of variability that the error bars are capturin g should be clearly stated (for
+example, train/test split, initialization, random drawin g of some parameter, or overall
+run with given experimental conditions).
+• The method for calculating the error bars should be explain ed (closed form formula,
+call to a library function, bootstrap, etc.)
+• The assumptions made should be given (e.g., Normally distr ibuted errors).
+• It should be clear whether the error bar is the standard devi ation or the standard error
+of the mean.
+• It is OK to report 1-sigma error bars, but one should state it . The authors should prefer-
+ably report a 2-sigma error bar than state that they have a 96% CI, if the hypothesis of
+Normality of errors is not veriﬁed.
+• For asymmetric distributions, the authors should be caref ul not to show in tables or
+ﬁgures symmetric error bars that would yield results that ar e out of range (e.g. negative
+error rates).
+• If error bars are reported in tables or plots, The authors sh ould explain in the text how
+they were calculated and reference the corresponding ﬁgure s or tables in the text.
+8.Experiments Compute Resources
+Question: For each experiment, does the paper provide sufﬁc ient information on the com-
+puter resources (type of compute workers, memory, time of ex ecution) needed to reproduce
+the experiments?
+Answer: [Yes]
+Justiﬁcation: We provide information of GPU type and number of GPUs used for running
+our experiments.
+Guidelines:
+• The answer NA means that the paper does not include experime nts.
+• The paper should indicate the type of compute workers CPU or GPU, internal cluster,
+or cloud provider, including relevant memory and storage.
+• The paper should provide the amount of compute required for each of the individual
+experimental runs as well as estimate the total compute.
+• The paper should disclose whether the full research projec t required more compute
+than the experiments reported in the paper (e.g., prelimina ry or failed experiments
+that didn’t make it into the paper).
+9.Code Of Ethics
+Question: Does the research conducted in the paper conform, in every respect, with the
+NeurIPS Code of Ethics https://neurips.cc/public/EthicsGuidelines ?
+Answer: [Yes]
+Justiﬁcation: This work follows the NeurIPS Code of Ethics.
+Guidelines:
+• The answer NA means that the authors have not reviewed the Ne urIPS Code of Ethics.
+• If the authors answer No, they should explain the special ci rcumstances that require a
+deviation from the Code of Ethics.
+• The authors should make sure to preserve anonymity (e.g., i f there is a special consid-
+eration due to laws or regulations in their jurisdiction).
+10.Broader Impacts
+Question: Does the paper discuss both potential positive so cietal impacts and negative
+societal impacts of the work performed?
+Answer: [NA]
+Justiﬁcation: We foresee no potential societal impact of th is work.
+Guidelines:
+• The answer NA means that there is no societal impact of the wo rk performed.
+25• If the authors answer NA or No, they should explain why their work has no societal
+impact or why the paper does not address societal impact.
+• Examples of negative societal impacts include potential m alicious or unintended uses
+(e.g., disinformation, generating fake proﬁles, surveill ance), fairness considerations
+(e.g., deployment of technologies that could make decision s that unfairly impact spe-
+ciﬁc groups), privacy considerations, and security consid erations.
+• The conference expects that many papers will be foundation al research and not tied
+to particular applications, let alone deployments. Howeve r, if there is a direct path to
+any negative applications, the authors should point it out. For example, it is legitimate
+to point out that an improvement in the quality of generative models could be used to
+generate deepfakes for disinformation. On the other hand, i t is not needed to point out
+that a generic algorithm for optimizing neural networks cou ld enable people to train
+models that generate Deepfakes faster.
+• The authors should consider possible harms that could aris e when the technology is
+being used as intended and functioning correctly, harms tha t could arise when the
+technology is being used as intended but gives incorrect res ults, and harms following
+from (intentional or unintentional) misuse of the technolo gy.
+• If there are negative societal impacts, the authors could a lso discuss possible mitiga-
+tion strategies (e.g., gated release of models, providing d efenses in addition to attacks,
+mechanisms for monitoring misuse, mechanisms to monitor ho w a system learns from
+feedback over time, improving the efﬁciency and accessibil ity of ML).
+11.Safeguards
+Question: Does the paper describe safeguards that have been put in place for responsible
+release of data or models that have a high risk for misuse (e.g ., pretrained language models,
+image generators, or scraped datasets)?
+Answer: [NA]
+Justiﬁcation: We foresee no such risks posed by this work.
+Guidelines:
+• The answer NA means that the paper poses no such risks.
+• Released models that have a high risk for misuse or dual-use should be released with
+necessary safeguards to allow for controlled use of the mode l, for example by re-
+quiring that users adhere to usage guidelines or restrictio ns to access the model or
+implementing safety ﬁlters.
+• Datasets that have been scraped from the Internet could pos e safety risks. The authors
+should describe how they avoided releasing unsafe images.
+• We recognize that providing effective safeguards is chall enging, and many papers do
+not require this, but we encourage authors to take this into a ccount and make a best
+faith effort.
+12.Licenses for existing assets
+Question: Are the creators or original owners of assets (e.g ., code, data, models), used in
+the paper, properly credited and are the license and terms of use explicitly mentioned and
+properly respected?
+Answer: [Yes]
+Justiﬁcation: All of the datasets we use are publicly availa ble at huggingface site, and we
+have properly cited all the training and evaluation dataset s we used.
+Guidelines:
+• The answer NA means that the paper does not use existing asse ts.
+• The authors should cite the original paper that produced th e code package or dataset.
+• The authors should state which version of the asset is used a nd, if possible, include a
+URL.
+• The name of the license (e.g., CC-BY 4.0) should be included for each asset.
+• For scraped data from a particular source (e.g., website), the copyright and terms of
+service of that source should be provided.
+26• If assets are released, the license, copyright informatio n, and terms of use in the pack-
+age should be provided. For popular datasets, paperswithcode.com/datasets has
+curated licenses for some datasets. Their licensing guide c an help determine the li-
+cense of a dataset.
+• For existing datasets that are re-packaged, both the origi nal license and the license of
+the derived asset (if it has changed) should be provided.
+• If this information is not available online, the authors ar e encouraged to reach out to
+the asset’s creators.
+13.New Assets
+Question: Are new assets introduced in the paper well docume nted and is the documenta-
+tion provided alongside the assets?
+Answer: [NA]
+Justiﬁcation: This work does not release new assets.
+Guidelines:
+• The answer NA means that the paper does not release new asset s.
+• Researchers should communicate the details of the dataset /code/model as part of their
+submissions via structured templates. This includes detai ls about training, license,
+limitations, etc.
+• The paper should discuss whether and how consent was obtain ed from people whose
+asset is used.
+• At submission time, remember to anonymize your assets (if a pplicable). You can
+either create an anonymized URL or include an anonymized zip ﬁle.
+14.Crowdsourcing and Research with Human Subjects
+Question: For crowdsourcing experiments and research with human subjects, does the pa-
+per include the full text of instructions given to participa nts and screenshots, if applicable,
+as well as details about compensation (if any)?
+Answer: [NA]
+Justiﬁcation: This work does not involve crowdsourcing nor research with human subjects.
+Guidelines:
+• The answer NA means that the paper does not involve crowdsou rcing nor research
+with human subjects.
+• Including this information in the supplemental material i s ﬁne, but if the main contri-
+bution of the paper involves human subjects, then as much det ail as possible should
+be included in the main paper.
+• According to the NeurIPS Code of Ethics, workers involved i n data collection, cura-
+tion, or other labor should be paid at least the minimum wage i n the country of the
+data collector.
+15.Institutional Review Board (IRB) Approvals or Equivalent f or Research with Human
+Subjects
+Question: Does the paper describe potential risks incurred by study participants, whether
+such risks were disclosed to the subjects, and whether Insti tutional Review Board (IRB)
+approvals (or an equivalent approval/review based on the re quirements of your country or
+institution) were obtained?
+Answer: [NA]
+Justiﬁcation: This work does not involve crowdsourcing nor research with human subjects.
+Guidelines:
+• The answer NA means that the paper does not involve crowdsou rcing nor research
+with human subjects.
+• Depending on the country in which research is conducted, IR B approval (or equiva-
+lent) may be required for any human subjects research. If you obtained IRB approval,
+you should clearly state this in the paper.
+27• We recognize that the procedures for this may vary signiﬁca ntly between institutions
+and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the
+guidelines for their institution.
+• For initial submissions, do not include any information th at would break anonymity
+(if applicable), such as the institution conducting the rev iew.
+28

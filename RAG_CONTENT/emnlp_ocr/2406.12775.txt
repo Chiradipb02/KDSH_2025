@@ -1,0 +1,1248 @@
+Hopping Too Late: Exploring the Limitations of
+Large Language Models on Multi-Hop Queries
+Eden Biran1Daniela Gottesman1Sohee Yang2Mor Geva1Amir Globerson1,3
+1Tel Aviv University2UCL3Google Research
+edenbiran@mail.tau.ac.il
+Abstract
+Large language models (LLMs) can solve com-
+plex multi-step problems, but little is known
+about how these computations are implemented
+internally. Motivated by this, we study how
+LLMs answer multi-hop queries such as “The
+spouse of the performer of Imagine is” . These
+queries require two information extraction
+steps: a latent one for resolving the first hop
+(“the performer of Imagine” ) into the bridge
+entity (John Lennon), and another for resolving
+the second hop ( “the spouse of John Lennon” )
+into the target entity (Yoko Ono). Understand-
+ing how the latent step is computed internally
+is key to understanding the overall computa-
+tion. By carefully analyzing the internal com-
+putations of transformer-based LLMs, we dis-
+cover that the bridge entity is resolved in the
+early layers of the model. Then, only after
+this resolution, the two-hop query is solved in
+the later layers. Because the second hop com-
+mences in later layers, there could be cases
+where these layers no longer encode the nec-
+essary knowledge for correctly predicting the
+answer. Motivated by this, we propose a novel
+“back-patching” analysis method whereby a hid-
+den representation from a later layer is patched
+back to an earlier layer. We find that in up to
+66% of previously incorrect cases there exists a
+back-patch that results in the correct generation
+of the answer, showing that the later layers in-
+deed sometimes lack the needed functionality.
+Overall, our methods and findings open further
+opportunities for understanding and improving
+latent reasoning in transformer-based LLMs.
+1 Introduction
+Despite groundbreaking performance in a multi-
+tude of tasks, large language models (LLMs) still
+struggle with complex knowledge queries (Press
+et al., 2023; Dziri et al., 2023). For example, LLMs
+often err when asked to complete multi-hop queries
+such as “The spouse of the performer of Imagine
+is”. Answering such queries requires composition
+thespouse of theperformer ofImagine isYoko 
+1) First hop is 
+resolved into 
+bridge entity 2) Information 
+propagates to last 
+token 3) Second hop is 
+resolved into 
+target entity Representation 
+encoding bridge 
+entity “John Lennon” 
+Representation 
+encoding target 
+entity “Yoko Ono” 
+Back-patched 
+representation Back- 
+patching 
+hidden 
+represen- 
+tation 
+⋮ ⋮ ⋮ ⋮Figure 1: An illustration of our findings: we observe
+evidence of latent reasoning in two-hop queries where
+1) During the early layers the first hop is resolved and
+the source entity Imagine now encodes the bridge entity
+John Lennon 2) During the middle layers critical infor-
+mation propagates to the last position 3) During the later
+layers the second hop is resolved and the last token now
+encodes the target entity Yoko Ono. We additionally
+illustrate back-patching: patching a hidden representa-
+tion from a later layer back into an earlier layer in order
+to fix cases where the pathway fails.
+and reasoning skills, which have been the focus of
+many recent works (Hou et al., 2023; Brinkmann
+et al., 2024; Yang et al., 2024; Li et al., 2024a;
+Wang et al., 2024; Petty et al., 2024). Besides the
+general interest in compositional skills, the investi-
+gation of latent multi-hop abilities of LLMs would
+also have significant implications for areas such
+as generalization (Lake and Baroni, 2018; Onoe
+et al., 2023) and model editing (Zhong et al., 2023;
+Cohen et al., 2024).
+To strengthen the latent reasoning ability of
+LLMs, it is essential to first understand the inter-
+nal mechanism of how LLMs successfully com-
+plete two-hop queries using latent multi-hop rea-
+soning. While there have been several works that
+investigate such a mechanism, a precise latent rea-
+soning pathway has only been found in relativelyarXiv:2406.12775v2  [cs.CL]  14 Oct 2024small language models trained on synthetic datasets
+(Brinkmann et al., 2024; Li et al., 2024a; Wang
+et al., 2024) and has not been thoroughly investi-
+gated in large pretrained models.
+Throughout this work we consider and compare
+two complementing settings, one where the model
+correctly answers the two-hop query and the other
+when it does not. To this end, in §2, we start
+by creating and publishing a dataset containing
+82,020 two-hop queries based on data from Wiki-
+data (Vrande ˇci´c and Krötzsch, 2014).
+Our approach to analyzing multi-hop reasoning
+begins with the hypothesis that it involves activat-
+ing the same “knowledge-extraction module” twice:
+once for the first hop ( “the performer of Imagine
+is John Lennon” ) and once for the second ( “the
+spouse of John Lennon is Yoko Ono” ). The key
+question we ask in this work is where are these two
+procedures implemented in the LLM. A natural
+way to answer this question is to seek the first point
+in the network where the outputs of these two steps
+appear. The typical approach to this would employ
+vocabulary projections (nostalgebraist, 2020; Geva
+et al., 2021; Sakarvadia et al., 2023; Yang et al.,
+2024; Li et al., 2024a). However, we instead opt for
+a more recent method named Patchscopes (Ghan-
+deharioun et al., 2024) which has clear advantages
+over the commonly used vocabulary projection.
+Using this approach, in §3 we find that the out-
+come of the first hop is clearly evident in the hidden
+representation of the end-token of the first hop. We
+further find that resolving the first hop happens dur-
+ing the early layers, as depicted in Figure 1 (stage
+1). Given the localization of the first hop, in §4
+we then ask where the second hop is resolved. We
+find that it typically appears in the last token of the
+prompt only in layers after the resolution of the first
+hop, as further illustrated in Figure 1 (stage 3).
+These observations suggest a mechanism where
+the first hop is resolved with the answer, that then
+propagates to the last token to resolve the second
+hop (as depicted by stage 2 in Figure 1). We explore
+this propagation in §5. Moreover, they suggest why
+this process may fail — If the two resolutions are
+done by different groups of layers, it must be that
+these two groups are both able to perform knowl-
+edge extraction, be it via their attention or MLP
+sublayers. However, since transformers have a lim-
+ited amount of layers, and their functionality is
+different (Meng et al., 2022; Geva et al., 2023), it is
+quite likely that the layer at which the second hop
+is performed will not have the desired functional-ity. To verify this hypothesis, in §6, we propose an
+analysis method named back-patching . The crux of
+the method involves taking a hidden representation
+from a later layer, patching it back into the same
+position of the same prompt in an earlier layer, and
+then continuing the forward pass. In a way, this
+allows the model more layers to finish the computa-
+tion without the need for additional parameters or
+training (Petty et al., 2024). Unlike previous meth-
+ods (Sakarvadia et al., 2023; Li et al., 2024a), back-
+patching makes no assumption on the structure of
+the prompt and does not require any knowledge of
+the participating entities. Testing back-patching on
+queries initially predicted incorrectly, we find that
+up to 66% of incorrect cases have the potential to
+be correctly predicted using back-patching when
+choosing the optimal source and target layers.
+Overall, our contributions can be summarized as
+follows:
+•We provide a novel dataset of two-hop queries,
+which can serve to systematically study this
+important setting.
+•We employ Patchscopes to inspect entities en-
+coded in hidden representations while process-
+ing two-hop queries.
+•We identify a sequential latent reasoning path-
+way in LLMs, where the first hop query is
+initially resolved into the bridge entity which
+is then used to answer the second hop.
+•We propose an analysis method named back-
+patching, that verifies our results and could ad-
+ditionally be used to improve the performance
+of LLMs on multi-hop question answering.
+We release our code and dataset at https://
+github.com/edenbiran/HoppingTooLate .
+2 Experimental Setup
+2.1 Two-Hop Queries
+We consider facts denoted by a triplet (e, r, e′)
+where eis a source entity (e.g., John Lennon), r
+is a relation (e.g., Spouse) and e′is a target entity
+(e.g., Yoko Ono). These facts can then be con-
+verted to factual statements (e.g., “The spouse of
+John Lennon is Yoko Ono” ) and also into queries
+by omitting e′(e.g., “The spouse of John Lennon
+is ”). We then prompt models with these queries in
+order to test their knowledge and reasoning.We create two-hop queries by composing two
+facts where one’s target entity is the other’s source
+entity. Namely, ((e1, r1, e2)and (e2, r2, e3)). We
+refer to e1as the source entity, e2as the bridge
+entity, and e3as the target entity. For example, the
+two-hop query “The spouse of the performer of
+Imagine is” can be decomposed into (Imagine, Per-
+former, John Lennon) and (John Lennon, Spouse,
+Yoko Ono).
+We further define two tokens of specific inter-
+est: the last token of e11(e.g., “The spouse of the
+performer of Imagine ”) and the last token of the
+whole two-hop prompt (e.g., “The spouse of the
+performer of Imagine is”), which we denote as t1
+andt2, respectively.
+2.2 Dataset
+We create a dataset containing 82,020 two-hop
+queries based on data from Wikidata (Vrande ˇci´c
+and Krötzsch, 2014). First, we sample entities with
+a maximal amount of Wikidata statements from
+a set of predefined Wikidata entity types. These
+entities will act as e2. Second, we use a prede-
+fined set of relations in order to construct the two
+triplets (e1, r1, e2)and (e2, r2, e3). Finally we con-
+vert both triplets into a single natural language
+phrase using manually crafted templates per re-
+lation. We refer to our codebase for further details
+including entity types and relations2.
+We next attempt to filter out cases where no la-
+tent reasoning is performed. Given a two hop query
+((e1, r1, e2),(e2, r2, e3))we test two prompts con-
+structed to detect and filter out cases where the
+model performs reasoning shortcuts (Xu et al.,
+2022; Wang et al., 2023a; Ju et al., 2024). The first
+prompt is the query (("", r1, e2),(e2, r2, e3))(i.e.,
+the query without e1), aimed at filtering out cases
+where the model predicts generally popular entities.
+The second prompt is ((e1,"", e2),(e2, r2, e3))
+(i.e., the query without r1), aimed at filtering out
+cases where the model predicts correctly due to a
+high correlation between e1ande3. For example,
+given the two-hop query “The spouse of the per-
+former of Imagine is” we filter out cases where the
+model predicts Yoko Ono for either “The spouse
+of the performer is” or“The spouse of Imagine
+is”. We perform this filtering for each model using
+greedy decoding creating a per model subset of the
+dataset. Table 1 displays the amount of examples
+left after this filtering process.
+1This token is also the last token of the first hop.
+2All data was retrieved during April 2024.Model Post FilteringCases Tested
+Correct Incorrect
+LLaMA 2 7B 70,625 388 351
+LLaMA 2 13B 70,972 554 413
+LLaMA 3 8B 71,569 379 371
+LLaMA 3 70B 70,334 656 595
+Pythia 6.9B 73,058 173 202
+Pythia 12B 74,056 172 372
+Table 1: The amount of examples post shortcut filtering
+and the final amount used throughout all experiments.
+We are specifically interested in understanding
+the differences between cases where the model
+completes the two-hop query correctly and incor-
+rectly. Therefore we generate two dataset subsets
+per model for these cases accordingly.
+The first subset is made up of cases where the
+model correctly answers both the two-hop query
+and the first hop. For example, given the two-hop
+query “The spouse of the performer of Imagine
+is”, we verify that the model correctly predicts the
+answer Yoko Ono when prompted with the two-
+hop query and additionally correctly predicts John
+Lennon when prompted with the first hop “The
+performer of Imagine is” . We use the latter filter
+to make sure that the model indeed “knows” the
+answer to the first hop. We then randomly sample
+100 examples of each bridge entity type, in order
+to create a more balanced subset (if less than 100
+examples of a specific type exist we take them all).
+The second subset includes cases where the
+model correctly answers both the first and second
+hop in isolation, but fails to answer the full two-hop
+query. As an example for the filtering procedure,
+given the same query above, we verify that the
+model correctly predicts John Lennon for the first
+hop“The performer of Imagine is” and Yoko Ono
+for the second hop “The spouse of John Lennon
+is”, but fails to predict Yoko Ono for the two-hop
+query “The spouse of the performer of Imagine is” .
+We focus on these cases, because we are interested
+in understanding why answering the two-hop query
+fails despite the model “knowing” the two separate
+facts. As we show later, this failure is likely due
+to the first fact being resolved too late. In a sim-
+ilar fashion to the first setting, we then randomly
+sample 50 examples of each bridge entity type (in
+order to keep the correct and incorrect subsets of
+approximately the same size).
+Table 1 reports the amount of examples used in
+experiments by model and setting.2.3 Models
+We analyze the following models: LLaMA 2 7B
+and 13B (Touvron et al., 2023), LLaMA 3 8B and
+70B (Meta AI, 2024), and Pythia 6.9B and 12B
+(Biderman et al., 2023). The 6.9B, 7B and 8B
+models have 32 layers, the 12B model has 36 layers,
+the 13B model has 40 layers, and the 70B model
+has 80 layers.
+3 Localizing First Hop Resolution
+One could imagine several possible ways for a
+model to solve multi-hop queries. One such way
+would be to effectively treat the two-hop query as a
+single relation, enabling the extraction of the final
+answer without the need to recall e2. Despite this,
+if the model truly performs latent reasoning, the
+most intuitive way to do so would start by resolving
+the first hop at some point within the computation.
+In order to localize where this happens, we use
+the Patchscopes analysis method. Our results show
+that the model indeed resolves the first hop during
+the early layers, at the position of t1.
+3.1 Interpreting Hidden Representations
+We use the Patchscopes framework (Ghandehar-
+ioun et al., 2024) to create a task that describes
+the entity encoded in a specific hidden representa-
+tion. Patchscopes maps a given representation to
+a sentence in natural language, thus considerably
+extending vocabulary projections which map to a
+single token (nostalgebraist, 2020).
+The procedure is as follows. First, given a source
+prompt, a source token and a source layer, the
+source prompt is passed through the model’s for-
+ward computation and the hidden representation v
+of the source token at the source layer is recorded.
+This representation vis what we aim to probe in
+search for an encoded entity. Second, we pass
+the same prompt used by Ghandeharioun et al.
+(2024):“Syria: Syria is a country in the
+Middle East, Leonardo DiCaprio: Leonardo
+DiCaprio is an American actor, Samsung:
+Samsung is a South Korean multinational
+corporation, x” through the model, replacing
+the hidden representation of “x”withvat a specific
+target layer. Finally, the forward pass is continued
+and text is generated.
+The chosen target prompt encourages the model
+to generate a continuation that states the seman-
+tic content (i.e., the entity name) encoded in the
+source hidden representation, along with a shortModel Subsete2fromt1e2fromt2e3fromt2
+Cases Layer Cases Layer Cases Layer
+LLaMA 2 Corr. 56% 8 .9 41% 15 .3 73% 16 .2
+7B Incorr. 41% 9 .1 36% 16 .4 47% 17 .5
+LLaMA 2 Corr. 49% 7 .7 34% 18 .2 71% 16 .9
+13B Incorr. 48% 7 .4 37% 17 .9 33% 16 .9
+LLaMA 3 Corr. 46% 8 .9 37% 14 .3 74% 13 .5
+8B Incorr. 46% 11 .9 25% 15 .3 40% 17 .2
+LLaMA 3 Corr. 63% 27 .1 46% 35 .2 86% 30 .7
+70B Incorr. 57% 29 .2 46% 34 .5 50% 35 .9
+Pythia Corr. 75% 5 .4 75% 11 .4 80% 14 .1
+6.9B Incorr. 78% 4 .9 67% 9 .2 65% 13 .6
+Pythia Corr. 73% 5 .0 66% 12 .2 77% 13 .5
+12B Incorr. 61% 6 .3 42% 12 .9 52% 17 .2
+Table 2: The results of Patchscopes executions. The
+table reports the percentage of cases where a target
+entity was successfully decoded from a source position.
+The table additionally reports the mean of the layer
+where the target entity was first successfully decoded.
+description of it. We find this task is better fitting
+than other proposed probes such as vocabulary pro-
+jections (nostalgebraist, 2020; Geva et al., 2022) or
+training linear classifiers on hidden representations
+(Belinkov and Glass, 2019; Belinkov, 2022). This
+is because exhibiting the ability to extract informa-
+tion from a hidden representation gives reason to
+believe that the same information can be extracted
+when answering the two-hop query. In addition
+Patchscopes has the clear advantage of decoding a
+representation into a natural language description.
+3.2 Experiment
+We run Patchscopes on t1, recording the hidden
+representation at each source layer and then patch-
+ing it into all target layers. Following each patch
+we sample three generations. For each source layer
+we check whether one of the generations is of e2,
+and if so, we consider the representation to encode
+the bridge entity at the source layer.
+3.3 Results
+Table 2 presents the percentage of cases where e2
+was observed in the hidden representation of t1.
+We refer to these as cases where e2was success-
+fully resolved. We note the non-trivial percentages
+of 41%-78% across all models and settings. Ad-
+ditionally, we note the general drop in resolved
+cases when the model fails to correctly complete
+the two-hop query, but that this setting still dis-
+plays a surprisingly high success rate. Next, we
+examine the mean layer at which e2first appears/uni00000013 /uni00000018 /uni00000014/uni00000013 /uni00000014/uni00000018 /uni00000015/uni00000013 /uni00000015/uni00000018 /uni00000016/uni00000013 /uni00000016/uni00000018 /uni00000017/uni00000013
+/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055/uni00000013/uni00000014/uni00000015/uni00000016/uni00000017/uni00000018/uni00000019/uni00000033/uni00000048/uni00000055/uni00000046/uni00000048/uni00000051/uni00000057/uni00000044/uni0000004a/uni00000048/uni00000003/uni00000052/uni00000049/uni00000003/uni00000026/uni00000044/uni00000056/uni00000048/uni00000056e2/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t1e3/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t2Figure 2: Percentage of cases per layer where target en-
+tities were first successfully decoded using Patchscopes.
+The percentages are out of all correctly answered cases
+for LLaMA 2 13B.
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+01234567
+Figure 3: Heat-map of the layers where Patchscopes
+successfully decodes e2from the position of t1. The per-
+centages are out of all successful decodings for LLaMA
+2 13B run on correctly answered cases.
+in both correct and incorrect cases. We find that
+in the incorrect cases the resolving generally oc-
+curs at higher layers than those of the correct cases.
+This difference alludes to how early the resolving
+happens potentially playing a part in successfully
+answering two-hop queries. We further verify this
+using the back-patching analysis method in §6.
+Figure 2 displays the proportion of cases per
+layer where e2is first successfully decoded from t1
+using Patchscopes. We observe that the resolving
+occurs almost exclusively during the early layers.
+Interestingly, this implies that the knowledge re-
+quired for this resolution must reside in these ear-
+lier layers. Similar figures for additional models
+are provided in Appendix B. The plot additionally
+shows the curve regarding the resolving of e3from
+t2, which is discussed in §4.This finding can further be seen in Figure 3,
+which displays a heat-map of the layers where
+Patchscopes successfully decodes e2fromt1. Two
+hot-spots are apparent. The first corresponds to
+success cases with an early source layer, showing
+thate2generally appears at this position during the
+early layers. The second hot-spot corresponds to
+later source layers that display success almost ex-
+clusively when patched after the final layer, which
+is roughly equivalent to vocabulary projection (nos-
+talgebraist, 2020). This is a clear advantage of
+Patchscopes, as despite the entity not being among
+the top tokens in the projection during early layers,
+it is in fact encoded in the hidden representation.
+See Appendix C for heat-maps of all models.
+4Second Hop is Resolved at Last Position
+In §3, we observe that the first hop is often resolved
+in position t1. Intuitively, one would expect the
+computation to use this result towards resolving the
+second hop (i.e., the final answer). In this section,
+we study this proposition by finding where e3first
+emerges and how it relates to the first emergence
+ofe2. We find that e3indeed emerges predomi-
+nantly after e2at the position of t2. Furthermore,
+we search for the final part of the pathway, the pre-
+dicted token. By projecting the residual updates
+made by the attention and MLP sublayers on the
+hidden representation of t2, we find that the MLP
+sublayers play the larger part in conjuring the pre-
+dicted token.
+4.1 Method
+Previous works (Geva et al., 2022, 2023) have
+shown that the residual updates made by the MLP
+and attention sublayers can be interpreted by pro-
+jecting them to the vocabulary using the layer norm
+and output embedding matrix. We use this method
+in order to locate specific entities in the flow of
+information by observing the rank of the entity
+in the vocabulary projection. We additionally use
+Patchscopes as presented in §3.
+4.2 Experiment
+We first employ Patchscopes on t2, this time check-
+ing if the target entity e3is encoded at this position.
+Additionally, we project the sublayer updates per-
+formed on t2, and check if the token with the high-
+est probability in the projection is the first token
+of the generated text. If so, we conclude that the
+update of a particular sublayer promotes the final
+prediction.Model SubsetAttention MLP
+Cases Layer Cases Layer
+LLaMA 2 7BCorrect 25.5% 24 .7 33 .2% 25 .2
+Incorrect 14.8% 23 .4 28 .4% 26 .0
+LLaMA 2 13BCorrect 28.8% 32 .0 68 .5% 33 .1
+Incorrect 14.2% 27 .0 51 .5% 31 .7
+LLaMA 3 8BCorrect 9.7% 26 .7 17 .6% 27 .8
+Incorrect 25.3% 27 .4 11 .8% 24 .6
+LLaMA 3 70BCorrect 21.9% 56 .3 48 .1% 68 .0
+Incorrect 21.8% 65 .7 36 .1% 67 .0
+Pythia 6.9BCorrect 11.5% 21 .8 36 .4% 20 .5
+Incorrect 28.2% 23 .4 33 .6% 21 .2
+Pythia 12BCorrect 27.9% 22 .2 38 .9% 22 .4
+Incorrect 43.2% 23 .6 47 .0% 23 .3
+Table 3: Percentages and mean layers where for the first
+time the predicted token is the most probable token in
+the vocabulary projection of the sublayer update.
+4.3 Results
+Table 2 contains the percentage of cases e3was de-
+coded from t2, effectively resolving the second hop.
+As expected, these percentages are high for cases in
+which the model predicted correctly (71%-86%)3
+and low for cases the model predicted incorrectly
+(33%-65%). Additionally, it is apparent from both
+Table 2 and Figure 2 that the target entity is re-
+solved by the mid-upper layers at the position of
+t2. This suggests that the information required to
+perform the second hop exists in the parameters of
+these layers.
+Inspecting the sublayer projections in Table 3,
+we find that the MLP sublayers play a larger role
+in promoting the predicted token compared to
+that of the attention sublayers. Despite this, the
+non negligible percentages achieved by the atten-
+tion sublayers could suggest multiple pathways, in
+agreement with previous work (Geva et al., 2023;
+Merullo et al., 2024) that considered both possi-
+bilities. Looking at the mean layers at which the
+prediction is first promoted, one can see that these
+promotions occur in the upper layers, after the last
+token has been resolved to e3.
+5 Information Propagates to Last Token
+As the model’s prediction is emitted from the last
+position of the prompt, critical information regard-
+ing the bridge entity must propagate to this token.
+By using attention knockout, projection, and Patch-
+scopes, we verify this claim. We find that in a large
+3We attribute the gap from 100% to the approximations
+involved in decoding a hidden representation.majority of cases relevant information can indeed
+be detected passing from t1tot2.
+5.1 Method
+In similar fashion to previous work (Wang et al.,
+2023b; Geva et al., 2023), we block hidden repre-
+sentations from attending to other representations
+at specific layers and test if the model’s final gener-
+ation changes. We perform the knockout by setting
+the mask of the attention from a source to a target
+position at a specific layer to −∞, causing this at-
+tention edge to contribute nothing to the residual
+update performed on the source representation. We
+experiment with blocking a window of layers as
+previous work (Geva et al., 2023) shows that in-
+formation propagation is spread among multiple
+layers.
+We additionally employ Patchscopes and sub-
+layer vocabulary projections, as described in §3
+and §4 respectively.
+5.2 Experiment
+We run attention knockout blocking information
+originating at t1from propagating to t2. We block a
+window of 7 layers in order to capture information
+flowing through multiple layers. If blocking a set
+of layers causes the model to no longer correctly
+predict the answer (in the incorrect setting we check
+for a change in the generated text), we consider
+these layers to contain information critical to the
+prediction.
+We additionally project the updates made by the
+attention and MLP sublayers to the last token, as
+described in §4. In the vocabulary projection we
+check if e2is the token with the highest probability,
+and if so consider the update to “contain” the bridge
+entity.
+Finally, we run Patchscopes on the last token of
+the prompt, as done in §3, checking if e2is encoded
+int2. Each one of these experiments gives a unique
+signal that information must have propagated from
+t1tot2.
+5.3 Results
+Table 4 shows the percentage of cases where we
+detect critical information propagating from t1tot2
+using at least one of the methods stated above. We
+note the relatively high percentages, indicating the
+information indeed flows as expected. Additionally,
+the table shows the that the layers relevant to the
+propagation are mostly the middle layers.Model Subset Detected Mean Layer
+LLaMA 2 7BCorrect 85.82% 12 .83
+Incorrect 95.44% 8 .10
+LLaMA 2 13BCorrect 81.94% 15 .45
+Incorrect 71.11% 16 .99
+LLaMA 3 8BCorrect 78.36% 10 .15
+Incorrect 82.74% 7 .45
+LLaMA 3 70BCorrect 90.39% 29 .14
+Incorrect 94.28% 20 .06
+Pythia 6.9BCorrect 96.53% 11 .94
+Incorrect 95.04% 8 .06
+Pythia 12BCorrect 94.18% 11 .23
+Incorrect 93.81% 9 .28
+Table 4: Percentages and mean layers of cases where
+critical information was first detected propagating from
+t1tot2using attention knockout, projection, or Patch-
+scopes.
+Table 2 contains the percentage of cases e2was
+decoded from t2, showing that this position indeed
+represents the bridge entity in 25%-75% of all
+cases. Comparing between the results of Patch-
+scopes on t2to those on t1, we observe a stark
+difference in the successful source layers. The re-
+sults show that the t2first encodes e2during the
+mid-upper layers, while t1does so in the lower
+layers. This can further be seen in the Patchscopes
+heat-maps in Appendix C. This gives additional
+reason to believe that a sequential computation is
+taking place.
+After describing all major pathway stages, we
+turn to a comparison between the correct and in-
+correct cases and observe the following pattern.
+Generally, in incorrect cases, the entities seem to
+be resolved later while the information seems to
+propagate and be extracted earlier. Figure 4 dis-
+plays this pattern in LLaMA 3 8B, plotting the first
+observed layers of each stage (we refer to Appendix
+D for plots of additional models). This gives evi-
+dence of the importance of how early the first hop
+is resolved.
+6 Back-patching Improves Two-Hop
+Performance
+Our results consistently display a sequential na-
+ture of computation, where the first hop is resolved
+into the bridge entity by the lower layers, which is
+then used to answer the second hop in the upper
+layers. These results suggest that when answering
+two-hop queries fail, it could be because the first-
+hop is resolved at layers that no longer contain the
+/uni00000014/uni00000056/uni00000057/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni0000002c/uni00000051/uni00000049/uni00000052/uni00000003/uni00000033/uni00000055/uni00000052/uni00000053/uni00000044/uni0000004a/uni00000044/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000015/uni00000051/uni00000047/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni00000033/uni00000055/uni00000048/uni00000047/uni0000004c/uni00000046/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000003/uni00000028/uni0000005b/uni00000057/uni00000055/uni00000044/uni00000046/uni00000057/uni00000048/uni00000047/uni00000013/uni00000018/uni00000014/uni00000013/uni00000014/uni00000018/uni00000015/uni00000013/uni00000015/uni00000018/uni00000016/uni00000013/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055
+/uni00000037/uni0000005a/uni00000052/uni00000010/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000034/uni00000058/uni00000048/uni00000055/uni0000005c/uni00000003/uni00000024/uni00000051/uni00000056/uni0000005a/uni00000048/uni00000055
+/uni00000026/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057 /uni0000002c/uni00000051/uni00000046/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057Figure 4: A comparison of the first layers of each stage
+in the pathway between correct and incorrect cases for
+LLaMA 3 8B.
+information needed to resolve the second hop. In
+order to verify this hypothesis, we test the follow-
+ing intriguing conjecture. We know that the earlier
+layers certainly contain knowledge, since they are
+regularly used to resolve the first hop. Then, we
+ask what will happen if we take a hidden represen-
+tation from a later layer and “feed” it into these
+earlier layers. Will the correct information now be
+extracted? As our results next show, this is often
+the case. This “back-patching” analysis thus pro-
+vides strong support that the success in two hop
+queries require the later layers to have the same
+functionality as earlier ones.
+Overall, this could point to an inherent limitation
+of the transformer architecture, where the model
+“runs out” of layers, propagates and extracts infor-
+mation before it is fully resolved, or is forced to
+use only the upper layers for knowledge extraction.
+6.1 Method
+Following our intuition above, we perform the fol-
+lowing back-patching experiment. Given a prompt,
+we first record a hidden representation vfrom a
+source layer ℓs. Then, while rerunning the same
+prompt, we patch vinto the same position at a tar-
+get layer ℓtsuch that ℓt< ℓ s. The forward pass
+then continues and text is generated using greedy
+decoding. This effectively feeds ℓtwith informa-
+tion encoded in vthat originated in ℓs.0 8 16 24 32
+T arget Layer08162432 Source Layer
+012345678(a) Back-patching t1
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+01234567 (b) Back-patching t2
+Figure 5: Heat-map of the layers where back-patching succeeds. The percentages are out of all successful back-
+patching instances for LLaMA 2 13B.
+Model Subset t1 t2
+LLaMA 2 7BCorrect 100% 100%
+Incorrect 41.02% 42 .45%
+LLaMA 2 13BCorrect 100% 100%
+Incorrect 32.44% 36 .07%
+LLaMA 3 8BCorrect 100% 100%
+Incorrect 38.81% 47 .16%
+LLaMA 3 70BCorrect 100% 100%
+Incorrect 57.31% 57 .81%
+Pythia 6.9BCorrect 100% 100%
+Incorrect 66.33% 56 .43%
+Pythia 12BCorrect 100% 100%
+Incorrect 63.17% 61 .82%
+Table 5: Back-patching success rates by setting and
+back-patched token.
+6.2 Experiment
+We perform the back-patching experiment twice,
+once on the token t1and once on the token t2. In
+order to quantify the potential of back-patching,
+we check whether one of the source-target pairs
+resulted in the generation of the correct answer. We
+then perform an analysis of the successful source
+and target layers.
+6.3 Results
+Table 5 presents the back-patching results. First
+we note the high success rates, correctly answering
+between 32%-66% of incorrect cases while keeping
+the correct cases at 100% across models and token
+positions. This means that in many cases rerunning
+specific parts of the computation is enough in order
+to successfully extract the target information. On a
+more practical note, this also shows that significant
+gains can be made by correctly choosing the source
+and target layers, which we leave for future work.One can additionally observe that in LLaMA
+models back-patching t2achieves a higher success
+rate than back-patching t1, which may point at the
+stages related to the last position of the prompt as
+being the more dominant failure point in answering
+two-hop queries. Moreover, this higher success
+rate is achieved despite the fact that back-patching
+t2does not assume any information about the struc-
+ture of the prompt. We believe that this displays an
+additional strength of the method.
+Figure 5a displays the heat-map of the layers
+where back-patching t1succeeds for LLaMA 2
+13B (see Appendix E for additional models). We
+first note the higher success rate when the source
+layers are the model’s lower layers. These lower
+layers correlate to the resolving of the first hop,
+therefore back-patching them allows the model a
+better chance at solving the first hop. Second, we
+note the non existent success rate of the higher
+target layers. Unsurprisingly, in this case the model
+does not gain enough time to correctly complete
+the pathway, resulting in a low success rate.
+Figure 5b displays the heat-map of the layers
+where back-patching t2succeeds for LLaMA 2
+13B. Unlike when back-patching t1, in this case
+the higher success rate can be found in the the up-
+per source layers. These layers correlate to the
+resolving of the second hop at the last token posi-
+tion. Hence, back-patching a hidden representation
+taken from a later layer allows the model a better
+chance at solving the second hop. Furthermore, we
+note the higher success rate in lower target layers.
+This allows the model to gain time to resolve the
+second hop. This also gives the model access to
+parametric knowledge that might only be encoded
+in the lower layers, allowing the model to fully
+utilize its whole knowledge-base.7 Related Work
+Tracing and locating factual knowledge has been
+the focus of many recent works aiming to under-
+cover and control the way transformers make pre-
+dictions. Several of these works are motivated by
+knowledge editing (De Cao et al., 2021; Mitchell
+et al., 2022; Meng et al., 2022; Zhang et al., 2024)
+while others focus on understanding the inner work-
+ings of transformers (Dai et al., 2022; Geva et al.,
+2022, 2023). Our work follows and expands on
+this second group by extending them to the more
+complex case of two-hop queries, which require
+multiple factual knowledge extractions and compo-
+sitions.
+The question whether models can implicitly rea-
+son over stored parametric knowledge has also
+gained recent popularity. One avenue of related
+research includes circuit discovery (Nanda et al.,
+2023; Wang et al., 2023b; Conmy et al., 2023;
+Brinkmann et al., 2024), but these works focus
+mainly on synthetic tasks. More closely related to
+this paper, recent works (Sakarvadia et al., 2023;
+Yang et al., 2024; Li et al., 2024a) have found ex-
+istential evidence of latent reasoning in multi-hop
+queries, albeit without accounting for the flow of
+information throughout layers and positions. In a
+concurrent work by Wang et al. (2024) a multi-hop
+reasoning circuit similar to ours was discovered in
+a small transformer language model trained on syn-
+thetic data until grokking occurs. Our work finds
+further proof of such latent reasoning in a more
+practical setting that includes large language mod-
+els, real world knowledge and a regular pretraining
+setup. We additionally use different mechanistic
+interpretability methods and account for the flow
+of information during the forward pass.
+Even without fully identifying the mechanism
+behind latent reasoning, several works have tried
+to address model’s shortcomings in this area. One
+such work by Sakarvadia et al. (2023) assumes
+prior knowledge of the bridge entity, whose hidden
+representation is then strategically injected directly
+into the computation. Likewise, recent work by Li
+et al. (2024a) also assumes knowledge of the bridge
+entity and then employs knowledge editing tech-
+niques to improve performance, which is known
+to have potentially disruptive effects on models
+(Zhang et al., 2024; Hsueh et al., 2024; Li et al.,
+2024b). Both these previously proposed methods
+have drawbacks, which a potential method based
+on back-patching would not share.8 Conclusion
+Our work uses mechanistic tools to study the latent
+reasoning abilities of LLMs on two hop queries.
+We observe strong evidence of a sequential latent
+reasoning pathway in which the second hop is an-
+swered in the mid-upper layers only after the first
+hop is answered by the lower layers. We find that
+this sequential nature could point to a possible lim-
+itation of transformers, where the second hop must
+be answered using only the knowledge encoded
+in the upper layers. To further validate this, we
+introduce and evaluate an analysis method named
+back-patching, based on extracting hidden repre-
+sentations from later layers and patching them back
+into earlier layers. Finally, we show that back-
+patching significantly improves performance on
+previously incorrect queries. Overall, our methods
+and findings open opportunities for understanding
+and improving latent reasoning in LLMs.
+Limitations
+Several of our experiments rely on mechanistic
+methods that decode hidden representations and
+residual updates in various ways. While these meth-
+ods have been widely used in many recent works
+(Geva et al., 2022, 2023; Dar et al., 2023; Yang
+et al., 2024; Li et al., 2024a), they can only be
+seen as an approximation. However, using multi-
+ple different techniques (such as both Patchscopes
+and sublayer projections) helps alleviate this con-
+cern. Additionally, our experiments are generally
+designed to give positive signals that result in lower
+bound results, hence we believe that these approxi-
+mations do not undermine our findings.
+In this work we study one prominent latent rea-
+soning pathway, although others most likely exist
+(McGrath et al., 2023; Yang et al., 2024). Addition-
+ally, we do not account for all possible parts of the
+discovered pathway (e.g., how the relations come
+in to play). Despite this, by focusing on the most
+relevant components we find sufficient proof for
+our main finding regarding the sequential nature of
+the computation.
+Our work examines only two-hop queries, al-
+though we expect queries with three or more
+hops and even additional unrelated reasoning tasks
+to involve similar mechanisms to those we ob-
+served. This is due to previous (Wang et al., 2023b;
+Brinkmann et al., 2024) and concurrent (Wang
+et al., 2024) works in different (if sometimes small
+or synthetic) settings observing pathways that canbe broken down into concrete computational steps
+that match intuitive reasoning steps. These results
+resemble our finding that two-hop questions are
+broken down and answered sequentially by LLMs.
+We leave such expansion to additional settings for
+future work.
+Despite the promising results of back-patching,
+our current proposed method is not a practical in-
+ference method, as only a subset of back-patches
+generate the correct answer. However, if one could
+efficiently select a subset of source and target lay-
+ers a priori, this could make for a viable method.
+Although we believe that if achieving the best per-
+formance in multi-hop question answering is the
+sole goal, methods such as chain of thought prompt-
+ing (Wei et al., 2022; Press et al., 2023) would be
+far more effective.
+Acknowledgements
+This work was supported by the Tel Aviv University
+Center for AI and Data Science (TAD) and the
+Israeli Science Foundation.
+References
+David Bau. 2024. Baukit.
+Yonatan Belinkov. 2022. Probing classifiers: Promises,
+shortcomings, and advances. Computational Linguis-
+tics, 48(1):207–219.
+Yonatan Belinkov and James Glass. 2019. Analysis
+methods in neural language processing: A survey.
+Transactions of the Association for Computational
+Linguistics , 7:49–72.
+Stella Biderman, Hailey Schoelkopf, Quentin Gregory
+Anthony, Herbie Bradley, Kyle O’Brien, Eric Hal-
+lahan, Mohammad Aflah Khan, Shivanshu Purohit,
+USVSN Sai Prashanth, Edward Raff, et al. 2023.
+Pythia: A suite for analyzing large language mod-
+els across training and scaling. In International
+Conference on Machine Learning , pages 2397–2430.
+PMLR.
+Jannik Brinkmann, Abhay Sheshadri, Victor Levoso,
+Paul Swoboda, and Christian Bartelt. 2024. A mech-
+anistic analysis of a transformer trained on a symbolic
+multi-step reasoning task. In Findings of the Associa-
+tion for Computational Linguistics ACL 2024 , pages
+4082–4102, Bangkok, Thailand and virtual meeting.
+Association for Computational Linguistics.
+Roi Cohen, Eden Biran, Ori Yoran, Amir Globerson,
+and Mor Geva. 2024. Evaluating the ripple effects
+of knowledge editing in language models. Transac-
+tions of the Association for Computational Linguis-
+tics, 12:283–298.Arthur Conmy, Augustine Mavor-Parker, Aengus Lynch,
+Stefan Heimersheim, and Adrià Garriga-Alonso.
+2023. Towards automated circuit discovery for mech-
+anistic interpretability. In Advances in Neural Infor-
+mation Processing Systems , volume 36, pages 16318–
+16352. Curran Associates, Inc.
+Damai Dai, Li Dong, Yaru Hao, Zhifang Sui, Baobao
+Chang, and Furu Wei. 2022. Knowledge neurons in
+pretrained transformers. In Proceedings of the 60th
+Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers) , pages 8493–
+8502, Dublin, Ireland. Association for Computational
+Linguistics.
+Guy Dar, Mor Geva, Ankit Gupta, and Jonathan Berant.
+2023. Analyzing transformers in embedding space.
+InProceedings of the 61st Annual Meeting of the
+Association for Computational Linguistics (Volume 1:
+Long Papers) , pages 16124–16170, Toronto, Canada.
+Association for Computational Linguistics.
+Nicola De Cao, Wilker Aziz, and Ivan Titov. 2021. Edit-
+ing factual knowledge in language models. In Pro-
+ceedings of the 2021 Conference on Empirical Meth-
+ods in Natural Language Processing , pages 6491–
+6506, Online and Punta Cana, Dominican Republic.
+Association for Computational Linguistics.
+Nouha Dziri, Ximing Lu, Melanie Sclar, Xiang (Lor-
+raine) Li, Liwei Jiang, Bill Yuchen Lin, Sean Welleck,
+Peter West, Chandra Bhagavatula, Ronan Le Bras,
+Jena Hwang, Soumya Sanyal, Xiang Ren, Allyson Et-
+tinger, Zaid Harchaoui, and Yejin Choi. 2023. Faith
+and fate: Limits of transformers on compositional-
+ity. In Advances in Neural Information Processing
+Systems , volume 36, pages 70293–70332. Curran As-
+sociates, Inc.
+Mor Geva, Jasmijn Bastings, Katja Filippova, and Amir
+Globerson. 2023. Dissecting recall of factual associa-
+tions in auto-regressive language models. In Proceed-
+ings of the 2023 Conference on Empirical Methods in
+Natural Language Processing , pages 12216–12235,
+Singapore. Association for Computational Linguis-
+tics.
+Mor Geva, Avi Caciularu, Kevin Wang, and Yoav Gold-
+berg. 2022. Transformer feed-forward layers build
+predictions by promoting concepts in the vocabulary
+space. In Proceedings of the 2022 Conference on
+Empirical Methods in Natural Language Process-
+ing, pages 30–45, Abu Dhabi, United Arab Emirates.
+Association for Computational Linguistics.
+Mor Geva, Roei Schuster, Jonathan Berant, and Omer
+Levy. 2021. Transformer feed-forward layers are key-
+value memories. In Proceedings of the 2021 Confer-
+ence on Empirical Methods in Natural Language Pro-
+cessing , pages 5484–5495, Online and Punta Cana,
+Dominican Republic. Association for Computational
+Linguistics.
+Asma Ghandeharioun, Avi Caciularu, Adam Pearce, Lu-
+cas Dixon, and Mor Geva. 2024. Patchscopes: Aunifying framework for inspecting hidden representa-
+tions of language models. In Forty-first International
+Conference on Machine Learning .
+Yifan Hou, Jiaoda Li, Yu Fei, Alessandro Stolfo,
+Wangchunshu Zhou, Guangtao Zeng, Antoine Bosse-
+lut, and Mrinmaya Sachan. 2023. Towards a mech-
+anistic interpretation of multi-step reasoning capa-
+bilities of language models. In Proceedings of the
+2023 Conference on Empirical Methods in Natural
+Language Processing , pages 4902–4919, Singapore.
+Association for Computational Linguistics.
+Cheng-Hsun Hsueh, Paul Kuo-Ming Huang, Tzu-Han
+Lin, Che-Wei Liao, Hung-Chieh Fang, Chao-Wei
+Huang, and Yun-Nung Chen. 2024. Editing the
+mind of giants: An in-depth exploration of pitfalls of
+knowledge editing in large language models. arXiv
+preprint arXiv:2406.01436 .
+Tianjie Ju, Yijin Chen, Xinwei Yuan, Zhuosheng Zhang,
+Wei Du, Yubin Zheng, and Gongshen Liu. 2024. In-
+vestigating multi-hop factual shortcuts in knowledge
+editing of large language models. In Proceedings
+of the 62nd Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers) ,
+pages 8987–9001, Bangkok, Thailand. Association
+for Computational Linguistics.
+Brenden Lake and Marco Baroni. 2018. Generalization
+without systematicity: On the compositional skills
+of sequence-to-sequence recurrent networks. In Pro-
+ceedings of the 35th International Conference on
+Machine Learning , volume 80 of Proceedings of Ma-
+chine Learning Research , pages 2873–2882. PMLR.
+Zhaoyi Li, Gangwei Jiang, Hong Xie, Linqi Song, Defu
+Lian, and Ying Wei. 2024a. Understanding and patch-
+ing compositional reasoning in LLMs. In Findings of
+the Association for Computational Linguistics ACL
+2024 , pages 9668–9688, Bangkok, Thailand and vir-
+tual meeting. Association for Computational Linguis-
+tics.
+Zhoubo Li, Ningyu Zhang, Yunzhi Yao, Mengru Wang,
+Xi Chen, and Huajun Chen. 2024b. Unveiling the pit-
+falls of knowledge editing for large language models.
+InThe Twelfth International Conference on Learning
+Representations .
+Thomas McGrath, Matthew Rahtz, Janos Kramar,
+Vladimir Mikulik, and Shane Legg. 2023. The hy-
+dra effect: Emergent self-repair in language model
+computations. arXiv preprint arXiv:2307.15771 .
+Kevin Meng, David Bau, Alex Andonian, and Yonatan
+Belinkov. 2022. Locating and editing factual asso-
+ciations in gpt. In Advances in Neural Information
+Processing Systems , volume 35, pages 17359–17372.
+Curran Associates, Inc.
+Jack Merullo, Carsten Eickhoff, and Ellie Pavlick. 2024.
+Language models implement simple Word2Vec-style
+vector arithmetic. In Proceedings of the 2024 Con-
+ference of the North American Chapter of the Asso-
+ciation for Computational Linguistics: Human Lan-
+guage Technologies (Volume 1: Long Papers) , pages5030–5047, Mexico City, Mexico. Association for
+Computational Linguistics.
+Meta AI. 2024. Introducing meta llama 3: The most
+capable openly available llm to date.
+Eric Mitchell, Charles Lin, Antoine Bosselut, Chelsea
+Finn, and Christopher D Manning. 2022. Fast model
+editing at scale. In International Conference on
+Learning Representations .
+Neel Nanda, Lawrence Chan, Tom Lieberum, Jess
+Smith, and Jacob Steinhardt. 2023. Progress mea-
+sures for grokking via mechanistic interpretability. In
+The Eleventh International Conference on Learning
+Representations .
+nostalgebraist. 2020. interpreting gpt: the logit lens.
+Yasumasa Onoe, Michael Zhang, Shankar Padmanab-
+han, Greg Durrett, and Eunsol Choi. 2023. Can LMs
+learn new entities from descriptions? challenges in
+propagating injected knowledge. In Proceedings
+of the 61st Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers) ,
+pages 5469–5485, Toronto, Canada. Association for
+Computational Linguistics.
+Jackson Petty, Sjoerd Steenkiste, Ishita Dasgupta, Fei
+Sha, Dan Garrette, and Tal Linzen. 2024. The impact
+of depth on compositional generalization in trans-
+former language models. In Proceedings of the 2024
+Conference of the North American Chapter of the
+Association for Computational Linguistics: Human
+Language Technologies (Volume 1: Long Papers) ,
+pages 7239–7252, Mexico City, Mexico. Association
+for Computational Linguistics.
+Ofir Press, Muru Zhang, Sewon Min, Ludwig Schmidt,
+Noah Smith, and Mike Lewis. 2023. Measuring and
+narrowing the compositionality gap in language mod-
+els. In Findings of the Association for Computational
+Linguistics: EMNLP 2023 , pages 5687–5711, Singa-
+pore. Association for Computational Linguistics.
+Mansi Sakarvadia, Aswathy Ajith, Arham Khan, Daniel
+Grzenda, Nathaniel Hudson, André Bauer, Kyle
+Chard, and Ian Foster. 2023. Memory injections:
+Correcting multi-hop reasoning failures during in-
+ference in transformer-based language models. In
+Proceedings of the 6th BlackboxNLP Workshop: An-
+alyzing and Interpreting Neural Networks for NLP ,
+pages 342–356, Singapore. Association for Compu-
+tational Linguistics.
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Al-
+bert, Amjad Almahairi, Yasmine Babaei, Nikolay
+Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti
+Bhosale, et al. 2023. Llama 2: Open founda-
+tion and fine-tuned chat models. arXiv preprint
+arXiv:2307.09288 .
+Denny Vrande ˇci´c and Markus Krötzsch. 2014. Wiki-
+data: a free collaborative knowledgebase. Commun.
+ACM , 57(10):78–85.Boshi Wang, Xiang Yue, Yu Su, and Huan Sun. 2024.
+Grokked transformers are implicit reasoners: A mech-
+anistic journey to the edge of generalization. arXiv
+preprint arXiv:2405.15071 .
+Fei Wang, Wenjie Mo, Yiwei Wang, Wenxuan Zhou,
+and Muhao Chen. 2023a. A causal view of entity
+bias in (large) language models. In Findings of the
+Association for Computational Linguistics: EMNLP
+2023 , pages 15173–15184, Singapore. Association
+for Computational Linguistics.
+Kevin Ro Wang, Alexandre Variengien, Arthur Conmy,
+Buck Shlegeris, and Jacob Steinhardt. 2023b. Inter-
+pretability in the wild: a circuit for indirect object
+identification in GPT-2 small. In The Eleventh Inter-
+national Conference on Learning Representations .
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten
+Bosma, brian ichter, Fei Xia, Ed H. Chi, Quoc V Le,
+and Denny Zhou. 2022. Chain of thought prompt-
+ing elicits reasoning in large language models. In
+Advances in Neural Information Processing Systems .
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien
+Chaumond, Clement Delangue, Anthony Moi, Pier-
+ric Cistac, Tim Rault, Remi Louf, Morgan Funtow-
+icz, Joe Davison, Sam Shleifer, Patrick von Platen,
+Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu,
+Teven Le Scao, Sylvain Gugger, Mariama Drame,
+Quentin Lhoest, and Alexander Rush. 2020. Trans-
+formers: State-of-the-art natural language processing.
+InProceedings of the 2020 Conference on Empirical
+Methods in Natural Language Processing: System
+Demonstrations , pages 38–45, Online. Association
+for Computational Linguistics.
+Nan Xu, Fei Wang, Bangzheng Li, Mingtao Dong, and
+Muhao Chen. 2022. Does your model classify en-
+tities reasonably? diagnosing and mitigating spuri-
+ous correlations in entity typing. In Proceedings of
+the 2022 Conference on Empirical Methods in Nat-
+ural Language Processing , pages 8642–8658, Abu
+Dhabi, United Arab Emirates. Association for Com-
+putational Linguistics.
+Sohee Yang, Elena Gribovskaya, Nora Kassner, Mor
+Geva, and Sebastian Riedel. 2024. Do large language
+models latently perform multi-hop reasoning? In
+Proceedings of the 62nd Annual Meeting of the As-
+sociation for Computational Linguistics (Volume 1:
+Long Papers) , pages 10210–10229, Bangkok, Thai-
+land. Association for Computational Linguistics.
+Ningyu Zhang, Yunzhi Yao, Bozhong Tian, Peng Wang,
+Shumin Deng, Mengru Wang, Zekun Xi, Shengyu
+Mao, Jintian Zhang, Yuansheng Ni, et al. 2024. A
+comprehensive study of knowledge editing for large
+language models. arXiv preprint arXiv:2401.01286 .
+Zexuan Zhong, Zhengxuan Wu, Christopher Manning,
+Christopher Potts, and Danqi Chen. 2023. MQuAKE:
+Assessing knowledge editing in language models via
+multi-hop questions. In Proceedings of the 2023Conference on Empirical Methods in Natural Lan-
+guage Processing , pages 15686–15702, Singapore.
+Association for Computational Linguistics.
+A Technical Details
+We use the Baukit library (Bau, 2024) for several
+of the experiments. Each experiment was run on
+1-4 A100 or H100 GPUs and lasted at most 24
+hours. The models were retrieved and run using
+the HuggingFace Transformers library (Wolf et al.,
+2020). When generating with sampling we use the
+default parameters from the Transformers library.
+We use half precision for the 70B model and full
+precision for all other models.
+B Patchscopes First Decoded Layers
+Figure 6 depicts the percentage of cases per layer
+where target entities were first successfully de-
+coded using Patchscopes for all models (as de-
+scribed in §3).
+C Patchscopes Heat-maps
+Figures 7 and 8 depict the heat-maps of Patchscope
+success cases as introduced in §3. We report Patch-
+scope experiments for decoding e2fromt1,e2from
+t2, ande3fromt2for all models.
+D First Observed Layers of Pathway
+Stages
+Figure 9 depicts a comparison of the first layers of
+each stage in the observed pathway between correct
+and incorrect cases (as shown in §5) for all models.
+E Back-patching Heat-maps
+Figures 10 and 11 depict the back-patching heap-
+maps of successful source and target layers (as
+shown in §6) for all models./uni00000013 /uni00000018 /uni00000014/uni00000013 /uni00000014/uni00000018 /uni00000015/uni00000013 /uni00000015/uni00000018 /uni00000016/uni00000013
+/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055/uni00000013/uni00000015/uni00000017/uni00000019/uni0000001b/uni00000014/uni00000013/uni00000033/uni00000048/uni00000055/uni00000046/uni00000048/uni00000051/uni00000057/uni00000044/uni0000004a/uni00000048/uni00000003/uni00000052/uni00000049/uni00000003/uni00000026/uni00000044/uni00000056/uni00000048/uni00000056e2/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t1e3/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t2(a) LLaMA 2 7B
+/uni00000013 /uni00000018 /uni00000014/uni00000013 /uni00000014/uni00000018 /uni00000015/uni00000013 /uni00000015/uni00000018 /uni00000016/uni00000013 /uni00000016/uni00000018 /uni00000017/uni00000013
+/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055/uni00000013/uni00000014/uni00000015/uni00000016/uni00000017/uni00000018/uni00000019/uni00000033/uni00000048/uni00000055/uni00000046/uni00000048/uni00000051/uni00000057/uni00000044/uni0000004a/uni00000048/uni00000003/uni00000052/uni00000049/uni00000003/uni00000026/uni00000044/uni00000056/uni00000048/uni00000056e2/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t1e3/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t2 (b) LLaMA 2 13B
+/uni00000013 /uni00000018 /uni00000014/uni00000013 /uni00000014/uni00000018 /uni00000015/uni00000013 /uni00000015/uni00000018 /uni00000016/uni00000013
+/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055/uni00000013/uni00000014/uni00000015/uni00000016/uni00000017/uni00000018/uni00000019/uni0000001a/uni00000033/uni00000048/uni00000055/uni00000046/uni00000048/uni00000051/uni00000057/uni00000044/uni0000004a/uni00000048/uni00000003/uni00000052/uni00000049/uni00000003/uni00000026/uni00000044/uni00000056/uni00000048/uni00000056e2/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t1e3/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t2
+(c) LLaMA 3 8B
+/uni00000013 /uni00000014/uni00000013 /uni00000015/uni00000013 /uni00000016/uni00000013 /uni00000017/uni00000013 /uni00000018/uni00000013 /uni00000019/uni00000013 /uni0000001a/uni00000013 /uni0000001b/uni00000013
+/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055/uni00000013/uni00000014/uni00000015/uni00000016/uni00000017/uni00000018/uni00000019/uni0000001a/uni0000001b/uni00000033/uni00000048/uni00000055/uni00000046/uni00000048/uni00000051/uni00000057/uni00000044/uni0000004a/uni00000048/uni00000003/uni00000052/uni00000049/uni00000003/uni00000026/uni00000044/uni00000056/uni00000048/uni00000056e2/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t1e3/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t2 (d) LLaMA 3 70B
+/uni00000013 /uni00000018 /uni00000014/uni00000013 /uni00000014/uni00000018 /uni00000015/uni00000013 /uni00000015/uni00000018 /uni00000016/uni00000013
+/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055/uni00000013/uni00000015/uni00000017/uni00000019/uni0000001b/uni00000014/uni00000013/uni00000014/uni00000015/uni00000033/uni00000048/uni00000055/uni00000046/uni00000048/uni00000051/uni00000057/uni00000044/uni0000004a/uni00000048/uni00000003/uni00000052/uni00000049/uni00000003/uni00000026/uni00000044/uni00000056/uni00000048/uni00000056e2/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t1e3/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t2
+(e) Pythia 6.9B
+/uni00000013 /uni00000018 /uni00000014/uni00000013 /uni00000014/uni00000018 /uni00000015/uni00000013 /uni00000015/uni00000018 /uni00000016/uni00000013 /uni00000016/uni00000018
+/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055/uni00000013/uni00000015/uni00000017/uni00000019/uni0000001b/uni00000033/uni00000048/uni00000055/uni00000046/uni00000048/uni00000051/uni00000057/uni00000044/uni0000004a/uni00000048/uni00000003/uni00000052/uni00000049/uni00000003/uni00000026/uni00000044/uni00000056/uni00000048/uni00000056e2/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t1e3/uni00000003/uni00000047/uni00000048/uni00000046/uni00000052/uni00000047/uni00000048/uni00000047/uni00000003/uni00000049/uni00000055/uni00000052/uni00000050/uni00000003t2 (f) Pythia 12B
+Figure 6: Percentage of cases per layer where target entities were first successfully decoded using Patchscopes.0 8 16 24
+T arget Layer081624 Source Layer
+012345678(a)e2decoded from t1, LLaMA 2 7B
+0 8 16 24
+T arget Layer081624 Source Layer
+02468 (b)e2decoded from t2, LLaMA 2 7B
+0 8 16 24
+T arget Layer081624 Source Layer
+0510152025 (c)e3decoded from t2, LLaMA 2 7B
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+01234567
+(d)e2decoded from t1, LLaMA 2 13B
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+01234567 (e)e2decoded from t2, LLaMA 2 13B
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+05101520 (f)e3decoded from t2, LLaMA 2 13B
+0 8 16 24
+T arget Layer081624 Source Layer
+012345
+(g)e2decoded from t1, LLaMA 3 8B
+0 8 16 24
+T arget Layer081624 Source Layer
+0246810 (h)e2decoded from t2, LLaMA 3 8B
+0 8 16 24
+T arget Layer081624 Source Layer
+0510152025 (i)e3decoded from t2, LLaMA 3 8B
+081624324048566472
+T arget Layer081624324048566472 Source Layer
+02468
+(j)e2decoded from t1, LLaMA 3 70B
+081624324048566472
+T arget Layer081624324048566472 Source Layer
+02468 (k)e2decoded from t2, LLaMA 3 70B
+081624324048566472
+T arget Layer081624324048566472 Source Layer
+051015202530 (l)e3decoded from t2, LLaMA 3 70B
+Figure 7: Patchscopes success heat-maps for LLaMA models.0 8 16 24
+T arget Layer081624 Source Layer
+012345(a)e2decoded from t1, Pythia 6.9B
+0 8 16 24
+T arget Layer081624 Source Layer
+01234567 (b)e2decoded from t2, Pythia 6.9B
+0 8 16 24
+T arget Layer081624 Source Layer
+0246810121416 (c)e3decoded from t2, Pythia 6.9B
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+02468
+(d)e2decoded from t1, Pythia 12B
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+024681012 (e)e2decoded from t2, Pythia 12B
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+025710121517 (f)e3decoded from t2, Pythia 12B
+Figure 8: Patchscopes success heat-maps for Pythia models./uni00000014/uni00000056/uni00000057/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni0000002c/uni00000051/uni00000049/uni00000052/uni00000003/uni00000033/uni00000055/uni00000052/uni00000053/uni00000044/uni0000004a/uni00000044/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000015/uni00000051/uni00000047/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni00000033/uni00000055/uni00000048/uni00000047/uni0000004c/uni00000046/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000003/uni00000028/uni0000005b/uni00000057/uni00000055/uni00000044/uni00000046/uni00000057/uni00000048/uni00000047/uni00000013/uni00000018/uni00000014/uni00000013/uni00000014/uni00000018/uni00000015/uni00000013/uni00000015/uni00000018/uni00000016/uni00000013/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055
+/uni00000037/uni0000005a/uni00000052/uni00000010/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000034/uni00000058/uni00000048/uni00000055/uni0000005c/uni00000003/uni00000024/uni00000051/uni00000056/uni0000005a/uni00000048/uni00000055
+/uni00000026/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057 /uni0000002c/uni00000051/uni00000046/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057(a) LLaMA 2 7B
+/uni00000014/uni00000056/uni00000057/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni0000002c/uni00000051/uni00000049/uni00000052/uni00000003/uni00000033/uni00000055/uni00000052/uni00000053/uni00000044/uni0000004a/uni00000044/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000015/uni00000051/uni00000047/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni00000033/uni00000055/uni00000048/uni00000047/uni0000004c/uni00000046/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000003/uni00000028/uni0000005b/uni00000057/uni00000055/uni00000044/uni00000046/uni00000057/uni00000048/uni00000047/uni00000013/uni00000018/uni00000014/uni00000013/uni00000014/uni00000018/uni00000015/uni00000013/uni00000015/uni00000018/uni00000016/uni00000013/uni00000016/uni00000018/uni00000017/uni00000013/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055
+/uni00000037/uni0000005a/uni00000052/uni00000010/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000034/uni00000058/uni00000048/uni00000055/uni0000005c/uni00000003/uni00000024/uni00000051/uni00000056/uni0000005a/uni00000048/uni00000055
+/uni00000026/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057 /uni0000002c/uni00000051/uni00000046/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057 (b) LLaMA 2 13B
+/uni00000014/uni00000056/uni00000057/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni0000002c/uni00000051/uni00000049/uni00000052/uni00000003/uni00000033/uni00000055/uni00000052/uni00000053/uni00000044/uni0000004a/uni00000044/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000015/uni00000051/uni00000047/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni00000033/uni00000055/uni00000048/uni00000047/uni0000004c/uni00000046/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000003/uni00000028/uni0000005b/uni00000057/uni00000055/uni00000044/uni00000046/uni00000057/uni00000048/uni00000047/uni00000013/uni00000018/uni00000014/uni00000013/uni00000014/uni00000018/uni00000015/uni00000013/uni00000015/uni00000018/uni00000016/uni00000013/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055
+/uni00000037/uni0000005a/uni00000052/uni00000010/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000034/uni00000058/uni00000048/uni00000055/uni0000005c/uni00000003/uni00000024/uni00000051/uni00000056/uni0000005a/uni00000048/uni00000055
+/uni00000026/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057 /uni0000002c/uni00000051/uni00000046/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057
+(c) LLaMA 3 8B
+/uni00000014/uni00000056/uni00000057/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni0000002c/uni00000051/uni00000049/uni00000052/uni00000003/uni00000033/uni00000055/uni00000052/uni00000053/uni00000044/uni0000004a/uni00000044/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000015/uni00000051/uni00000047/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni00000033/uni00000055/uni00000048/uni00000047/uni0000004c/uni00000046/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000003/uni00000028/uni0000005b/uni00000057/uni00000055/uni00000044/uni00000046/uni00000057/uni00000048/uni00000047/uni00000013/uni00000014/uni00000013/uni00000015/uni00000013/uni00000016/uni00000013/uni00000017/uni00000013/uni00000018/uni00000013/uni00000019/uni00000013/uni0000001a/uni00000013/uni0000001b/uni00000013/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055
+/uni00000037/uni0000005a/uni00000052/uni00000010/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000034/uni00000058/uni00000048/uni00000055/uni0000005c/uni00000003/uni00000024/uni00000051/uni00000056/uni0000005a/uni00000048/uni00000055
+/uni00000026/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057 /uni0000002c/uni00000051/uni00000046/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057 (d) LLaMA 3 70B
+/uni00000014/uni00000056/uni00000057/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni0000002c/uni00000051/uni00000049/uni00000052/uni00000003/uni00000033/uni00000055/uni00000052/uni00000053/uni00000044/uni0000004a/uni00000044/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000015/uni00000051/uni00000047/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni00000033/uni00000055/uni00000048/uni00000047/uni0000004c/uni00000046/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000003/uni00000028/uni0000005b/uni00000057/uni00000055/uni00000044/uni00000046/uni00000057/uni00000048/uni00000047/uni00000013/uni00000018/uni00000014/uni00000013/uni00000014/uni00000018/uni00000015/uni00000013/uni00000015/uni00000018/uni00000016/uni00000013/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055
+/uni00000037/uni0000005a/uni00000052/uni00000010/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000034/uni00000058/uni00000048/uni00000055/uni0000005c/uni00000003/uni00000024/uni00000051/uni00000056/uni0000005a/uni00000048/uni00000055
+/uni00000026/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057 /uni0000002c/uni00000051/uni00000046/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057
+(e) Pythia 6.9B
+/uni00000014/uni00000056/uni00000057/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni0000002c/uni00000051/uni00000049/uni00000052/uni00000003/uni00000033/uni00000055/uni00000052/uni00000053/uni00000044/uni0000004a/uni00000044/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000015/uni00000051/uni00000047/uni00000003/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000035/uni00000048/uni00000056/uni00000052/uni0000004f/uni00000059/uni00000048/uni00000047/uni00000033/uni00000055/uni00000048/uni00000047/uni0000004c/uni00000046/uni00000057/uni0000004c/uni00000052/uni00000051/uni00000003/uni00000028/uni0000005b/uni00000057/uni00000055/uni00000044/uni00000046/uni00000057/uni00000048/uni00000047/uni00000013/uni00000018/uni00000014/uni00000013/uni00000014/uni00000018/uni00000015/uni00000013/uni00000015/uni00000018/uni00000016/uni00000013/uni00000016/uni00000018/uni0000002f/uni00000044/uni0000005c/uni00000048/uni00000055
+/uni00000037/uni0000005a/uni00000052/uni00000010/uni0000002b/uni00000052/uni00000053/uni00000003/uni00000034/uni00000058/uni00000048/uni00000055/uni0000005c/uni00000003/uni00000024/uni00000051/uni00000056/uni0000005a/uni00000048/uni00000055
+/uni00000026/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057 /uni0000002c/uni00000051/uni00000046/uni00000052/uni00000055/uni00000055/uni00000048/uni00000046/uni00000057 (f) Pythia 12B
+Figure 9: A comparison of the first layers of each pathway stage between correct and incorrect cases for all models.0 8 16 24
+T arget Layer081624 Source Layer
+0246810(a) Source token is t1, LLaMA 2 7B
+0 8 16 24
+T arget Layer081624 Source Layer
+0246810 (b) Source token is t2, LLaMA 2 7B
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+012345678
+(c) Source token is t1, LLaMA 2 13B
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+01234567 (d) Source token is t2, LLaMA 2 13B
+0 8 16 24
+T arget Layer081624 Source Layer
+012345678
+(e) Source token is t1, LLaMA 3 8B
+0 8 16 24
+T arget Layer081624 Source Layer
+024681012 (f) Source token is t2, LLaMA 3 8B
+081624324048566472
+T arget Layer081624324048566472 Source Layer
+024681012
+(g) Source token is t1, LLaMA 3 70B
+081624324048566472
+T arget Layer081624324048566472 Source Layer
+02468101214 (h) Source token is t2, LLaMA 3 70B
+Figure 10: Back-patching heat-maps of successful source and target layers for LLaMA models.0 8 16 24
+T arget Layer081624 Source Layer
+02571012151720(a) Source token is t1, Pythia 6.9B
+0 8 16 24
+T arget Layer081624 Source Layer
+024681012 (b) Source token is t2, Pythia 6.9B
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+02468
+(c) Source token is t1, Pythia 12B
+0 8 16 24 32
+T arget Layer08162432 Source Layer
+0246810 (d) Source token is t2, Pythia 12B
+Figure 11: Back-patching heat-maps of successful source and target layers for Pythia models.

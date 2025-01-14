@@ -1,0 +1,893 @@
+Resource-Efﬁcient Transformer Pruning for Finetuning of Large Models
+Fatih Ilhan1, Gong Su2, Selim Furkan Tekin1, Tiansheng Huang1, Sihao Hu1, Ling Liu1
+1Georgia Institute of Technology, Atlanta, GA
+2IBM Research, Yorktown Heights, NY
+{filhan, stekin6, thuang, sihaohu}@gatech.edu, gongsu@us.ibm.com, ling.liu@cc.gatech.edu
+Abstract
+With the recent advances in vision transformers and
+large language models (LLMs),ﬁnetuning costly large mod-
+els on downstream learning tasks poses signiﬁcant chal-
+lenges under limited computational resources. This pa-
+per presents a REsource and ComputAtion-efﬁcient Prun-
+ing framework (RECAP) for theﬁnetuning of transformer-
+based large models. RECAP by design bridges the gap
+between efﬁciency and performance through an iterative
+process cycling between pruning,ﬁnetuning, and updat-
+ing stages to explore different chunks of the given large-
+scale model. At each iteration, weﬁrst prune the model
+with Taylor-approximation-based importance estimation
+and then only update a subset of the pruned model weights
+based on the Fisher-information criterion. In this way, RE-
+CAP achieves two synergistic and yet conﬂicting goals: re-
+ducing the GPU memory footprint while maintaining model
+performance, unlike most existing pruning methods that re-
+quire the model to beﬁnetuned beforehand for better preser-
+vation of model performance. We perform extensive exper-
+iments with a wide range of large transformer-based archi-
+tectures on various computer vision and natural language
+understanding tasks. Compared to recent pruning tech-
+niques, we demonstrate that RECAP offers signiﬁcant im-
+provements in GPU memory efﬁciency, capable of reducing
+the footprint by up to 65%.
+1. Introduction
+Transformer-based neural network architectures have
+shown remarkable performance in a wide range of ar-
+eas, e.g., computer vision, natural language understanding
+(NLU), and multi-modal tasks. Notably, vision transform-
+ers (ViTs) [ 11] and variants such as DINO [ 3,30], Mask-
+Former [ 5,6], and CLIP [ 32] have demonstrated excep-
+tional performance across various tasks from image recog-
+nition, semantic segmentation, to object detection. Like-
+wise, BERT [ 10], GPT [ 31], and T5 [ 33] are dominating
+transformer-based architectures for many popular large lan-guage models (LLMs) [ 2,36]. These models are usually
+pre-trained over a combination of very large datasets and
+serve as a foundation model for a variety of tasks. Before
+deployment, these pre-trained large models (PLMs) can be
+ﬁnetuned further on a downstream task/dataset to maximize
+the task-speciﬁc model performance.
+Problem Statement.Over-parameterization with a large
+number of parameters and using big datasets in the train-
+ing of a foundation model is known to result in signiﬁcantly
+better generalization performance [ 29]. The PLMs trained
+on billions of tokens result in very large models of billions
+of parameters and can require hundreds of GBs of GPU
+memory forﬁnetuning and inference. For example, a re-
+cent open-source family of LLMs, LLama-2 [ 36] reports
+the following statistics for the largest model variant with
+70B parameters: 2T tokens for∼1.7M GPU hours with
+A100-80GB GPUs, which can cost around∼$6.7M. There-
+fore,ﬁnetuning such PLMs on downstream tasks instead of
+training from scratch has become a common practice. How-
+ever, employing such models may be overindulging when
+tackling downstream tasks. Even the smallest variant of
+LLama-2 with 7B parameters requires∼14GB GPU mem-
+ory for inference and even more (∼70GB) forﬁnetuning at
+16-bit precision. Effectivelyﬁnetuning a PLM with limited
+resources while maintaining performance remains an open
+challenge. This problem can be aggravated when the GPU
+resources are insufﬁcient to performﬁnetuning on the origi-
+nal model, makingﬁnetuning impossible for many. Further-
+more, when users need toﬁnetune a PLM over their propri-
+etary or privacy-sensitive data (e.g., medical data, personal
+chats, or conﬁdential documents), this process should only
+be executed in local computing environments without shar-
+ing sensitive data.
+To reduce the GPU memory footprint ofﬁnetuning large
+transformer-based models, pruning [ 12,16] emerges as a
+promising technique due to its success in convolutional
+and transformer-based models, particularly to increase in-
+ference efﬁciency. Pruning is based on the argument that
+not all weights of the pre-trained large model are neces-
+sary for a given downstream task. Hence, pruning solutions
+This CVPR paper is the Open Access version, provided by the Computer Vision Foundation.
+Except for this watermark, it is identical to the accepted version;
+the final published version of the proceedings is available on IEEE Xplore.
+16206
+estimate the importance of weights for theﬁnetuning task
+and prune out the least important weights by the system-
+supplied sparsity ratio. However, representative pruning
+techniques [ 12,16,27] perform better when they are ap-
+plied afterﬁnetuning (post-ﬁnetune pruning) because pre-
+ﬁnetune pruning may yield suboptimal results by remov-
+ing important parameters for theﬁnetuning task. Therefore,
+many existing approaches suffer from low resources during
+ﬁnetuning.
+Contribution and Scope.We introduce RECAP, a RE-
+source and ComputAtion-efﬁcient Pruning framework to
+achieve two seemingly conﬂicting goals: reducing the GPU
+memory footprint duringﬁnetuning while maintaining the
+ﬁnetuned model performance. RECAP jointly utilizes the
+CPU and GPU toﬁnetune the pre-trained large model in a
+resource-efﬁcient manner. We use CPU resources for less
+intensive and low-frequency computations that require ac-
+cess to the full model and resort to GPU for more inten-
+sive and high-frequency computations during theﬁnetun-
+ing process.First, RECAP explores different chunks of the
+given large-scale model through an iterative CPU-GPU col-
+laboration cycling between pruning,ﬁnetuning, and updat-
+ing stages. At each iteration, weﬁrst prune the model with
+Taylor-approximation-based importance estimation. Then,
+we upload the pruned model to the GPU, and afterﬁnetun-
+ing, we transfer the updated weights to the CPU.Second, we
+generate aﬁnetuning mask controlled by Fisher informa-
+tion, which determines the subset of the pruned model that
+should be updated duringﬁnetuning. This prevents early
+saturation in the exploration process and further reduces the
+GPU memory footprint of gradients and optimizer states.
+By iterativelyﬁnetuning various chunks of the full
+model, while being administrated by the CPU on which
+part of the model to operate on and which weights to up-
+date, RECAP only loads andﬁnetunes a selective portion
+of the weights on GPU in each iteration. In this way, un-
+like existing pruning methods that require the model to be
+ﬁnetuned beforehand for better preservation of model accu-
+racy [ 16,27], RECAP can achieve high performance with
+signiﬁcantly less GPU memory footprint. Extensive ex-
+periments are conducted on a range of large transformer-
+based architectures and various computer vision and natu-
+ral language understanding tasks. Compared to recent large
+model pruning techniques, RECAP signiﬁcantly improves
+the GPU memory efﬁciency (reducing the footprint by up
+to 65%), while maintaining competitive model quality. We
+also analyze the impact of design components and behavior
+under various pruning ratios.
+2. Related Work
+Among the representative efﬁcientﬁnetuning techniques,
+quantization of neural networks reduces the number of bits
+used to represent the model weights and enables low-bit-matrix multiplications. A major challenge is the loss of
+information, especially in the existence of outlier values
+in model weights [ 9]. In addition, quantization is not
+task-aware and the practical improvements are hardware-
+dependent. Several studies [ 24,25] applied quantization for
+vision transformers but these methods are limited to post-
+training for reducing the model size for inference-stage de-
+ployment. Adapter-based solutions [ 19] represent another
+type of efﬁciency technique, where a set of trainable pa-
+rameters into the pre-trained models is injected andﬁne-
+tuned while keeping the backboneﬁxed. Several variants,
+such as multi-task adapters [ 26], LoRA [ 20], and vision
+transformer adapters [ 4] have been proposed. Adapters re-
+duce the memory footprint of gradients and optimizer states.
+However, memory footprint reduction remains limited since
+the full model weights have to be loaded on GPU during
+ﬁnetuning. Neural architecture search methods on train-
+ing super networks have also been explored [ 14], targeting
+similar problems. Lastly, VPT [ 21] applies prompt tuning
+on vision transformers by attaching learnable preﬁx vectors
+to inputs at each layer and keeping model weights frozen.
+Even though this method is parameter-efﬁcient, memory
+efﬁciency is limited due to signiﬁcantly longer input se-
+quences at each layer.
+Model pruning reduces the model size by pruning out
+certain parameters based on an importance criterion, such as
+weight magnitude [ 12,16], weight change [ 23,34] or output
+change [ 28,39], until a desired pruning rate is achieved. Re-
+cent research [ 28,40] reports that pruning yields better re-
+sults if executed afterﬁnetuning (post-ﬁnetune) [ 12,13,28]
+compared to the conventional scenarios where the pruning
+is applied beforeﬁnetuning (pre-ﬁnetune) [ 16,23]. Some
+studies [ 39] advocate eliminating the requirement ofﬁne-
+tuning after pruning but still require full modelﬁnetuning
+as theﬁrst step. Most existing pruning techniques involve
+ﬁnetuning the full modelﬁrst, which is not suitable for very
+large transformer models under limited GPU memory. As a
+result, conventional pruning techniques still require loading
+andﬁnetuning the full model on GPU for best results, which
+limits their applicability in practice. Our approach does not
+have the resource bottleneck required by theﬁnetuning of
+the full model because RECAP iteratively explores and par-
+tiallyﬁnetunes the smaller subnetworks of the full model,
+therefore signiﬁcantly reducing the GPU memory footprint
+throughoutﬁnetuning while preserving model performance.
+3. Methodology
+The design of RECAP is motivated by the limitations of pre-
+ﬁnetune pruning and post-ﬁnetune pruning. The formerﬁrst
+prunes the full model, and thenﬁnetunes the pruned model
+on GPU. The main limitation is the inability to incorporate
+the critical information related to the downstream task dur-
+ing pruning, and thus suboptimal pruning of important pa-
+16207
+Figure 1. System architecture of RECAP. Components in blue are done on CPU, and those in green are done on GPU.
+rameters of the model. In contrast, the post-ﬁnetune pruning
+methods conductﬁnetuning both before and after pruning,
+i.e., the full model isﬁrstﬁnetuned on GPU followed by
+pruning to obtain the pruned model, and then the pruned
+model isﬁnetuned again on GPU. This method can produce
+a high-quality model at the cost of loading andﬁnetuning
+the full model on GPU. Unlike pre-ﬁnetune pruning and
+post-ﬁnetune pruning, RECAP introduces a new approach
+to enable efﬁcient pruning duringﬁnetuning. In RECAP,
+we iterativelyﬁnetune various chunks of the full model to
+maintain a high quality in theﬁnetuned pruned model with-
+out requiring loading and operating on the full model on
+GPU. To this end, RECAP leverages the CPU to determine
+which part of the model to operate on and which weights
+to update at each iteration, which reduces the GPU memory
+footprint caused by model weights, optimizer states, acti-
+vations and gradients. Figure 1provides the RECAP sys-
+tem architecture and the illustrative comparison with pre-
+ﬁnetune pruning and post-ﬁnetune pruning scenarios.
+Concretely, weﬁrst inject task-speciﬁc heads into the
+pre-trained base model (Step 1). Then, at each iteration be-
+fore transferring the pruned model to the GPU forﬁnetun-
+ing, we compute importance metrics for all model weights
+at the CPU (Step 2). To this end, weﬁrst sample a tiny sub-
+set of the dataset and approximate how much the objective
+loss changes over it after removing each model weight us-
+ing aﬁrst-order Taylor expansion. These importance met-
+ric values are utilized to determine which weights will be
+pruned out such that the weights with a high impact on the
+output will be preserved. To further improve the pruningefﬁciency, we determine which weights within the pruned
+model should be updated duringﬁnetuning based on their
+empirical Fisher such that the weights with lower gradient
+values will not be updated (Step 3). Consequently, their op-
+timizer states will not be needed duringﬁnetuning, reducing
+the GPU memory footprint caused by optimizer states and
+gradients. After loading the pruned model andﬁnetuning
+masks to GPU, we performﬁnetuning on the downstream
+task/dataset (Step 4). At each optimization step, we only
+update the weights determined by the pre-computedﬁne-
+tuning mask. Afterﬁnetuning, we update the full model
+weights at CPU (Step 5). We continue the main loop from
+Step 2, and repeat forKrounds or until the performance
+on the validation dataset converges. Lastly, if more com-
+pression is necessary, our approach can be combined with
+quantization [ 9] to boost the efﬁciency and beneﬁt from the
+orthogonal advantages.
+3.1. Pruning Stage
+In this subsection, we provide the details of the pruning
+stage operations. Given a model with weightsθandﬁnetun-
+ing datasetD f, our goal is obtaining a pruned model with
+rp%pruning ratio (i.e.r p%of the original model parame-
+ters will be pruned out).
+3.1.1 Grouping Model Weights
+There are mainly two pruning approaches depending on
+how the weights are grouped. In unstructured pruning, the
+pruning decision is made for each model weight separately,
+16208
+resulting in unstructured sparsity in weight matrices after
+pruning. In the structured pruning approach, model weights
+are grouped (e.g. channels,ﬁlters for CNNs, hidden dimen-
+sions, heads for transformers, etc.) and the same pruning
+decision is made for the weights within each group together.
+After structured pruning, instead of being a masked version
+of the original model with sparse weights, the pruned model
+has weight matrices of smaller size, less number of heads,
+etc. In our method, we consider structured pruning since it
+is more hardware-friendly and the improvements in latency
+and memory are better reﬂected in practice.
+In our case for transformers, we have two main types
+of model weights, respectively for attention modules and
+feedforward layers. For the attention module weights, each
+group contains the model weights (query, key, value, out-
+put weight matrices) corresponding to a head. For feedfor-
+ward layers, each group contains the model weights corre-
+sponding to a hidden dimension. We consider the coupled
+structure of model weights within the computation graph to
+eliminate inconsistencies after pruning, as illustrated in Fig-
+ure2. Let us denote the weight groups for pruning asG(p)
+m,
+wheremis the group index.
+3.1.2 Importance Estimation for Pruning
+After grouping model weights, the next step of pruning is
+computing the importance of each weight group within the
+model. Several approaches have been proposed to deﬁne
+the importance criterion based on weight magnitude, acti-
+vations, gradients etc [ 15,18,39]. Following the success of
+the Taylor expansion-based weight importance estimation
+approach proposed for convolutional neural networks [ 27],
+we also deﬁne the importance of each weightθ kby the es-
+timation of how much the loss would change if that weight
+were pruned. Performing separate computations for each
+weight over the full dataset is computationally infeasible.
+Therefore, we can consider the second-order Taylor expan-
+Figure 2. Illustration of the operations at a multi-head attention
+module withh= 12heads. We group the attention module
+weights as represented with colors and perform structured prun-
+ing at the head level for attention module weights.sion over a randomly sampled tiny subsetD s⊂D fwith
+|Ds|≪|D f|to approximate the loss change induced by the
+removal of each weight and then deﬁne the importanceI θk
+as follows:
+Iθk=|L(D s)−L θk=0(Ds)|≈
+∂L(D s)
+∂θkθk−1
+2θkHkθ2
+,
+where∂L(D s)
+∂θkis the mean derivative of the observed loss
+with respect to the weightθ koverD s.H= [∂2L(D s)
+∂θi∂θj]ijis
+the Hessian matrix andH kis thekth row. Since the compu-
+tation of the Hessian matrix can be expensive due to a high
+number of model parameters, we use theﬁrst-order approx-
+imation with the following form for the computation of the
+pruning importance of each weight groupG(p)
+m:
+I(p)
+m=X
+θk∈G(p)
+m∂L(D s)
+∂θkθk2
+,(1)
+where we sum the importance of each weight within the
+group. Other pruning importance criteria can also be uti-
+lized in our framework as well and we investigate the effect
+of these on theﬁnal model performance in our experiments.
+After the computation of ( 1) for every weight group, we
+keep the weight groups with the highest importance values.
+We sort the weight groups based on their importance values
+and prune out the groups untilv p%of the model parame-
+ters remain. The pruned model ends up with the weights
+θ(p)={G(p)
+m|M(p)[m] = 1}, whereM(p)holds one for
+the preserved group indices and zero for the pruned group
+indices). We iteratively repeat the computation of ( 1) and
+the pruning operation forN psteps until the desired cost re-
+duction condition is satisﬁed such that1−vNpp≥rp. Grad-
+ually pruning the model provides a better approximation of
+the importance values and empirically yields higher perfor-
+mance compared to the one-shot approach. Here, theﬁnal
+desired pruning ratior pcan be set such that theﬁnetuning
+cost of the pruned model (GPU memory requirement) will
+be less than the available resources.
+3.2. Finetuning Stage
+During theﬁnetuning of the pruned modelθ(p)on GPU,
+we perform masked weight updates, which provides two
+crucial advantages. First, we can further reduce the GPU
+memory footprint incurred by the optimizer states and gra-
+dients by only storing those for the weights that are be-
+ing updated. Another motivation for masked updates dur-
+ingﬁnetuning is related to the convergence of the pruned
+model structure over iterations. Finetuning all weights of
+the pruned model inherently causes an increase in the im-
+portance of these weights compared to the weights that were
+pruned out. Thus, the iterations may saturate very quickly
+and cause the pruning of the same weights at each iteration
+16209
+from the very beginning of the process, which can be sub-
+optimal as in pre-ﬁnetune pruning.
+3.2.1 Importance Estimation for Finetuning
+Due to the above motivations, instead ofﬁnetuning all
+weights, we onlyﬁnetune a predeﬁned portion of the pruned
+model weights. To decide which weight to update, after ob-
+taining the pruned model following the procedure described
+in Section 3.1, we perform an intermediate step of computa-
+tion to determine the subset of weights that are most impor-
+tant to update within the pruned model. We would like to
+note that although this step is similar to the operations in the
+pruning stage, here instead of determining the weights that
+have themost impact on model output, our goal isﬁnding
+the weights that would cause thehighest change in model
+predictions when we update them.
+We measure how much the pruned model output
+pθk(y|x)changes when we change the weightθ ktoθ k+δ,
+whereδis a small weight perturbation, by approximating
+the KL divergenceD KL(pθk(y|x)||p θk+δ(y|x))between
+two output distributions [ 35]:
+ExDKL(pθk(y|x)||p θk+δ(y|x))≈δ2Fθk+O(δ3),(2)
+whereF θkis thekth diagonal value of the Fisher informa-
+tion matrix and is deﬁned as:
+Fθk=Ex∼p(x)h
+Ey∼p(y|x)∂logp θk(y|x)
+∂θk2i
+.(3)
+As seen from ( 2) and ( 3), the Fisher information is related
+to the impact of weight updates on the model output. To
+reduce the computation cost, we consider the following ap-
+proximation for the expectation (also referred as empirical
+Fisher in recent studies [ 35]) and deﬁne theﬁnetuning im-
+portance of each weight group as below:
+I(f)
+n=X
+θk∈G(f)
+n∂logp θk(Ds)
+∂θk2
+,(4)
+whereG(f)
+nis thenth weight group and∂logp θk(Ds)
+∂θkis the
+mean derivative of the pruned model output with respect
+toθ koverD s. In other words, to minimize the misalign-
+ment between optimizing all weights and only a portion of
+weights of the pruned model, we can update the weights
+with the highest gradient magnitudes. Duringﬁnetuning,
+each weight groupG(f)
+ncontains the coupled weights corre-
+sponding to the same hidden dimension.
+Then, as in 3.1, we determine which weight groups to
+ﬁnetune by sorting the weight groups based on theirﬁne-
+tuning importance values. Weﬁnetunev f%of the pruned
+model parameters belonging to the groups with the highest
+importance values. LetM(f)denote theﬁnetuning masksuch that it holds one for the group indices that will be up-
+dated and zero for the rest. While loading the pruned model
+at GPU, we also load thisﬁnetuning mask. Next, we start
+theﬁnetuning procedure on GPU over the pruned model
+with sparsiﬁed updates forN fsteps. Duringﬁnetuning, we
+only load the optimizer states and store the gradients for the
+subset of weightsθ(f)={G(f)
+n|M(f)[n] = 1}.
+3.3. Updating Stage
+After eachﬁnetuning stage, we transfer the updates to the
+CPU and overwrite the full model weights that have been
+updated. In addition, we update the optimizer states cor-
+responding to the whole weights since re-initializing opti-
+mizer states at the beginning of each iteration and not car-
+rying over the momentum values to the next iteration for
+the weights that are being updated can cause slower conver-
+gence. This also enables us to prevent any instability that
+might occur in case certain weights have not been updated
+for a number of past iterations start to be updated. For in-
+stance, for SGD with a momentum value ofβ, we have the
+following update step at the end of eachﬁnetuning stage:
+Vk←(
+Vkifθ k∈ ∪G∈θ(f)G
+βVkow,(5)
+θk←(
+θk+∆θ kifθ k∈ ∪G∈θ(f)G
+θk ow,(6)
+where∆θ kis the weight update forθ kcomputed in theﬁne-
+tuning stage. We would like to note that ( 5) can be modiﬁed
+depending on the preferred optimizer type. We repeat the
+pruning,ﬁnetuning and updating stages forKiterations or
+until the validation performance converges.
+4. Experiments
+In this section, we report the results of experiments on four
+vision benchmarks: CIFAR100 [ 22], TinyImageNet for im-
+age classiﬁcation and Cityscapes [ 7], KITTI [ 1] for seman-
+tic segmentation, and six natural language understanding
+tasks from the GLUE benchmark. We show that RECAP
+effectively balances the tradeoff betweenﬁnal model accu-
+racy after pruning and the GPU memory footprint of the
+ﬁnetuning process. We also analyze the impact of mask-
+ing on the performance and memory footprint of our sys-
+tem. We provide experimental setup details (datasets, pre-
+processing, implementation and measurements) with fur-
+ther analysis in the Appendix. Our code is available at:
+https://github.com/git-disl/recap .
+4.1. Accuracy vs Memory-Efﬁciency Analysis
+In this subsection, we report the performance of RECAP
+by analyzing the relation between theﬁnetuned model per-
+formance, and the GPU memory footprint of the process.
+16210
+Task:
+Image Class.ViT-base ViT-large ViT-huge
+C100 TinyIN Mem. C100 TinyIN Mem. C100 Mem.
+Full-FT91.84 89.73 1200 94.12 93.02 3854 94.55 7984
+Head-FT82.75 77.87 414 87.34 86.47 1339 89.66 2708
+LoRA-FT86.43 83.79 480 90.81 89.16 1564 92.49 2840
+Pre-FT Pruning86.57 81.41 825 91.65 89.13 2657 92.10 5377
+Post-FT Pruning88.93 85.52 1200 92.41 91.10 3854 93.15 7984
+Movement Pruning88.40 85.06 1216 92.08 90.90 3890 92.90 8010
+RECAP (Ours) 88.34 83.83 431 91.93 89.95 1251 92.78 2483
+Table 1. Image classiﬁcation results in terms of accuracy (%)
+with GPU memory footprint (MB) for ViT-base (86M), ViT-large
+(307M) and ViT-huge (632M) at CIFAR100 and TinyImageNet
+with variousﬁne-tuning techniques.
+To this end, weﬁrst provide the results for image classi-
+ﬁcation with ViT variants [ 11] and semantic segmentation
+experiments with Mask2Former (M2F) [ 6] in Tables 1and
+2. Here, we compare variousﬁnetuning techniques.Full-
+FTdenotes the standardﬁnetuning procedure of the full
+model, where no efﬁciency technique has been utilized. In
+Head-FT, we freeze the pre-trained model weights and only
+update the parameters of the injected task head to reduce
+the GPU memory footprint caused by activations and opti-
+mizer states. InLORA-FT, we again freeze the pre-trained
+model weights, but in addition to the task head, we also
+inject andﬁnetune adapter modules, speciﬁcally following
+the LoRA [ 20] methodology. We also compare RECAP
+with three representative pruning techniques for theﬁnetun-
+ing of PLMs. InPre-FT(pre-ﬁnetune pruning), which we
+consider as our baseline, weﬁnetune the model after per-
+forming the pruning operation. InPost-FT(post-ﬁnetune
+pruning), weﬁnetune the model before and after pruning,
+following [ 28]. Lastly, we also report the results obtained
+withMovement[ 34] pruning, which integrates the pruning
+process intoﬁnetuning through joint optimization. For all
+pruning techniques, including RECAP, we report the results
+forr p= 33.3%.
+From the results in Tables 1and2, we make three ob-
+servations. (1) RECAP consistently outperforms Pre-FT
+pruning with higher accuracy and lower memory footprint
+as expected. (2) RECAP achieves competitive accuracy re-
+sults with Post-FT pruning and Movement pruning at a sig-
+niﬁcantly lower memory footprint as these two techniques
+require GPU operations on the full model, resulting in a
+high GPU memory footprint. In comparison, RECAP only
+requires the pruned model on GPU and updates a portion
+of those weights at each iteration, and thus, effectively re-
+duces the GPU memory footprint by around 64% and 68%
+for ViT-base and ViT-large respectively, and by around 34%
+and 40% for M2F w/ Swin-base and Swin-large respec-
+tively. (3) For M2F on Cityscapes and KITTI in Table 2, the
+performance gap between RECAP and Post-FT and Move-
+ment pruning techniques is almost zero.
+In Table 2, the higher cost with RECAP for M2F is dueTask:
+Semantic Seg.Mask2Former w/ Swin-base Mask2Former w/ Swin-large
+Cityscapes KITTI Memory Cityscapes KITTI Memory
+Full-FT81.61 71.26 3924 82.69 71.45 6092
+Head-FT76.95 68.27 1648 77.00 68.44 2324
+LoRA-FT77.93 69.85 1815 79.15 70.20 2640
+Pre-FT Pruning77.13 68.61 3079 77.75 69.80 4712
+Post-FT Pruning79.10 70.78 3924 79.48 71.14 6092
+Movement Pruning78.77 70.77 3963 79.66 71.20 6156
+RECAP (Ours) 78.33 70.82 2577 79.50 70.98 3647
+Table 2. Semantic segmentation results in terms of mIoU (%) with
+GPU memory footprint (MB) for Mask2Former models with back-
+bones Swin-base/Swin-large and evaluated at Cityscapes-dev and
+KITTI-dev sets with variousﬁne-tuning techniques.
+Figure 3. Accuracy vs GPU memory footprint for ViT-base and
+ViT-large. In the top-left direction, accuracy increases while mem-
+ory footprint decreases, and RECAP either outperforms other tech-
+niques at the same memory footprint or performs on par with sig-
+niﬁcantly lower memory usage. We also plot the results of full
+ﬁnetuning (Full-FT) and headﬁnetuning with frozen backbone
+(Head-FT). Post-ﬁnetune pruning and movement pruning have the
+same peak GPU memory usage as fullﬁnetuning.
+to the temporarily stored activations for backpropagation.
+In M2F, we observe that the cost of activations is dominant
+(57.4% of total cost whereas 14.2% in ViT-b and 6.4% in
+ViT-l) due to high-resolution activations. Finetuning with
+adapters does not require computing the derivative of loss
+w.r.t attention weights and so, bypassing the storage for
+some activations or modifying some gradients in-place dur-
+ing backpropagation is possible. So, although RECAP re-
+duces the cost of activations thanks to pruned heads and FF
+layers, adapters are more efﬁcient in this scenario but with
+0.4-1% lower mIoU. We also provide Tables 3and4for the
+results in image classiﬁcation experiments at different prun-
+ing ratios to observe how the behavior of these techniques
+changes at different constraint regimes.
+16211
+Model MethodPruning Ratio (r p)
+16.6% 33.3% 50.0% 66.6%CIFAR100ViT-base (86M)
+Full-FT: 91.84%
+Head-FT: 82.75%Pre-FT89.98 86.57 77.29 50.62
+Post-FT91.20 88.93 84.95 75.03
+Movement90.92 88.40 84.85 74.83
+RECAP (Ours) 90.50 88.34 83.33 72.90
+ViT-large (307M)
+Full-FT:94.12%
+Head-FT:87.34%Pre-FT92.49 91.65 89.75 82.60
+Post-FT93.76 92.41 91.29 87.76
+Movement93.39 92.08 91.10 87.33
+RECAP (Ours) 93.55 91.93 90.63 85.65
+Table 3. The results for ViT-base and ViT-large evaluated at CI-
+FAR100 with various techniques at different pruning ratios.
+To illustrate how these pruning ratios translate to mem-
+ory footprint, we plot the results in Figure 3, showing that
+in every pruning regime, RECAP provides the best tradeoff
+between accuracy and memory efﬁciency. Due to structured
+pruning, we observe a signiﬁcant performance drop with
+66% or more pruning ratio in all techniques. But we can
+achieve 3-4x less memory usage with 33% pruning ratio,
+without losing signiﬁcant performance (e.g, -2.19%/-3.08%
+at CIFAR100/TinyImageNet for ViT-large). Lastly, we il-
+lustrate some samples from Cityscapes-dev in Figures 6and
+7to visually compare the model outputs after pruning with
+various techniques. We observe that the model after Pre-
+FT pruning tends to lose details for small objects (people,
+signs etc.) whereas model outputs after RECAP and Post-
+FT pruning are very similar.
+We perform similar analysis on natural language under-
+standing (NLU) tasks and report the results obtained on the
+GLUE benchmark in Figure 4. GLUE benchmark has nine
+NLU tasks, and due to space constraints, we include the
+results of six tasks, which we list in Figure 5with descrip-
+tions. We also report the results with memory footprints
+in Table 5forr p= 50%. We observe that RECAP can
+achieve the performance of Post-FT pruning in most set-
+tings. For instance, in CoLA, MRPC and SST-2, RECAP
+achieves very similar results with Post-FT pruning until the
+50% pruning ratio. Yet, RECAP consumes a notably lower
+memory footprint with 45% of Post-FT pruning and 73% of
+Pre-FT pruning.
+4.2. Analysis on the Impact of Masking
+In this subsection, we analyze the impact of the masking
+of updates during theﬁnetuning stage. To this end, we re-
+port the results obtained with ViT-base on CIFAR100 and
+TinyImageNet datasets and with BERT-base on COLA-dev
+from GLUE at different pruning and masking ratios. We
+plot the obtained results in Figure 8. We observe that the
+performance worsens when the masking ratio is zero/too
+low or too high. As we discuss in Section 3.2, without
+masking, the process saturates earlier, resulting in subopti-
+mal performance similar to that in pre-ﬁnetune pruning. OnModel MethodPruning Ratio (r p)
+16.6% 33.3% 50.0%TinyImageNetViT-base (86M)
+Full-FT: 89.73%
+Head-FT: 77.87%Pre-FT85.40 81.41 63.11
+Post-FT88.52 85.52 78.18
+Movement88.03 85.06 78.14
+RECAP (Ours) 86.93 83.83 73.96
+ViT-large (307M)
+Full-FT: 93.02%
+Head-FT: 86.37%Pre-FT90.75 89.13 72.32
+Post-FT92.66 91.10 77.63
+Movement92.36 90.90 77.45
+RECAP (Ours) 92.32 89.95 75.47
+Table 4. The results for ViT-base and ViT-large evaluated at Tiny-
+ImageNet with various techniques at different pruning ratios.
+Figure 4. Performance at various pruning ratios for BERT-base on
+six datasets from GLUE benchmark.
+Figure 5. Six of the natural language understanding tasks in GLUE
+benchmark and their task descriptions.
+Task: NLUCoLA SST-2 MRPC QQP QNLI RTEMemory
+Full-FT59.61 93.23 88.48 89.11 92.25 68.23 1553
+Head-FT51.10 89.75 85.44 88.05 90.66 64.99 524
+Pre-FT53.17 91.16 83.88 89.47 90.14 62.45 957
+Post-FT57.78 92.20 86.81 88.52 91.12 66.43 1553
+RECAP (Ours) 57.67 92.20 86.55 89.39 90.74 65.98 702
+Table 5. Natural language understanding results in terms of accu-
+racy (%) with GPU memory footprint (MB) for BERT-base (For
+CoLA and MRPC, we report Matthews Correlation Coefﬁcient
+(MCC) and F1 Score, respectively.
+the other hand, masking too many weights hurts the con-
+vergence so we empirically set the masking ratio, which is
+rf= 87.5%for vision experiments andr f= 50%for text
+experiments. We provide further analysis on the conver-
+16212
+Figure 6. Visual comparison of the Mask2Former outputs for ran-
+domly selected samples from Cityscapes after pruning with Pre-
+FT, RECAP and Post-FT pruning at 33% pruning rate.
+Figure 7. Visual comparison of the Mask2Former outputs for ran-
+domly selected samples from KITTI after pruning with Pre-FT,
+RECAP and Post-FT pruning at 33% pruning rate.
+Figure 8. Performance at variousﬁnetuning mask ratios. Selected
+masking rates are shown with vertical dashed lines.
+gence of the pruned model structure in the Appendix.
+4.3. Memory Footprint Breakdown
+In Figure 9, we report the memory footprint due to
+each component (weights, gradients, activations, optimizer
+states) forr f= 33%,r f= 87.5%, batch size of one, and
+the process time for ten epochs. RECAP reduces the mem-
+ory footprint of all components, attributing to only operat-
+ing on the pruned model at GPU, and also further reduc-
+Figure 9. Breakdown of GPU memory footprint (left bars) and
+process time (right bars) for ViT-base and ViT-large at CIFAR100.
+ing the cost of optimizer states and gradients with masked
+ﬁnetuning. CPU time contains the time consumed during
+pruning and masking.
+5. Conclusion
+We have presented RECAP, a pruning framework and a
+suite of optimization techniques, for memory-efﬁcientﬁne-
+tuning of transformer-based large DNN models. This pa-
+per makes two original contributions. First, we develop a
+novel three-stage approach for integrating pruning andﬁne-
+tuning through an iterative process cycling between prun-
+ing,ﬁnetuning, and updating stages, allowing RECAP to
+explore different chunks of the given large-scale model.
+Second, unlike existing pruning methods that demand full
+modelﬁnetuning at GPU, our approach effectively reduces
+the memory footprints of model weights, gradients, activa-
+tions, and loss optimizer states. Extensive experiments with
+large transformer-based architectures on four vision bench-
+marks and six NLU tasks on the GLUE benchmark demon-
+strate that RECAP offers signiﬁcant improvements in GPU
+memory efﬁciency, reducing the footprint by up to 65%,
+while maintaining competitive performance.
+Acknowledgement
+This research is partially sponsored by the NSF CISE grants
+2302720, 2312758, and 2038029, and an IBM faculty
+award. Theﬁrst author thanks for the summer 2023 intern-
+ship at IBM Research with the group led by Dr. Donna
+Dillenberger.
+16213
+References
+[1] Hassan Alhaija, Siva Mustikovela, Lars Mescheder, Andreas
+Geiger, and Carsten Rother. Augmented reality meets com-
+puter vision: Efﬁcient data generation for urban driving
+scenes.International Journal of Computer Vision (IJCV),
+2018. 5,2
+[2] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Sub-
+biah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakan-
+tan, Pranav Shyam, Girish Sastry, Amanda Askell, Sand-
+hini Agarwal, Ariel Herbert-Voss, Gretchen Krueger, Tom
+Henighan, Rewon Child, Aditya Ramesh, Daniel Ziegler,
+Jeffrey Wu, Clemens Winter, Chris Hesse, Mark Chen, Eric
+Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack
+Clark, Christopher Berner, Sam McCandlish, Alec Radford,
+Ilya Sutskever, and Dario Amodei. Language models are
+few-shot learners. InAdvances in Neural Information Pro-
+cessing Systems, pages 1877–1901. Curran Associates, Inc.,
+2020. 1
+[3] Mathilde Caron, Hugo Touvron, Ishan Misra, Herv ´e Jegou,
+Julien Mairal, Piotr Bojanowski, and Armand Joulin. Emerg-
+ing properties in self-supervised vision transformers. In
+2021 IEEE/CVF International Conference on Computer Vi-
+sion (ICCV), pages 9630–9640, 2021. 1
+[4] Zhe Chen, Yuchen Duan, Wenhai Wang, Junjun He, Tong
+Lu, Jifeng Dai, and Yu Qiao. Vision transformer adapter for
+dense predictions. InThe Eleventh International Conference
+on Learning Representations, 2023. 2
+[5] Bowen Cheng, Alexander G. Schwing, and Alexander Kir-
+illov. Per-pixel classiﬁcation is not all you need for semantic
+segmentation. InNeural Information Processing Systems,
+2021. 1
+[6] Bowen Cheng, Ishan Misra, Alexander G. Schwing, Alexan-
+der Kirillov, and Rohit Girdhar. Masked-attention mask
+transformer for universal image segmentation. In2022
+IEEE/CVF Conference on Computer Vision and Pattern
+Recognition (CVPR), pages 1280–1289, 2022. 1,6
+[7] Marius Cordts, Mohamed Omran, Sebastian Ramos, Timo
+Rehfeld, Markus Enzweiler, Rodrigo Benenson, Uwe
+Franke, Stefan Roth, and Bernt Schiele. The cityscapes
+dataset for semantic urban scene understanding. InProc.
+of the IEEE Conference on Computer Vision and Pattern
+Recognition (CVPR), 2016. 5,2
+[8] Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li,
+and Li Fei-Fei. Imagenet: A large-scale hierarchical image
+database. In2009 IEEE Conference on Computer Vision and
+Pattern Recognition, pages 248–255, 2009. 2
+[9] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke
+Zettlemoyer. GPT3.int8(): 8-bit matrix multiplication for
+transformers at scale. InAdvances in Neural Information
+Processing Systems, 2022. 2,3
+[10] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina
+Toutanova. BERT: pre-training of deep bidirectional trans-
+formers for language understanding. InProceedings of the
+2019 Conference of the North American Chapter of the
+Association for Computational Linguistics: Human Lan-
+guage Technologies, NAACL-HLT 2019, Minneapolis, MN,
+USA, June 2-7, 2019, Volume 1 (Long and Short Papers),pages 4171–4186. Association for Computational Linguis-
+tics, 2019. 1
+[11] Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov,
+Dirk Weissenborn, Xiaohua Zhai, Thomas Unterthiner,
+Mostafa Dehghani, Matthias Minderer, Georg Heigold, Syl-
+vain Gelly, Jakob Uszkoreit, and Neil Houlsby. An image is
+worth 16x16 words: Transformers for image recognition at
+scale. InInternational Conference on Learning Representa-
+tions, 2021. 1,6,2
+[12] Jonathan Frankle and Michael Carbin. The lottery ticket hy-
+pothesis: Finding sparse, trainable neural networks. InInter-
+national Conference on Learning Representations, 2019. 1,
+2
+[13] Elias Frantar and Dan Alistarh. Sparsegpt: Massive language
+models can be accurately pruned in one-shot, 2023. 2
+[14] Zichao Guo, Xiangyu Zhang, Haoyuan Mu, Wen Heng,
+Zechun Liu, Yichen Wei, and Jian Sun. Single path one-shot
+neural architecture search with uniform sampling. InECCV,
+2019. 2
+[15] Song Han, Jeff Pool, John Tran, and William J. Dally. Learn-
+ing both weights and connections for efﬁcient neural net-
+work. InNeural Information Processing Systems, 2015. 4
+[16] Song Han, Huizi Mao, and William J. Dally. Deep com-
+pression: Compressing deep neural network with pruning,
+trained quantization and huffman coding. In4th Interna-
+tional Conference on Learning Representations, ICLR 2016,
+San Juan, Puerto Rico, May 2-4, 2016, Conference Track
+Proceedings, 2016. 1,2
+[17] Kaiming He, X. Zhang, Shaoqing Ren, and Jian Sun. Deep
+residual learning for image recognition.2016 IEEE Confer-
+ence on Computer Vision and Pattern Recognition (CVPR),
+pages 770–778, 2016. 2
+[18] Yihui He, Xiangyu Zhang, and Jian Sun. Channel pruning
+for accelerating very deep neural networks. In2017 IEEE
+International Conference on Computer Vision (ICCV), pages
+1398–1406, 2017. 4
+[19] Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna
+Morrone, Quentin de Laroussilhe, Andrea Gesmundo, Mona
+Attariyan, and Sylvain Gelly. Parameter-efﬁcient transfer
+learning for nlp. InInternational Conference on Machine
+Learning, 2019. 2
+[20] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-
+Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen.
+LoRA: Low-rank adaptation of large language models. In
+ICLR, 2022. 2,6
+[21] Menglin Jia, Luming Tang, Bor-Chun Chen, Claire Cardie,
+Serge Belongie, Bharath Hariharan, and Ser-Nam Lim. Vi-
+sual prompt tuning. InECCV, 2022. 2
+[22] Alex Krizhevsky. Learning multiple layers of features from
+tiny images. Technical report, University of Toronto, 2009.
+5,2
+[23] Namhoon Lee, Thalaiyasingam Ajanthan, and Philip Torr.
+SNIP: SINGLE-SHOT NETWORK PRUNING BASED ON
+CONNECTION SENSITIVITY. InInternational Confer-
+ence on Learning Representations, 2019. 2,4
+[24] Yang Lin, Tianyu Zhang, Peiqin Sun, Zheng Li, and
+Shuchang Zhou. Fq-vit: Post-training quantization for fully
+16214
+quantized vision transformer. InProceedings of the Thirty-
+First International Joint Conference on Artiﬁcial Intelli-
+gence, IJCAI-22, pages 1173–1179, 2022. 2
+[25] Zhenhua Liu, Yunhe Wang, Kai Han, Siwei Ma, and Wen
+Gao. Post-training quantization for vision transformer. In
+Neural Information Processing Systems, 2021. 2
+[26] Rabeeh Karimi Mahabadi, Sebastian Ruder, Mostafa De-
+hghani, and James Henderson. Parameter-efﬁcient multi-
+taskﬁne-tuning for transformers via shared hypernetworks.
+ArXiv, abs/2106.04489, 2021. 2
+[27] Pavlo Molchanov, Stephen Tyree, Tero Karras, Timo Aila,
+and Jan Kautz. Pruning convolutional neural networks for
+resource efﬁcient inference. In5th International Conference
+on Learning Representations, ICLR 2017, Toulon, France,
+April 24-26, 2017, Conference Track Proceedings. OpenRe-
+view.net, 2017. 2,4
+[28] P. Molchanov, A. Mallya, S. Tyree, I. Frosio, and J. Kautz.
+Importance estimation for neural network pruning. In2019
+IEEE/CVF Conference on Computer Vision and Pattern
+Recognition (CVPR), pages 11256–11264, Los Alamitos,
+CA, USA, 2019. IEEE Computer Society. 2,6
+[29] Behnam Neyshabur, Zhiyuan Li, Srinadh Bhojanapalli, Yann
+LeCun, and Nathan Srebro. The role of over-parametrization
+in generalization of neural networks. InInternational Con-
+ference on Learning Representations, 2019. 1
+[30] Maxime Oquab, Timoth ´ee Darcet, Th ´eo Moutakanni, Huy
+Vo, Marc Szafraniec, Vasil Khalidov, Pierre Fernandez,
+Daniel Haziza, Francisco Massa, Alaaeldin El-Nouby, Mah-
+moud Assran, Nicolas Ballas, Wojciech Galuba, Russell
+Howes, Po-Yao Huang, Shang-Wen Li, Ishan Misra, Michael
+Rabbat, Vasu Sharma, Gabriel Synnaeve, Hu Xu, Herv ´e Je-
+gou, Julien Mairal, Patrick Labatut, Armand Joulin, and Piotr
+Bojanowski. Dinov2: Learning robust visual features with-
+out supervision, 2023. 1
+[31] Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario
+Amodei, and Ilya Sutskever. Language models are unsuper-
+vised multitask learners. 2019. 1
+[32] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya
+Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry,
+Amanda Askell, Pamela Mishkin, Jack Clark, Gretchen
+Krueger, and Ilya Sutskever. Learning transferable visual
+models from natural language supervision. InInternational
+Conference on Machine Learning, 2021. 1
+[33] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee,
+Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, and
+Peter J. Liu. Exploring the limits of transfer learning with a
+uniﬁed text-to-text transformer.Journal of Machine Learn-
+ing Research, 21(140):1–67, 2020. 1
+[34] Victor Sanh, Thomas Wolf, and Alexander M. Rush. Move-
+ment pruning: Adaptive sparsity byﬁne-tuning. InProceed-
+ings of the 34th International Conference on Neural Infor-
+mation Processing Systems, Red Hook, NY, USA, 2020. Cur-
+ran Associates Inc. 2,6
+[35] Yi-Lin Sung, Varun Nair, and Colin Raffel. Training neural
+networks withﬁxed sparse masks.ArXiv, abs/2111.09839,
+2021. 5
+[36] Hugo Touvron, Louis Martin, Kevin Stone, Peter Al-
+bert, Amjad Almahairi, Yasmine Babaei, Nikolay Bash-lykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhos-
+ale, Dan Bikel, Lukas Blecher, Cristian Canton Ferrer,
+Moya Chen, Guillem Cucurull, David Esiobu, Jude Fer-
+nandes, Jeremy Fu, Wenyin Fu, Brian Fuller, Cynthia
+Gao, Vedanuj Goswami, Naman Goyal, Anthony Hartshorn,
+Saghar Hosseini, Rui Hou, Hakan Inan, Marcin Kardas, Vik-
+tor Kerkez, Madian Khabsa, Isabel Kloumann, Artem Ko-
+renev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut
+Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu, Yuning
+Mao, Xavier Martinet, Todor Mihaylov, Pushkar Mishra,
+Igor Molybog, Yixin Nie, Andrew Poulton, Jeremy Reizen-
+stein, Rashi Rungta, Kalyan Saladi, Alan Schelten, Ruan
+Silva, Eric Michael Smith, Ranjan Subramanian, Xiao-
+qing Ellen Tan, Binh Tang, Ross Taylor, Adina Williams,
+Jian Xiang Kuan, Puxin Xu, Zheng Yan, Iliyan Zarov,
+Yuchen Zhang, Angela Fan, Melanie Kambadur, Sharan
+Narang, Aurelien Rodriguez, Robert Stojnic, Sergey Edunov,
+and Thomas Scialom. Llama 2: Open foundation andﬁne-
+tuned chat models, 2023. 1
+[37] Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill,
+Omer Levy, and Samuel Bowman. GLUE: A multi-task
+benchmark and analysis platform for natural language un-
+derstanding. InProceedings of the 2018 EMNLP Workshop
+BlackboxNLP: Analyzing and Interpreting Neural Networks
+for NLP, pages 353–355, Brussels, Belgium, 2018. Associa-
+tion for Computational Linguistics. 2
+[38] Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chau-
+mond, Clement Delangue, Anthony Moi, Pierric Cistac, Tim
+Rault, R ´emi Louf, Morgan Funtowicz, Joe Davison, Sam
+Shleifer, Patrick von Platen, Clara Ma, Yacine Jernite, Julien
+Plu, Canwen Xu, Teven Le Scao, Sylvain Gugger, Mariama
+Drame, Quentin Lhoest, and Alexander M. Rush. Trans-
+formers: State-of-the-art natural language processing. In
+Proceedings of the 2020 Conference on Empirical Methods
+in Natural Language Processing: System Demonstrations,
+pages 38–45, Online, 2020. Association for Computational
+Linguistics. 2
+[39] Nakyeong Yang, Yunah Jang, Hwanhee Lee, Seohyeong
+Jeong, and Kyomin Jung. Task-speciﬁc compression for
+multi-task language models using attribution-based pruning.
+InFindings of the Association for Computational Linguis-
+tics: EACL 2023, pages 594–604, Dubrovnik, Croatia, 2023.
+Association for Computational Linguistics. 2,4
+[40] Yihua Zhang, Yuguang Yao, Parikshit Ram, Pu Zhao, Tian-
+long Chen, Mingyi Hong, Yanzhi Wang, and Sijia Liu. Ad-
+vancing model pruning via bi-level optimization. InAd-
+vances in Neural Information Processing Systems, 2022. 2
+16215

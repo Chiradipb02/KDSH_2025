@@ -1,0 +1,842 @@
+Under review as submission to TMLR
+Decomposing The Dark Matter of Sparse Autoencoders
+Anonymous authors
+Paper under double-blind review
+Abstract
+Sparse autoencoders (SAEs) are a promising technique for decomposing language model ac-
+tivations into interpretable linear features. However, current SAEs fall short of completely
+explaining model performance, resulting in “dark matter”: unexplained variance in activa-
+tions. Thisworkinvestigatesdarkmatterasanobjectofstudyinitsownright. Surprisingly,
+we find that much of SAE dark matter—about half of the error vector itself and >90%of
+its norm—can be linearly predicted from the initial activation vector. Additionally, we find
+that the scaling behavior of SAE error norms at a per token level is remarkably predictable:
+larger SAEs mostly struggle to reconstruct the same contexts as smaller SAEs. We build
+on the linear representation hypothesis to propose models of activations that might lead to
+these observations, including postulating a new type of “introduced error”; these insights
+imply that the part of the SAE error vector that cannot be linearly predicted (“nonlin-
+ear” error) might be fundamentally different from the linearly predictable component. To
+validate this hypothesis, we empirically analyze nonlinear SAE error and show that 1) it
+contains fewer not yet learned features, 2) SAEs trained on it are quantitatively worse, 3)
+it helps predict SAE per-token scaling behavior, and 4) it is responsible for a proportional
+amount of the downstream increase in cross entropy loss when SAE activations are inserted
+into the model. Finally, we examine two methods to reduce nonlinear SAE error: inference
+time gradient pursuit, which leads to a very slight decrease in nonlinear error, and linear
+transformations from earlier layer SAE outputs, which leads to a larger reduction.
+1 Introduction
+The ultimate goal for ambitious mechanistic interpretability is to understand neural networks from the
+bottom up by breaking them down into programs (“circuits") and the variables (“features”) that those
+programs operate on (Olah, 2023). One recent successful technique for finding features in language models
+has been sparse autoencoders (SAEs), which learn a dictionary of one-dimensional representations that can
+be sparsely combined to reconstruct model hidden activations (Cunningham et al., 2023; Bricken et al.,
+2023). However, as observed by Gao et al. (2024), the scaling behavior of SAE width (number of latents) vs.
+reconstruction mean squared error (MSE) is best fit by a power law with a constant error term. Gao et al.
+(2024) speculate that this component of SAE error below the asymptote might best be explained by model
+activations having components with denser structure than simple SAE features (e.g. Gaussian noise). This
+is a concern for the ambitious agenda because it implies that there are components of model hidden states
+that are harder for SAEs to learn and which might not be eliminated by simple scaling of SAEs.
+Motivated by this discovery, in this work our goal is to specifically study the SAE error vector itself, and in
+doingsogaininsightintothefailuresofcurrentSAEs, thedynamicsofSAEscaling, andpossibledistributions
+of model activations. Thus, our direction differs from the bulk of prior work that seeks to quantify SAE
+failures, as these mostly focus on downstream benchmarks or simple cross entropy loss (see e.g. Gao et al.
+(2024); Templeton et al. (2024); Anders & Bloom (2024)). The structure of this paper is as follows:
+1. In Section 4, we introduce the fundamental mystery that we will explore throughout the rest of the paper:
+SAE errors are shockingly predictable. To the best of our knowledge, we are the first to show that a large
+fraction of SAE error vectors can be explained with a linear transformation of the input activation, that
+1Under review as submission to TMLR
+105 106 1070.000.050.100.150.200.250.300.35
+Absent Features
+Linear Error
+Nonlinear ErrorSAE Reconstruction, FVU0.186+2.708W0.317
+SAE Reconstruction + Error Prediction, FVU0.122
+SAE Pursuit Reconstruction + Error Prediction
+Encoder Error
+SAE WidthFraction Variance Unexplained (FVU)
+Figure 1: A breakdown of SAE dark matter. See Section 4 for how we break down the overall fraction
+of unexplained variance into absent features, linear error, and nonlinear error. See Section 7.1 for further
+separating encoder error from nonlinear error.
+the norm of SAE error vectors can be accurately predicted by a linear projection of the input activation,
+and that on a per-token level, error norms of large SAEs are linearly predictable from small SAEs.
+2. In Section 5, we propose models of SAE error to explain these observations, including postulating a new
+type of “introduced error” that is causedby the SAE architecture and sparsity constraint.
+3. In Section 6, we investigate the linearly predictable and nonlinearly predictable components of SAE error.
+We find that although the nonlinear component affects downstream cross entropy loss in proportion to its
+norm, it is qualitatively different from linear error: as compared to linear error, nonlinear error is harder
+to learn SAEs for, consists of a smaller proportion of absent linear features, and helps with predicting the
+norm of larger SAE errors from smaller SAEs.
+4. In Section 7, we show that inference time optimization increases the fraction of variance explained by
+SAEs, but only slightly decreases nonlinear error. Additionally, we show that we can use SAEs trained
+on previous components to decrease nonlinear error and total SAE error.
+2 Related Work
+Language Model Representation Structure: The linear representation hypothesis (LRH) (Park et al.,
+2023; Elhage et al., 2022) claims that language model hidden states can be decomposed into a sparse sum
+of linear feature directions. The LRH has seen recent empirical support with sparse autoencoders , which
+have succeeded in decomposing much of the variance of language model hidden states into such a sparse
+sum, as well as a long line of work that has used probing and dimensionality reduction to find causal
+linear representations for specific concepts (Alain, 2016; Nanda et al., 2023; Marks et al., 2024; Gurnee,
+2024). On the other hand, some recent work has questioned whether the linear representation hypothesis
+is true: Engels et al. (2024) find multidimensional circular representations in Mistral (Jiang et al., 2023)
+and Llama (AI@Meta, 2024), and Csordás et al. (2024) examine synthetic recurrent neural networks and
+find “onion-like” non-linear features not contained in a linear subspace. This has inspired recent discussion
+about what a true model of activation space might be: Mendel (2024) argues that the linear representation
+hypothesis ignores the growing body of results showing the multi-dimensional structure of SAE latents, and
+2Under review as submission to TMLR
+Smith (2024b) argues that we only have evidence for a “weak” form of the superposition hypothesis holding
+that only somefeatures are linearly represented.
+SAE Errors and Benchmarking: Multiple works have introduced techniques to benchmark SAEs and
+characterize their error: Bricken et al. (2023), Gao et al. (2024), and Templeton et al. (2024) use manual
+human analysis of features, automated interpretability, downstream cross entropy loss when SAE recon-
+structions are inserted back into the model, and feature geometry visualizations; Karvonen et al. (2024)
+use the setting of board games, where the ground truth features are known, to determine what proportion
+of the true features SAEs learn; and Anders & Bloom (2024) use the performance of the model on NLP
+benchmarks when the SAE reconstruction is inserted back into the model. More specifically relevant to
+our main direction in this paper, Gurnee (2024) finds that SAE reconstruction errors are pathological , that
+is, when SAE reconstructions are inserted into the model, they have a larger effect on cross entropy loss
+than random perturbations with the same error norm. Follow up work by Heimersheim & Mendel (2024)
+and Lee & Heimersheim (2024) find that this effect disappears when the random baseline is replaced by a
+perturbation in the direction of the difference between two random activations.
+SAE Scaling Laws: Anthropic (2024), Templeton et al. (2024), and Gao et al. (2024) study how SAE
+MSE scales with respect to FLOPS, sparsity, and SAE width, and define scaling laws with respect to these
+quantities. Templetonetal.(2024)alsostudyhowspecificgroupsoflanguagefeatureslikechemicalelements,
+cities, animals, and foods are learned by SAEs, and show that SAEs predictably learn these features in terms
+of their occurrence. Finally, Bussmann et al. (2024) find that larger SAEs learn two new types of dictionary
+vectors as comparsed to smaller SAEs: features not present at all in smaller SAEs, and more fine-grained
+“feature split” versions of features in smaller SAEs.
+3 Notation
+In this paper, we consider neural network activations x∈Rdand sparse autoencoders Sae∈Rd→Rd
+which seek to minimize ∥x−Sae(x)∥2while using a small number of active latents. We are agnostic to
+the architecture or training procedure of the sparse autoencoder; see (Bricken et al., 2023; Cunningham
+et al., 2023; Gao et al., 2024; Templeton et al., 2024) for such details. We also define SaeError (x)such that
+x=Sae(x) +SaeError (x), or rearranged
+SaeError (x):=x−Sae(x). (1)
+4 Predicting SAE Error
+Experiment Details:1Unless noted otherwise, we set xequal to layer 20Gemma 2 9B (Team et al., 2024)
+activations. We use 300contexts of 1024tokens from the uncopywrited subset of the Pile (Gao et al., 2020)
+and then filter to only activations of tokens after position 200in each context, as Lieberum et al. (2024) find
+that earlier tokens are easier for sparse autoencoders to reconstruct, and we wish to ignore the effect of token
+position on our results. This results in a dataset of about 247k activations. We use the suite of Gemma
+Scope (Lieberum et al., 2024) sparse autoencoders. For linear regressions, we use a random subset of size
+150k as training examples (since Gemma 2 9B has a hidden dimension of 3584, this prevents overfitting) and
+report the R2on the other 97k activations. For transforms to a multi-dimensional output, we report the
+averageR2across dimensions. We include bias terms in our linear regressions but omit them from equations
+for simplicity.
+Predicting SAE Error Norm : For our first set of experiments, we find the optimal linear probe a∗from
+xto∥SaeError (x)∥2
+2. Formally (with a slight abuse of notation, since xis a random variable and not a
+dataset), we solve for
+a∗= arg min
+a∈R/vextenddouble/vextenddoubleaT·x−∥SaeError (x)∥2
+2/vextenddouble/vextenddouble
+2(2)
+1Code at https://anonymous.4open.science/r/SAE-Dark-Matter-1163
+3Under review as submission to TMLR
+105106
+SAE Width101102SAE L0
+0.870.880.890.900.910.920.930.94
+Figure 2:R2of linear regressions from activations
+to SAE error norms . Errors norms are linearly
+predictable with high accuracy at all widths and L0.
+105106
+SAE Width101102SAE L0
+0.300.360.420.480.540.600.660.72Figure 3:R2of linear transformations from activa-
+tions to SAE error vectors . Errors vector predic-
+tion accuracy decreases with increasing width and
+L0.
+TheR2of these probes are all extremely high: on layer 20, for all Gemma Scope combinations of SAE width
+andL0, between 86%and95%of the variance in SAE error norm is explained by the optimal linear probe.
+We plot these results as a contour plot in Fig. 2. Overall, sparser and wider SAEs have less predictable error
+norms. In Appendix A, we show a plot of the R2of the prediction across layers, and find that except for
+the first few layers, activation probes have a much higher R2than probes using tokens, SAE L0, model loss,
+or activation norm.
+Predicting SAE Error Vectors: We next examine the R2of the optimal linear transform b∗fromxto
+SaeError (x):
+b∗:= arg min
+b∈Rd×d∥b·x−SaeError (x)∥2(3)
+As we show in Fig. 3, the R2of these transforms for layer 20range between 30%and72%; this is less than
+theR2for our norm prediction experiments, but still much higher than we might expect. Intuitively, this
+result implies that there must be large linear subspaces that the SAE is mostly failing to learn. Like SAE
+error norm predictions, there is a clear pattern across SAE L0and width: R2decreases with increasing SAE
+width and L0. Interestingly, this pattern is notthe same as it was above for SAE error norm: the R2of
+error norm predictions increases with SAE L0, while it decreases for error vector predictions. One concern
+might be that b∗is mostly reversing feature shrinkage, in Appendix A.1, we show that this is not the case.
+Nonlinear FVU: Another related metric we are interested in is the total amount of the original activation
+xwe fail to “explain” using boththe SAE reconstruction Sae(x)and a linear projection of x. That is,
+assuming we have found b∗as in Eq. (3), we are interested in the fraction of variance unexplained (FVU)
+by the sum of Sae(x)andb∗·x:
+FVU nonlinear := 1−R2(x,Sae(x) +b∗·x) (4)
+Welabelthisquantity FVU nonlinearbecauseitisintuitivelytheamountoftheSAE’sunexplainedvariancethat
+is not a linear projection of the input. Interestingly, we find that at a fixed L0,FVU nonlinearis approximately
+constant (see Fig. 4). That is, even though we can linearly predict a smaller portion of the error vector in
+larger SAEs, this effect is counteracted almost exactly by the fact that the SAE error vector itself is getting
+smaller. In contrast, FVU nonlineardecreases as SAE L0increases.
+4Under review as submission to TMLR
+105106
+SAE Width101102SAE L0
+0.0880.0960.1040.1120.1200.1280.1360.144
+Nonlinear Error (FVU)
+Figure 4: FVU nonlinearversus SAE width and L0. Larger
+SAEL0s have a smaller FVU nonlinear, but FVU nonlinear
+stays mostly constant with increasing SAE width.
+16k32k65k131k262k524k1m
+SAE Width (y)16k
+32k
+65k
+131k
+262k
+524k
+1mSAE Width (x)
+0.800.850.900.951.00Figure 5:R2for linear probes of per token SAE
+errors of larger SAEs from smaller SAEs. Predic-
+tion accuracy decreases as the SAEs get farther
+apart in scale, but overall remains high.
+We can use the hypothesis that FVU nonlinearis a constant at a fixed sparsity to plot the breakdown of FVU
+for varying SAE width and L0≈60in Fig. 1. We plot a horizontal fit for FVU nonlinear and a power law
+fit with a constant for Gemma SAE reconstructions; the power law fit asymptotes above the horizontal fit,
+which implies the presence of linear error even at very large SAE width. Note that we assume absent features
+(those which are not yet learned) are a component of the linear error; we provide justifications for this in
+Section 5.2.
+Predicting SAE Per-Token Error Norms: We now examine per-token SAE scaling behavior. Given two
+SAEs, SAE 1and SAE 2, we are interested in how much of the variance in error norms in SAE 2is predictable
+from error norms in SAE 1. That is, we want to find c∗such that
+c∗:= arg min
+c∈R∥c·SaeError 1(x)−SaeError 2(x)∥2(5)
+Note that in practice, although a∗also can predict the norm of SAE error, it requires training the target
+SAE to learn a probe. Here, on the other hand, although we formulate finding c∗as an optimization problem
+that requires a larger SAE, in practice we do not need to actually train the larger SAE to get interesting
+insights: since c∗has just one component, it simply measures how well small SAE error can be multiplied
+by a scalar to predict large SAE error. If the R2is high, we know that on tokens that small SAEs perform
+poorly on, larger SAEs will as well. In Fig. 5, we plot the R2ofc∗probes on all pairs of layer 20SAEs with
+L0≈60(restricting to pairs where SAE 2is larger than SAE 2), and find that indeed, per token SAE errors
+are highly predictable. Additionally, we show concretely what these correlated SAE error norms looks like
+on a set of 100tokens from the Pile in Fig. 6.
+5 Modeling Activations
+We will adopt the weaklinear hypothesis (Smith, 2024b), a generalization of the linear representation hy-
+pothesis which holds only that somefeatures in language models are represented linearly. Thus we have
+x=n/summationdisplay
+i=0wiyi+Dense (x) (6)
+for linear features {y1,...,yn}and random vector w∈Rn, where wis sparse (∥w∥1≪d) and Dense (x)
+is a random vector representing the dense component of x.Dense (x)might be Gaussian noise, nonlinear
+5Under review as submission to TMLR
+0 20 40 60 80 100
+T oken557595115L2 Norm
+' This'
+' article'' links'
+' hypothe''si'
+'sed'
+' issues'' about'' impact'
+' evaluation'','7516k SAE error
+32k SAE error65k SAE error
+131k SAE error262k SAE error
+524k SAE error1m SAE error
+Figure 6: Per token scaling with average nonlinear error, layer 20Gemma 9B SAEs from Gemma Scope
+closest toL0= 60.
+features as described by Csordás et al. (2024), or anything else not represented in a low-dimensional linear
+subspace.
+Say our SAE has mlatents. Since by assumption Dense (x)cannot be represented in a low-dimensional linear
+subspace, the sparsity limited SAE will not be able to learn it. Thus, we will assume that the SAE learns
+only themmost common features y0,...,ym−1. We will also assume that the SAE introduces some error
+when making this approximation, and instead learns ˆyiand ˆwi. Thus we have
+Sae(x) =m/summationdisplay
+i=0ˆwiˆyi (7)
+SaeError (x) =Dense (x) +/parenleftiggm/summationdisplay
+i=0ˆwiˆyi−m/summationdisplay
+i=0wiyi/parenrightigg
++n/summationdisplay
+i=mwiyi (8)
+We finally define Introduced (x):=/summationtextm
+i=0ˆwiˆyi−/summationtextm
+i=0wiyi, so we have
+SaeError (x) =Dense (x) +Introduced (x) +n/summationdisplay
+i=mwiyi (9)
+5.1 Analyzing Error Norm Prediction
+We will first analyze Eq. (2), the learned probe from xto∥SaeError (x)∥2
+2. First, we claim that given a
+vector x, ifxis a sparse sum of orthogonal vectors, then there exists a perfect prediction vector asuch that
+aTx≈|x|2
+2(in other words, the norm squared of xcan be linearly predicted from x). The proof of this
+claim is in Appendix B.1; the intuition is that we can set the probe vector a∗to the sum of the vectors yi
+weighted by their average weight E(wi).
+When xis instead a sparse sum of non-orthogonal vectors, as it partly is in Eq. (6) amd Eq. (9), this proof
+is no longer true, but we now argue that a similar intuition holds. If the yiare almost orthogonal and do
+6Under review as submission to TMLR
+not activate much at the same time, then a probe vector again equal to the sum of vectors yiweighted by
+their average value E(wi)will be a good approximate prediction. Indeed, when we try predicting ∥Sae(x)∥2
+2
+from Sae(x)(which is a sparse sum of known almost orthogonal vectors of a similar distribution to the true
+SAE vectors), we find that indeed the linear probe that is learned is approximately equal to this sum (see
+Appendix B.2).
+Thus, we can now neatly explain why we can predict the norms of SAE errors: they mostly consist of almost
+orthogonal sparsely occuring not yet learned SAE features! We further can explain why larger SAEs have
+less predictable error norms: since mis larger, there is a larger component in the error of not-as-linearly-
+predictable Dense (x)andIntroduced (x).
+5.2 Analyzing Error Vector Prediction
+We will now analyze Eq. (3), the learned transformation from xtoSaeError (x), with our model of SAE
+error from Eq. (9). We assume that Introduced (x)cannot be approximated at all as a linear function of
+x; if this assumption is violated in practice, it will show up in our estimations as an increased amount of
+Dense (x).
+IfDense (x) +/summationtextn
+i=mwiyiis contained in a linear subspace of xorthogonal to/summationtextm
+i=0wiyi, then the error of
+the transformation b∗exactly equals Introduced (x)(since the transformation is just exactly this orthogonal
+linear subspace). However, if such a linear transform does not exist, the percent of variance left unexplained
+by the regression will be an upper bound on the true variance explained by Introduced (x). We also note
+that if this test is accurate, we can use it to estimate Dense (x): the difference between the variance explained
+bySae(x)and the variance explained by x−(Sae(x) +b∗·x)will approach Dense (x)asm→∞.
+Thus, our ability to estimate Introduced (x)andDense (x)using b∗depends on how well a linear transform
+works to predict Dense (x)and/summationtextn
+i=mwiyi. Although we do not have access to the ground truth vectors yi,
+wecanreplace x′with a similar distribution of vectors that we dohave access to, using the same trick as
+above. Given an SAE, we replace xwithx′=Sae(x).x′has the useful property that it is a sparse linear
+sum of vectors (the ones that the SAE learned), and the distribution of these vectors and their weights are
+similar to that of the true features yi. We now pass x′back through the SAE and can control all of the
+quantities we are interested in: we can vary mby masking SAE dictionary elements, simulate Dense( x′)by
+adding Gaussian noise to x′, and simulate Introduced (x)by adding Gaussian noise to Sae(x′).
+Table 1: Correlation matrix between synthetic noise and esti-
+mated errors.
+Estimated
+Dense( x′)Estimated
+Introduced( x′)
+x′Noise 0.9842 0.1417
+Sae(x′)Noise 0.0988 0.9036We run this synthetic setup with a
+Gemma Scope layer 20SAE (width 16k,
+L0≈68) in Appendix B.3, and find that
+indeed, estimated Dense( x′)is highly
+correlated with the amount of Gaussian
+nosie added to x′and Introduced( x′)
+is highly correlated with the amount of
+Gaussian noise added to Sae(x′)(see Ta-
+ble 1). However, note that because x′noise is also slightly correlated with estimated Introduced( x′), it is
+possible that some of the contribution to the estimated nonlinear error is from Dense( x′).
+Thus, we again now have a potential explanation for our initial results: we can predict error vectors because
+they consist in large part of not yet learned linear features in an almost orthogonal subspace of x, we can
+predict a smaller portion of larger SAE errors because the number of these linear features go down with
+SAE width, and the horizontal line in Fig. 1 is because Dense (x)andIntroduced (x)are mostly constant.
+Furthermore, we can hypothesize from the correlations om Table 1 that the linearly predictable component
+of SAE error consists mostly of not yet learned features and Dense (x), while the component that is not
+linearly predictable consists mostly of Introduced (x). We will explore this hypothesis in Section 6.
+5.3 Analyzing Per-Token Scaling Predictions
+Finally, we provide a simple explanation for why per-token SAE errors are highly predictable between SAEs
+of different sizes. For this, we only need Eq. (9). Since Dense (x)andIntroduced (x)stay mostly constant
+7Under review as submission to TMLR
+x
+Sae(x)
+Sae(x) -
+ NonlinearError(x)
+SaeError(x)
+LinearError(x)
+NonlinearError(x)0.60.70.80.91.0Norm Prediction Test R2
+Figure 7: Violin plot of norm prediction tests for
+all layer 20Gemma Scope SAEs. We plot the R2
+of a linear regression from xto to each random
+vector’s norm squared.
+NotQ1Q2Q3Q4Q5Q6Q7Q8Q9Q10
+Decile0.30.40.50.60.70.8Accuracy
+SAE trained on nonlinear error
+SAE trained on linear errorFigure 8: Auto-interpretability results on SAEs trained
+on the linear and nonlinear components of SaeError (x).
+“Not” represents contexts that the SAE latent did not
+activateon, whileeach Qirepresentsactivatingexamples
+from decile i.
+asmincreases, for large mthe SAE error stays mostly constant because it is primarily determined by these
+components. Thus, since m= 16kis already large, a linear prediction that is just a slightly smaller version of
+the current error performs well. Additionally, this reasoning suggests a natural experiment: if we can predict
+Introduced (x)on a per-token level (which we hypothesize we can do with the non-linearly predictable
+component of SAE error), we may be able to better predict the floor of SAE scaling and therefore better
+predict larger SAE errors; we run this experiment in Section 6, where we find an affirmative answer.
+6 Analyzing Components of SAE Error
+In this section, we run experiments that seek to prove our hypothesis from Section 5.2: that the split of
+SaeError (x)intoalinearlypredictablecomponentandthenon-linearlypredictablecomponentismeaningful.
+For convenience, given a probe b∗from Eq. (3), we write
+LinearError (x):=SaeError (x)−b∗·x
+NonlinearError (x):=SaeError (x)−LinearError (x)
+Applying the Norm Prediction Test: For our first experiment, we run the norm prediction test from
+Eq.(2)on sixdifferentrandomvectors: x,Sae(x),Sae(x)−NonlinearError (x)(justthelinearlypredictable
+part of the SAE reconstruction), SaeError (x),LinearError (x), and NonlinearError (x). The results are
+shown as a violin plot for each component across all layer 20Gemma Scope SAEs in Fig. 7 (the Sae(x)bar
+is just a summary of Fig. 2).
+Firstly, we note that ∥x∥2
+2can almost be perfectly predicted from x. This is reassuring news for the linear
+representationhypothesis,asitimpliesthat xcanindeedbewellmodeledasthesumofmanyone-dimensional
+features, at least from the perspective of this test.
+We also find that NonlinearError (x)has a notably lower score on this test. This supports our hypothesis
+that unlike x, this component does not consist mostly of a sparse sum of linear features from x, and may be
+partly composed of Introduced (x).
+Training SAEs on SaeError (x)Components: Another empirical test we run is training an SAE on
+NonlinearError (x)and LinearError (x). Our hypothesis is that it will be harder to learn an SAE for
+8Under review as submission to TMLR
+16k 32k 65k131k 262k 524k1m
+SAE Width0255075100Percent Recovered When
+Replacing Layer (%)L0  60
+11 20 36 68138 310 427
+L0Width 16kR2
+Norm / T otal SAE Error NormReconstruction + Linear Error
+Reconstruction + Nonlinear Error
+Figure 9: Results of intervening in the forward pass and replacing xwith Sae(x) +NonlinearError (x)and
+Sae(x) +LinearError (x)during the forward pass. Reported in percent of cross entropy loss recovered with
+respect to the difference between the same intervention with Sae(x)and with the normal model forward
+pass.
+NonlinearError (x)than LinearError (x), since LinearError (x)should have a higher proportion of true
+linear features. We choose a fixed Gemma Scope layer 20SAE with 16klatents and L0≈60to generate
+SaeError (x)from. This SAE has nonlinear and linear components of the error approximately equal in
+norm andR2of the total SaeError (x)they explain, so it presents a fair comparison. We train SAEs to
+convergence (about 100M tokens) on each of these components of error and find that indeed, the SAE trained
+onNonlinearError (x)converges to a fraction of variance unexplained an absolute 5percent higher than
+the SAE trained on the linear component of SAE error ( ≈0.59and≈0.54respectively).
+One confounding factor is that the linear component of SAE error additionally contains Dense (x), which
+may also be harder for the SAE to learn. Thus, we additionally examine the interpretability of the learned
+SAE latents using automated interpretability (this technique was first proposed by Bills et al. (2023) for
+interpreting neurons, and first applied to SAEs by Cunningham et al. (2023)). Specifically, we use the
+implementation introduced by Juang et al. (2024), where a language model (we use Llama 3.1 70b (AI@Meta,
+2024)) is given top activating examples to generate an explanation, and then must use only that explanation
+to predict if the feature fires on a test context. Our results in Fig. 8 show that indeed, the SAE trained
+on linear error produces latents that are about an absolute 5%more interpretable across all activation
+firing deciles (we average results across 1000random features for both SAEs, where for each feature use 7
+examplesineachofthe 10featureactivationdecilesaswellas 50negativeexamples, andshow 95%confidence
+intervals).
+Downstream Cross Entropy Loss of SaeError (x)Components: AcommonmetricusedtotestSAEsis
+the percent of cross entropy loss recovered when the SAE reconstruction is inserted into the model in place of
+the original activation versus an ablation baseline (see e.g. Bloom (2024)). We modify this test to specifically
+examinethedifferentcomponentsof SaeError (x): wecomparethepercentofthecrossentropylossrecovered
+when replacing xwith Sae(x)plus either LinearError (x)orNonlinearError (x)to the baseline of inserting
+just Sae(x)in place of x. To estimate how much each component “should” recover, we use two metrics:
+the average norm of the component relative to the total norm of Sae(x)and the percent of the variance
+that the component recovers between Sae(x)andx. The results, shown in Fig. 9, show that for the most
+part these metrics are reasonable predictions for both types of error. That is, both NonlinearError (x)
+9Under review as submission to TMLR
+1051061070.00.10.20.3
+Unlearned Features
+Dense Features / Linear Error
+Nonlinear Error
+(from Dictionary and Sparsity)Pursuit SAE Reconstruction, FVU0.136+2.342W0.272
+Pursuit SAE Reconstruction + Error Prediction, FVU0.117
+SAE WidthFVU
+(a) SAE error breakdown vs. SAE width for infer-
+ence time optimized reconstructions from Gemma
+Scope L0≈60dictionaries.
+residual
+prev residualMLP
+attention0.000.200.400.60R²0.49
+0.14
+0.070.04Predicting
+Nonlinear Error
+residual
+prev residualMLP
+attention0.060.090.070.10Predicting
+SAE-Error
+residual
+prev residualMLP
+attention0.340.32
+0.160.18Predicting
+Linear Error(b) The R2of linearly predicting parts of SAE error from the
+SAE reconstructions of adjacent model components, layer 20
+Gemma Scope L0≈60,16kSAE width.
+Figure 10: Investigations towards reducing nonlinear SAE error.
+andLinearError (x)proportionally contribute to the SAE’s increase in downstream cross entropy loss, with
+possibly a slightly higher contribution than expected for LinearError (x).
+Using∥NonlinearError (x)∥to Predict Scaling: Following up on our discussion in Section 5.3, we are
+interested in whether NonlinearError (x)can help with predicting SAE per-token error norm scaling, as
+this might suggest that it contains a larger component of Introduced (x)than LinearError (x). Formally,
+we solve for
+d∗:= arg min
+d∈R⊭/vextenddouble/vextenddoubledT·[SaeError 1(x),NonlinearError 1(x)]−SAE 2(x)/vextenddouble/vextenddouble
+2(10)
+To evaluate the improvement of d∗relative to c∗from Eq. (5), we report the percent decrease in FVU; see
+Fig. 11. We find that using the norm of NonlinearError (x)provides a small but noticeable bump in the
+ability to predict larger SAE errors of up to a 5%decrease in FVU, validating this hypothesis.
+7 Reducing NonlinearError (x)
+If indeed NonlinearError (x)is partly made up of Introduced (x), we may be able to reduce it by improving
+SAEs. Thus, in this section, we investigate to what extent simple techniques can reduce NonlinearError (x).
+7.1 Using a More Powerful Encoder
+Our first approach for reducing nonlinear error is to try improving the encoder. We use a recent approach
+suggested by Smith (2024a): applying a greedy inference time optimization algorithm called gradient pursuit
+to a frozen learned SAE decoder matrix. We implement the algorithm exactly as described by Smith (2024a)
+and run it on all layer 20Gemma Scope 9bSAEs closest to L0≈60. For each example xwith reconstruction
+Sae(x), we use the gradient pursuit implementation with an L0exactly equal to the L0ofxin the original
+Sae(x).
+Usingthesenewreconstructionsof x, werepeatEq.(3)anddoalineartransformationfrom xtotheinference
+time optimized reconstructions. We then regenerate the same scaling plot as Fig. 1 and show this figure in
+Fig. 10a. Our first finding is that pursuit indeed decreases the total FVU of Sae(x)by3to5%; as Smith
+(2024a) only showed an improvement on a small 1layer model, to the best of our knowledge we are the first
+to show this result on state of the art SAEs. Our most interesting finding, however, is that the FVU nonlinear
+stays almost constant when compared to the original SAE scaling in Fig. 1.
+10Under review as submission to TMLR
+16k32k65k131k262k524k1m
+SAE Width (y)16k
+32k
+65k
+131k
+262k
+524k
+1mSAE Width (x)
+0246
+Figure 11: Percent decrease in FVU when additionally
+using the squared norms of nonlinear error to predict
+SAE error norm.In other words, if our tests are accurate, most of
+the reduction in FVU comes from better learning
+Dense (x)and reducing the linearly explainable er-
+ror, not from reducing Introduced (x). In Fig. 1, we
+plot the additional reduction in FVU nonlinear as the
+contribution of encoder error; because FVU nonlinear
+stays almost constant, this section is very narrow.
+7.2 Linear Projections Between Adjacent SAEs
+Our second approach for reducing nonlinear error is
+to try to linearly explain it in terms of the outputs
+of previous SAEs. The motivation for this approach
+is that during circuit analysis (see e.g. Marks et al.
+(2024)), an SAE is trained for every component in
+the model, and being able to explain parts of the
+SAE error in terms of prior SAEs would directly
+decrease the magnitude of noise terms in the dis-
+covered SAE feature circuits. For the Gemma 2 ar-
+chitecture at the locations the SAEs are trained on,
+each residual activation can be decomposed in terms
+of prior components:
+Resid layer =MlpOutlayer +RMSNorm (Oproj(AttnOut layer)) + Resid layer−1 (11)
+In Fig. 10b, we plot the R2of a regression from each of these right hand side components to each of the differ-
+ent components of an SAE trained on Resid layer(SaeError (x),LinearError (x), and NonlinearError (x))
+for layer 19-20with all SAEs chosen with width 16kandL0≈60. We find that we can explain a small
+amount (up to≈10%) of total SaeError (x)using previous components, which may be immediately useful
+for circuit analysis.
+We also find that SaeError (x)itself can explain 50%of the variance in the nonlinear error, although this
+may not be entirely surprising, as the nonlinear error is a function of Sae(x):
+NonlinearError (x) =SaeError (x)−LinearError (x)
+= (x−Sae(x))−LinearError (x)
+These results mean that we might be able to explain some of the SAE Error using a circuits level view, but
+overall there are still large parts of each error component unexplained.
+8 Conclusion
+The fact that SAE error can be predicted and analyzed at all is surprising; thus, our findings are intriguing
+evidence that SAE error, and not just SAE reconstructions, are worthy of analysis. Indeed, as a byproduct
+of studying SAE error, we have discovered a number of interesting practical applications: we can predict
+which tokens will have the highest error in a large SAE without needing to train it, and we can decrease
+error terms in SAE circuit analysis. Additionally, the presence of constant nonlinear error at a fixed sparsity
+as we scale implies that scaling SAEs may not be the only (or best) way to explain more of model behavior.
+Future work might explore alternative penalties besides sparsity or new ways to learn better dictionaries.
+We note that our tests are also approximate; we argue for the existence ofIntroduced (x)as a separate term
+from Dense (x), but the exact magnitude of each component remains uncertain. Ultimately, we believe that
+there is still room to make SAEs better, not just bigger.
+11Under review as submission to TMLR
+References
+AI@Meta. Llama 3 model card, 2024. URL https://github.com/meta-llama/llama3/blob/main/MODEL_
+CARD.md.
+Guillaume Alain. Understanding intermediate layers using linear classifier probes. arXiv preprint
+arXiv:1610.01644 , 2016.
+Evan Anders and Joseph Bloom. Examining language model performance with reconstructed acti-
+vations using sparse autoencoders. LessWrong , 2024. URL https://www.lesswrong.com/posts/
+8QRH8wKcnKGhpAu2o/examining-language-model-performance-with-reconstructed .
+Transformer Circuits Team Anthropic. Circuits updates april 2024, 2024. URL https://
+transformer-circuits.pub/2024/april-update/index.html#scaling-laws .
+Steven Bills, Nick Cammarata, Dan Mossing, Henk Tillman, Leo Gao, Gabriel Goh, Ilya Sutskever, Jan
+Leike, Jeff Wu, and William Saunders. Language models can explain neurons in language models. URL
+https://openaipublic. blob. core. windows. net/neuron-explainer/paper/index. html.(Date accessed: 14.05.
+2023), 2, 2023.
+Joseph Bloom. Open source sparse autoencoders for all residual stream lay-
+ers of gpt2 small. https://www.alignmentforum.org/posts/f9EgfLSurAiqRJySD/
+open-source-sparse-autoencoders-for-all-residual-stream , 2024.
+Trenton Bricken, Adly Templeton, Joshua Batson, Brian Chen, Adam Jermyn, Tom Conerly, Nick Turner,
+Cem Anil, Carson Denison, Amanda Askell, Robert Lasenby, Yifan Wu, Shauna Kravec, Nicholas Schiefer,
+Tim Maxwell, Nicholas Joseph, Zac Hatfield-Dodds, Alex Tamkin, Karina Nguyen, Brayden McLean,
+Josiah E Burke, Tristan Hume, Shan Carter, Tom Henighan, and Christopher Olah. Towards monose-
+manticity: Decomposing language models with dictionary learning. Transformer Circuits Thread , 2023.
+https://transformer-circuits.pub/2023/monosemantic-features/index.html.
+Bart Bussmann, Patrick Leask, Joseph Bloom, Curt Tigges, and Neel Nanda. Stitching saes of different
+sizes. AI Alignment Forum , 2024. URL https://www.alignmentforum.org/posts/baJyjpktzmcmRfosq/
+stitching-saes-of-different-sizes .
+Róbert Csordás, Christopher Potts, Christopher D Manning, and Atticus Geiger. Recurrent neural networks
+learn to store and generate sequences using non-linear representations. arXiv preprint arXiv:2408.10920 ,
+2024.
+Hoagy Cunningham, Aidan Ewart, Logan Riggs, Robert Huben, and Lee Sharkey. Sparse autoencoders find
+highly interpretable features in language models. arXiv preprint arXiv:2309.08600 , 2023.
+Nelson Elhage, Tristan Hume, Catherine Olsson, Nicholas Schiefer, Tom Henighan, Shauna Kravec, Zac
+Hatfield-Dodds, Robert Lasenby, Dawn Drain, Carol Chen, Roger Grosse, Sam McCandlish, Jared Kaplan,
+Dario Amodei, Martin Wattenberg, and Christopher Olah. Toy models of superposition. Transformer
+Circuits Thread , 2022. https://transformer-circuits.pub/2022/toy_model/index.html .
+Joshua Engels, Isaac Liao, Eric J Michaud, Wes Gurnee, and Max Tegmark. Not all language model features
+are linear. arXiv preprint arXiv:2405.14860 , 2024.
+Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason Phang, Horace
+He, Anish Thite, Noa Nabeshima, et al. The pile: An 800gb dataset of diverse text for language modeling.
+arXiv preprint arXiv:2101.00027 , 2020.
+Leo Gao, Tom Dupré la Tour, Henk Tillman, Gabriel Goh, Rajan Troll, Alec Radford, Ilya Sutskever, Jan
+Leike, and Jeffrey Wu. Scaling and evaluating sparse autoencoders. arXiv preprint arXiv:2406.04093 ,
+2024.
+Giorgi Giglemiani, Nora Petrova, Chatrik Singh Mangat, Jett Janiak, and Stefan Heimersheim. Evaluating
+synthetic activations composed of sae latents in gpt-2. arXiv preprint arXiv:2409.15019 , 2024.
+12Under review as submission to TMLR
+Wes Gurnee. Sae reconstruction errors are (empirically) pathological. In AI Alignment Forum , pp. 16, 2024.
+Stefan Heimersheim and Jake Mendel. Activation plateaus & sensitive directions in
+gpt2. LessWrong , 2024. URL https://www.lesswrong.com/posts/LajDyGyiyX8DNNsuF/
+interim-research-report-activation-plateaus-and-sensitive-1 .
+Albert Q Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chaplot, Diego
+de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile Saulnier, et al. Mistral 7b.
+arXiv preprint arXiv:2310.06825 , 2023.
+Caden Juang, Gonçalo Paulo, Jacob Drori, and Nora Belrose. Open source automated interpretability for
+sparse autoencoder features. https://blog.eleuther.ai/autointerp/ , 2024.
+Adam Karvonen, Benjamin Wright, Can Rager, Rico Angell, Jannik Brinkmann, Logan Smith, Clau-
+dioMayrinkVerdun,DavidBau,andSamuelMarks. Measuringprogressindictionarylearningforlanguage
+model interpretability with board game models. arXiv preprint arXiv:2408.00113 , 2024.
+Vedang Lad, Wes Gurnee, and Max Tegmark. The remarkable robustness of llms: Stages of inference? arXiv
+preprint arXiv:2406.19384 , 2024.
+Daniel Lee and Stefan Heimersheim. Investigating sensitive directions in gpt-2: An improved base-
+line and comparative analysis of saes. LessWrong , 2024. URL https://www.lesswrong.com/posts/
+dS5dSgwaDQRoWdTuu/investigating-sensitive-directions-in-gpt-2-an-improved .
+Tom Lieberum, Senthooran Rajamanoharan, Arthur Conmy, Lewis Smith, Nicolas Sonnerat, Vikrant Varma,
+János Kramár, Anca Dragan, Rohin Shah, and Neel Nanda. Gemma scope: Open sparse autoencoders
+everywhere all at once on gemma 2. arXiv preprint arXiv:2408.05147 , 2024.
+Samuel Marks, Can Rager, Eric J Michaud, Yonatan Belinkov, David Bau, and Aaron Mueller. Sparse
+feature circuits: Discovering and editing interpretable causal graphs in language models. arXiv preprint
+arXiv:2403.19647 , 2024.
+Jake Mendel. Sae feature geometry is outside the superposition hypothesis. AI Align-
+ment Forum , 2024. URL https://www.alignmentforum.org/posts/MFBTjb2qf3ziWmzz6/
+sae-feature-geometry-is-outside-the-superposition-hypothesis .
+Neel Nanda, Andrew Lee, and Martin Wattenberg. Emergent linear representations in world models of
+self-supervised sequence models. arXiv preprint arXiv:2309.00941 , 2023.
+Chris Olah. Interpretability dreams. Transformer Circuits , May 2023. URL https://
+transformer-circuits.pub/2023/interpretability-dreams/index.html .
+Kiho Park, Yo Joong Choe, and Victor Veitch. The linear representation hypothesis and the geometry of
+large language models. arXiv preprint arXiv:2311.03658 , 2023.
+Lewis Smith. Replacing sae encoders with inference-time optimisation. https://www.alignmentforum.
+org/s/AtTZjoDm8q3DbDT8Z/p/C5KAZQib3bzzpeyrg , 2024a.
+Lewis Smith. The ‘strong’ feature hypothesis could be wrong. AI Alignment Fo-
+rum, 2024b. URL https://www.alignmentforum.org/posts/tojtPCCRpKLSHBdpn/
+the-strong-feature-hypothesis-could-be-wrong .
+Gemma Team, Morgane Riviere, Shreya Pathak, Pier Giuseppe Sessa, Cassidy Hardin, Surya Bhupatiraju,
+Léonard Hussenot, Thomas Mesnard, Bobak Shahriari, Alexandre Ramé, et al. Gemma 2: Improving
+open language models at a practical size. arXiv preprint arXiv:2408.00118 , 2024.
+Adly Templeton, Tom Conerly, Jonathan Marcus, Jack Lindsey, Trenton Bricken, Brian Chen, Adam
+Pearce, Craig Citro, Emmanuel Ameisen, Andy Jones, Hoagy Cunningham, Nicholas L Turner, Cal-
+lum McDougall, Monte MacDiarmid, C. Daniel Freeman, Theodore R. Sumers, Edward Rees, Joshua
+Batson, Adam Jermyn, Shan Carter, Chris Olah, and Tom Henighan. Scaling monosemanticity: Ex-
+tracting interpretable features from claude 3 sonnet. Transformer Circuits Thread , 2024. URL https:
+//transformer-circuits.pub/2024/scaling-monosemanticity/index.html .
+13Under review as submission to TMLR
+0 20 40 60 80 100
+T oken405060708090100L2 NormNorm of Linearly Predictable Error
+0 20 40 60 80 100
+T okenNorm of Non-Linearly Predictable Error
+SAE Width
+16k
+32k
+65k
+131k
+262k
+524k
+1m
+Figure 12: Per-token breakdown of linearly predictable and non-linearly predictable SAE error across SAE
+scale. We show the same tokens as in Fig. 6. The norm of linear error decreases with SAE width, whereas
+the norm of nonlinear error stays mostly constant.
+A Extra Error Prediction Experiments
+A.1 Note on Feature Shrinkage
+Earlier SAE variants were prone to feature shrinkage : the observation that Sae(x)systematically undershot
+x. Current state of the art SAE variants (e.g. JumpReLU SAEs, which we examine in this work), are less
+vulnerable to this problem, although we still find that Gemma Scope reconstructions have about a 10%
+smaller norm than x. One potential concern is that the b∗in Eq. (3) that we learn is merely predicting this
+shrinkage. If this was the case, then the cosine similarity of the linear error prediction (b∗)T·xwithxwould
+be close to 1; however, in practice we find that it is around 0.5, sob∗is indeed doing more than predicting
+shrinkage.
+A.2 Breaking Apart Error Per Token
+In Fig. 12, we show the same subset of tokens as in Fig. 6, but now broken apart into linearly predictable and
+non-linearly predictable components. That is, we learn b∗for each SAE as in Eq. (3), and then plot the norm
+ofb∗·xat the norm of the linearly predictable error on the left, and plot the norm of SaeError (x)−b∗·x
+as the norm of the non-linearly predictable error on the right. We see that the linearly predictable error
+decreases as we scale SAE width, but the non-linearly predictable error mostly stays constant. This is
+especially interesting because the result in Fig. 1 just found this on an average level, whereas here we find
+the same result holds on a per-token level.
+A.3 Norm Prediction Baselines
+In Fig. 13, we run a linear regression from different components to ∥SaeError (x)∥. We find that is is not
+“easy” to predict SAE error norm, especially at later layers; the token identity, SAE L0, activation norm,
+and model loss all do significantly worse than using the full activation. It is interesting to note that at the
+first few layers, token identity does better at predicting SAE error than a probe of the activations; this is
+perhaps not surprising, since recent results from e.g. Lad et al. (2024) show that very early layers primarily
+operate on a per token level.
+B More Info on Modeling Activations
+B.1 Proof of Claim from Section 5.1
+Say we have a set of munit vectors y1,y2,...,ym∈Rd. We will call these “feature vectors”. Define
+Y∈Rd×mas the matrix with the feature vectors as columns. We then define the Gram matrix GY∈Rm×m
+14Under review as submission to TMLR
+0 10 20 30 40
+Layer0.000.250.500.751.00R^2Acts
+T okensModel Loss
+L0Act Norm
+Figure 13: R2for linear regressions of SAE error
+norms with different regressors. We run on Gemma
+Scope 9B SAEs of size 131kwithL0≈60. Activa-
+tions perform the best except on the first few layers.
+0 2500 5000 7500 10000
+SAE Latent Index
+Sorted by Average Active Value200
+100
+0100200300(a*)Tfeature
+Running window average of (a*)Tfeature
+Average feature value when activeFigure 14: Average SAE latent activation and dot
+product of the latent with the learned norm predic-
+tion vector a∗for the Gemma Scope layer 20, width
+131k,L0= 62SAE. We also plot a smoothed ver-
+sion of this dot product with a smoothed window of
+10.
+of dot products on Y:
+(GY)ij= (YTY)ij=yi·yj
+We now will define a random column vector xthat is a weighted positive sum of the mfeature vectors, that
+is,x=/summationtext
+iwiyifor a non-negative random vector w∈Rm. We say feature vector yiis active if w i>0. We
+now define the autocorrelation matrix Rw∈Rm×mforwas
+R=E(wwT).
+We are interested in breaking down xinto its components, so we define a random matrix XasXij=wjYij,
+i.e. the columns of Ymultiplied by w. We can now define the Gram matrix GX∈Rm×m:
+(GX)ij= (XTX)ij=wiwjyi·yj
+GX= (wwT)⊙GY
+E(GX) =Rw⊙GY,
+where⊙denotes Schur (elementwise) multiplication. The intuition here is that the expected dot product be-
+tween columns of Xdepends on the dot product between the corresponding columns of Yand the correlation
+of the corresponding elements of the random vector.
+We will now examine the L2 norm of x:
+∥x∥2
+2=/summationdisplay
+ijwiwjyiyj
+=/vextenddouble/vextenddouble(wTw)⊙GY/vextenddouble/vextenddouble2
+F= Tr(wwtGY) =wG YwT
+We can also take the expected value:
+E(∥x∥2
+2) = Tr( RwGY)
+15Under review as submission to TMLR
+Our goal is to find a direction a∈Rdthat when dotted with xpredicts∥x∥2
+2. In other words, we want to
+findasuch that
+∥x∥2
+2≈aTx=aT/summationdisplay
+iwiyi=aTYw
+Combining equations, we want to find asuch that
+aTYw≈∥x∥2
+2= (vwTGYw)
+Let us first consider the simple case where for all i̸=j,yiandyjare perpendicular. Then our goal is to find
+asuch that
+aTYw≈Tr(wG YwT) =/summationdisplay
+i⟨yi,yi⟩w2
+i=/summationdisplay
+iw2
+i=∥w∥2
+2=wTw
+Since all of the yiare perpendicular, WLOG we can write a=/summationtext
+ibiyi+cfor a vector c∈Rdperpendicular
+to all yiand a vector b∈Rm. Then we have
+aTYw=/parenleftigg/summationdisplay
+ibiyi+c/parenrightiggT
+Yw
+=bTw
+Since ordinary least squares produces an unbiased estimator, we know that if we use ordinary least squares
+to solve for b,E(bTw) =E(wTw). Thus,
+/summationdisplay
+ibiE(wi) =/summationdisplay
+iE(w2
+i)
+bi=E(w2
+i)/E(wi)
+Now that we have bi, we can solve for the correlation coefficient between aTx=bTwand∥x∥2
+2=wTw.
+This gets messy when using general distributions, so we focus on a few simple cases.
+The first is the case where each w iis a scaled independent Bernoulli distribution, so wiissiwith probability
+piand0otherwise. Then bi=si. We also have that E(wTw) =E(bTw) =/summationtext
+is2
+ipi=µ.
+ρ=E(bTwwTw)−µ2
+/radicalbig
+E(wTwwTw)−µ2/radicalbig
+E(bTwbTw)−µ2
+=/summationtext
+is4
+i(pi−p2
+i)/radicalbig/summationtext
+is4
+i(pi−p2
+i)/radicalbig/summationtext
+is4
+i(pi−p2
+i)= 1
+That is, for Bernoulli variables, x=/summationtext
+isiyiis a perfect regression vector.
+The second is the case when each w iis an independent Poisson distribution with parameter λi. Then
+E(wi) =λiandE(w2
+i) =λ2
+i+λi, sobi=λi+ 1. We also have that E(wTw) =E(bTw) =/summationtext
+iλ2
+i+λi=µ.
+Finally, we will use the fact that E(w3
+i) =λ3
+i+ 3λ2
+i+λiandE(w4
+i) =λ4+ 6λ3+ 7λ2+λ. Then via algebra
+we have that
+ρ=/summationtext
+i2λ3
+i+ 3λ2
+i+λi/radicalbig/summationtext
+i4λ3+ 6λ3
+i+λi/radicalbig/summationtext
+iλ3
+i+ 2λ2
+i+λi
+For the special case λi= 1, we then have
+ρ=6√
+66≈0.73
+16Under review as submission to TMLR
+50% 40% 30% 20% 10% 0%
+% features ablated0.00.1FVULinear Error
+f(Activation Noise)
+Nonlinear Error
+f(Reconstruction Noise)Sae(x/prime) Noise Var = 1, x/prime Noise Var = 0.6
+50% 40% 30% 20% 10% 0%
+% features ablated0.00.1FVULinear Error
+f(Activation Noise)
+Nonlinear Error
+f(Reconstruction Noise)Sae(x/prime) Noise Var = 0.6, x/prime Noise Var = 1
+0.0 1.0 2.0 3.0 4.0
+True Nonlinear Noise Var0.0
+1.0
+2.0
+3.0
+4.0True Linear Noise Var                                (FVU difference)
+0.0 1.0 2.0 3.0 4.0
+True Nonlinear Noise Var0.0
+1.0
+2.0
+3.0
+4.0True Linear Noise Var                             (FVU difference)
+0.51.0
+0.20.4Est Nonlinear Error Est Linear Error
+Figure 15: Top:When controlled amounts of noise are added to synthetic data Sae(x′)andx′, the result
+is a plot similar to Fig. 1. Bottom: The nonlinear and linear error estimates (as shown at top) accurately
+correlate with the amount of noise added. The exact correlation between synthetic added noise and resulting
+estimated error components across these noise levels are shown in Table 1
+B.2 Empirical Norm Prediction
+In this experiment, we aim to determine to what extent our analysis in Section 5.1 holds true in practice on
+almostorthogonaltrueSAEfeatures. Thus, weusearandomvectorthatwecancontrol: Sae(x). Specifically,
+we learn a probe a∗for the Gemma Scope layer 20, width 131k,L0= 62SAE as in Eq. (2), except with the
+regressor equal to Sae(x)and the target equal to ∥Sae(x)∥:
+a∗= arg min
+a∈R/vextenddouble/vextenddoubleaT·Sae(x)−∥Sae(x)∥2
+2/vextenddouble/vextenddouble
+2(12)
+One important note is that we subtract the bias from Sae(x)so that it is purely a sparse sum of SAE features
+(this makes analysis easier). For each SAE latent from the SAE, we then compute
+(a∗)T·latent i (13)
+Finally, we plot this dot product against the average latent activation in Fig. 14. If a∗indeed equals the sum
+of the latents weighted by their activation, as we predict in Section 5.1, then these two quantities should be
+approximately equal, which we indeed see in the figure.
+B.3 Synthetic SAE Error Vector Experiments
+The results for different Gaussian noise amounts versus percentage of features ablated are shown in Fig. 15.
+On this distribution of vectors, the test works as expected; the variance explained by Sae(x) +aTxis a
+horizontal line proportional to Introduced (x), while the gap between this horizontal line and the asymptote
+of the variance explained by Sae(x)is proportional to Dense (x).
+We also tried running this test on a sparse sum of randomvectors, which did not work as well, possibly due
+to not including the structure of the SAE vectors (Giglemiani et al., 2024); see Appendix C for more details.
+17Under review as submission to TMLR
+C Synthetic Experiments with Random Data
+For this set of experiments, we generated a random vector x′that was the sum of a power law of 100k
+random gaussian vectors in R4000with expected L0of around 100. To simulate the SAE reconstruction and
+SAE error, we simply masked a portion of the vectors in the sum of x′. Unlike the more realistic synthetic
+data case we describe in Appendix B.3, this did not work as expected: even in the case with no noise added
+tox′or the simulated reconstruction, the variance explained by the sum of the linear estimate of the error
+plus the reconstructed vectors plotted against the number of features “ablated” formed a parabola (with
+minimum variance explained in the middle region), as opposed to a straight line as in Fig. 15.
+We note that this result is not entirely surprising: other works have found that random vectors are a bad
+synthetic test case for language model activations. For example, in the setting of model sensitivity to
+perturbations of activations, Giglemiani et al. (2024) found they needed to control for both sparsity and
+cosine similarity of SAE latents to produce synthetic vectors that mimic SAE latents when perturbed.
+18

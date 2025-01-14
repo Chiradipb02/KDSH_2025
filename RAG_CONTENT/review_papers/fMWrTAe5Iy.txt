@@ -1,0 +1,1141 @@
+R2-Gaussian: Rectifying Radiative Gaussian Splatting
+for Tomographic Reconstruction
+Ruyi Zha1Tao Jun Lin1Yuanhao Cai2,∗Jiwen Cao1
+Yanhao Zhang3Hongdong Li1
+1The Australian National University2Johns Hopkins University
+3Robotics Institute, University of Technology Sydney
+{ruyi.zha, taojun.lin, jiwen.cao, hongdong.li}@anu.edu.au
+caiyuanhao1998@gmail.com yanhao.zhang@uts.edu.au
+Abstract
+3D Gaussian splatting (3DGS) has shown promising results in image rendering and
+surface reconstruction. However, its potential in volumetric reconstruction tasks,
+such as X-ray computed tomography, remains under-explored. This paper intro-
+duces R2-Gaussian, the first 3DGS-based framework for sparse-view tomographic
+reconstruction. By carefully deriving X-ray rasterization functions, we discover
+a previously unknown integration bias in the standard 3DGS formulation, which
+hampers accurate volume retrieval. To address this issue, we propose a novel recti-
+fication technique via refactoring the projection from 3D to 2D Gaussians. Our new
+method presents three key innovations: (1) introducing tailored Gaussian kernels,
+(2) extending rasterization to X-ray imaging, and (3) developing a CUDA-based dif-
+ferentiable voxelizer. Experiments on synthetic and real-world datasets demonstrate
+that our method outperforms state-of-the-art approaches in accuracy and efficiency.
+Crucially, it delivers high-quality results in 4 minutes, which is 12 ×faster than
+NeRF-based methods and on par with traditional algorithms. Code and models are
+available on the project page https://github.com/Ruyi-Zha/r2_gaussian .
+1 Introduction
+Computed tomography (CT) is an essential imaging technique for noninvasively examining the
+internal structure of objects. Most CT systems use X-rays as the imaging source thanks to their
+ability to penetrate solid substances [ 20]. During a CT scan, an X-ray machine captures multi-angle
+2D projections that measure ray attenuation through the material. As the core of CT, tomographic
+reconstruction aims to recover the 3D density field of the object from its projections. This task is
+challenging in two aspects. Firstly, the harmful X-ray radiation limits the acquisition of sufficient
+and noise-free projections, making reconstruction a complex and ill-posed problem. Secondly,
+time-sensitive applications like medical diagnosis require algorithms to deliver results promptly.
+Existing tomography methods suffer from either suboptimal reconstruction quality or slow processing
+speed. Traditional CT algorithms [ 13,2,55] deliver results in minutes but induce serious artifacts. Su-
+pervised learning-based approaches [ 32,33,10,35] achieve promising outcomes by learning semantic
+priors but struggle with out-of-distribution objects. Recently, neural radiance fields (NeRF) [ 43] have
+been applied to tomography and perform well in per-case reconstruction [ 67,66,48,6,54]. However,
+they are very time-consuming ( >30minutes) because a huge amount of points have to be sampled
+for volume rendering.
+∗Yuanhao Cai is the corresponding author.
+38th Conference on Neural Information Processing Systems (NeurIPS 2024).Chest (50-view)Ground TruthOurs (iter=30k)35.01 dB, 10 minOurs (iter=10k)34.56 dB, 3 minSAX-NeRF34.45 dB, 792 minNAF33.99 dB, 32 minIntraTomo33.19 dB, 138 minFigure 1: We compare our method to state-of-the-art NeRF-based methods (IntraTomo [ 66], NAF [ 67],
+SAX-NeRF [ 6]) in terms of visual quality, PSNR (dB), and training time (minute). Our method
+achieves the highest reconstruction quality and is significantly faster than other methods.
+Recently, 3D Gaussian splatting (3DGS) [ 23] has outperformed NeRF in both quality and efficiency
+for view synthesis [ 64,38,31] and surface reconstruction [ 16,18,65]. However, attempts to apply
+the 3DGS technique to volumetric reconstruction tasks, such as X-ray tomography, are limited and
+ineffective. Some concurrent works [ 7,14] empirically modify 3DGS for X-ray view synthesis, but
+they treat it solely as a data augmentation tool for traditional tomography algorithms. To date, there
+is no 3DGS-based method for direct CT reconstruction.
+In this paper, we reveal an inherent integration bias in 3DGS. This bias, despite having a negligible
+impact on image rendering, critically hampers volumetric reconstruction. To be more specific, we
+will show in Sec. 4.2.1 that the standard 3DGS overlooks a covariance-related scaling factor when
+splatting a 3D Gaussian kernel onto the 2D image plane. This formulation leads to inconsistent
+volumetric properties queried from different views. Besides the integration bias, there are other
+challenges in applying 3DGS to tomography, such as the difference between natural light and X-ray
+imaging and the lack of an effective technique to query volumes from kernels.
+We propose R2-Gaussian (Rectified Radiative Gaussians) to extend 3DGS to sparse-view tomographic
+reconstruction. R2-Gaussian achieves a bias-free training pipeline with three significant improve-
+ments. Firstly , we introduce a novel radiative Gaussian kernel, which acts as a local density field
+parameterized by central density, position, and covariance. We initialize Gaussian parameters using
+the analytical method FDK [ 13] and optimize them with photometric losses. Secondly , we rectify
+the 3DGS rasterizer to support X-ray imaging. This is achieved by deriving new X-ray rendering
+functions and correcting the integration bias for accurate density retrieval. Thirdly , we develop a
+CUDA-based differentiable voxelizer, which not only extracts 3D volumes from Gaussians but also
+enables voxel-based regularization during training. We evaluate R2-Gaussian on both synthetic and
+real-world datasets. Extensive experiments demonstrate that our method surpasses state-of-the-art
+(SOTA) methods within 4 minutes, which is 12×faster than the most efficient NeRF-based solution,
+NAF [ 67] and comparable to traditional algorithms. It converges to optimal results in 15 minutes,
+improving PSNR by 0.6 dB compared to SOTA methods. A visual comparison is shown in Fig. 1.
+Our contributions can be summarized as follows: (1) We discover a previously unknown integration
+bias in 3DGS that impedes volumetric reconstruction. (2) We propose the first 3DGS-based tomogra-
+phy framework by introducing new kernels, extending rasterization to X-ray imaging, and developing
+a differentiable voxelizer. (3) Our method significantly outperforms state-of-the-art methods in both
+reconstruction quality and training speed, highlighting its practical value.
+2 Related work
+Tomographic reconstruction Computed tomography (CT) is widely used for non-intrusive inspec-
+tion in medicine [ 17,22], biology [ 12,39,24], and industry [ 11]. Conventional fan-beam CT produces
+a 3D volume by reconstructing each slice from 1D projection arrays. Recently, the cone-beam scanner
+has become popular for its fast scanning and high resolution [ 52], leading to the demand for 3D
+tomography, i.e., recovering the volume directly from 2D projection images. Our work focuses on
+3D sparse-view reconstruction where less than a hundred projections are captured to reduce radiation
+exposure. Traditional algorithms are mainly grouped into analytical and iterative methods. Analytical
+2methods like filtered back projection (FBP) and its 3D variant FDK [ 13] produce results instantly
+(<1second) by solving the Radon transform and its inverse [ 46]. However, they introduce serious
+streak artifacts in sparse-view scenarios. Iterative methods [ 2,55,40,51] formulate tomography as a
+maximum-a-posteriori problem and iteratively minimize the energy function with regularizations.
+They successfully suppress artifacts but take longer time ( <10minutes) and lose structure details.
+Deep learning methods can be categorized as supervised and self-supervised families. Supervised
+methods learn semantic priors from CT datasets. They then use the trained networks to inpaint
+projections [ 3,15], denoise volumes [ 10,28,35,37] or directly output results [ 19,63,1,32,33].
+Supervised learning methods perform well in cases similar to training sets but suffer from poor genera-
+tion ability when applied to unseen data. To overcome this limitation, some studies [ 67,66,48,6,54]
+handle tomography in a self-supervised learning fashion. Inspired by NeRF [ 43], they model the
+density field with coordinate-based networks and optimize them with photometric losses. Although
+NeRF-based methods excel in per-case reconstruction, they are time-consuming ( >30 minutes) due
+to the extensive point sampling in volume rendering. Our work can be put into the self-supervised
+learning family, but it greatly accelerates the training process and improves reconstruction quality.
+3DGS 3D Gaussian splatting [ 23] outperforms NeRF in speed by leveraging highly parallelized
+rasterization for image rendering. 3DGS represents objects with a set of trainable Gaussian-shaped
+primitives. It has achieved great success in RGB tasks, including surface reconstruction [ 16,18,65],
+dynamic scene modeling [ 60,34,61], human avatar [ 36,30,27], 3D generation [ 57,62,9], etc.
+Some concurrent works have extended 3DGS to X-ray imaging. X-Gaussian [ 7] modify 3DGS to
+synthesize novel-view X-ray projections. Gao et al. [14] improve X-Gaussian by considering complex
+noise-inducing physical effects. While they produce plausible 2D X-ray projections, they cannot
+directly extract 3D density volumes from trained Gaussians. Instead, they first augment projections
+with 3DGS, and then use traditional algorithms such as FDK for CT reconstruction, which is neither
+efficient nor effective. Li et al. [29] represent the density field with customized Gaussian kernels, but
+they replace the efficient rasterization with existing CT simulators. In comparison, our work can both
+rasterize X-ray projections and voxelize density volumes from Gaussians.
+3 Preliminary
+3.1 X-ray imaging
+Circular Scanning
+Source
+Object<latexit sha1_base64="tCzMifK0EAGCDIkjmsmlVUToe9k=">AAAB+3icbVDLSgMxFM3UV62vsS7dBItQN2VGpHZZcOOygn1AZyiZNNOGJpkhyUjLML/ixoUibv0Rd/6NmXYW2nogcDjnXu7JCWJGlXacb6u0tb2zu1ferxwcHh2f2KfVnooSiUkXRyySgwApwqggXU01I4NYEsQDRvrB7C73+09EKhqJR72Iic/RRNCQYqSNNLKrnqITjuoeR3oahOk8uxrZNafhLAE3iVuQGijQGdlf3jjCCSdCY4aUGrpOrP0USU0xI1nFSxSJEZ6hCRkaKhAnyk+X2TN4aZQxDCNpntBwqf7eSBFXasEDM5lHVOteLv7nDRMdtvyUijjRRODVoTBhUEcwLwKOqSRYs4UhCEtqskI8RRJhbeqqmBLc9S9vkt51w202mg83tXarqKMMzsEFqAMX3II2uAcd0AUYzMEzeAVvVma9WO/Wx2q0ZBU7Z+APrM8f7zWUXA==</latexit> (x)<latexit sha1_base64="gb2t6EWcFvZxx5LHsZg+uckV7tM=">AAAB9HicbVDLSsNAFL3xWeur6tJNsAh1UxKR2mXBjcsK9gFtKJPppB06mcSZm0IJ/Q43LhRx68e482+ctFlo64GBwzn3cs8cPxZco+N8WxubW9s7u4W94v7B4dFx6eS0raNEUdaikYhU1yeaCS5ZCzkK1o0VI6EvWMef3GV+Z8qU5pF8xFnMvJCMJA84JWgkrx8SHPtBquYVvBqUyk7VWcBeJ25OypCjOSh99YcRTUImkQqidc91YvRSopBTwebFfqJZTOiEjFjPUElCpr10EXpuXxplaAeRMk+ivVB/b6Qk1HoW+mYyC6lXvUz8z+slGNS9lMs4QSbp8lCQCBsjO2vAHnLFKIqZIYQqbrLadEwUoWh6KpoS3NUvr5P2ddWtVWsPN+VGPa+jAOdwARVw4RYacA9NaAGFJ3iGV3izptaL9W59LEc3rHznDP7A+vwBm7GR+g==</latexit>r(t)
+<latexit sha1_base64="0D//HFCsodPZi4RUuiPrVVdtQ64=">AAAB7HicbVBNS8NAEJ3Ur1q/qh69LBbBU0lEao8FLx4rmFpoQ9lsN+3SzSbsToQS+hu8eFDEqz/Im//GbZuDtj4YeLw3w8y8MJXCoOt+O6WNza3tnfJuZW//4PCoenzSMUmmGfdZIhPdDanhUijuo0DJu6nmNA4lfwwnt3P/8YlrIxL1gNOUBzEdKREJRtFKPg5yNRtUa27dXYCsE68gNSjQHlS/+sOEZTFXyCQ1pue5KQY51SiY5LNKPzM8pWxCR7xnqaIxN0G+OHZGLqwyJFGibSkkC/X3RE5jY6ZxaDtjimOz6s3F/7xehlEzyIVKM+SKLRdFmSSYkPnnZCg0ZyinllCmhb2VsDHVlKHNp2JD8FZfXiedq7rXqDfur2utZhFHGc7gHC7BgxtowR20wQcGAp7hFd4c5bw4787HsrXkFDOn8AfO5w8ndo7m</latexit>tn
+<latexit sha1_base64="cgNXU/OUszK4Wt6EWl/8XYPuqbE=">AAAB7HicbVBNS8NAEJ3Ur1q/qh69LBbBU0lEao8FLx4rmFpoQ9lsN+3SzSbsToQS+hu8eFDEqz/Im//GbZuDtj4YeLw3w8y8MJXCoOt+O6WNza3tnfJuZW//4PCoenzSMUmmGfdZIhPdDanhUijuo0DJu6nmNA4lfwwnt3P/8YlrIxL1gNOUBzEdKREJRtFKPg7yaDao1ty6uwBZJ15BalCgPah+9YcJy2KukElqTM9zUwxyqlEwyWeVfmZ4StmEjnjPUkVjboJ8ceyMXFhlSKJE21JIFurviZzGxkzj0HbGFMdm1ZuL/3m9DKNmkAuVZsgVWy6KMkkwIfPPyVBozlBOLaFMC3srYWOqKUObT8WG4K2+vE46V3WvUW/cX9dazSKOMpzBOVyCBzfQgjtogw8MBDzDK7w5ynlx3p2PZWvJKWZO4Q+czx8bTo7e</latexit>tfProjection
+<latexit sha1_base64="t4wTtMGfDhK6mNM/tE0ot67e9Cw=">AAAB8XicbVC7SgNBFL0bXzG+opaCDAbBKuxaxHQGbLRLwDwwWcLsZDYZMju7zMwKYUnpH9hYKGLrD6TyI+z8Bn/C2SSFJh64cDjnXu6514s4U9q2v6zMyura+kZ2M7e1vbO7l98/aKgwloTWSchD2fKwopwJWtdMc9qKJMWBx2nTG16lfvOeSsVCcatHEXUD3BfMZwRrI911AqwHnp/cjLv5gl20p0DLxJmTwuXHpPb9cDypdvOfnV5I4oAKTThWqu3YkXYTLDUjnI5znVjRCJMh7tO2oQIHVLnJNPEYnRqlh/xQmhIaTdXfEwkOlBoFnulME6pFLxX/89qx9stuwkQUayrIbJEfc6RDlJ6PekxSovnIEEwkM1kRGWCJiTZPypknOIsnL5PGedEpFUs1u1ApwwxZOIITOAMHLqAC11CFOhAQ8AjP8GIp68l6td5mrRlrPnMIf2C9/wB9ppU2</latexit>I
+<latexit sha1_base64="PEHb6VM3mOs1QxxIAhS7h0+XLks=">AAAB9HicbVC7SgNBFL0bX0l8RW0Em8EgxCbsWsSUQRvtIpgHJEuYncwmQ2Zn15nZQFwC/oWNhSK2Fn6KneDHOHkUmnhg4HDOvdwzx4s4U9q2v6zUyura+kY6k93c2t7Zze3t11UYS0JrJOShbHpYUc4ErWmmOW1GkuLA47ThDS4nfmNIpWKhuNWjiLoB7gnmM4K1kdzrQjvAuu/5iRyfdnJ5u2hPgZaJMyf5yuH9d+bh46LayX22uyGJAyo04ViplmNH2k2w1IxwOs62Y0UjTAa4R1uGChxQ5SbT0GN0YpQu8kNpntBoqv7eSHCg1CjwzOQkolr0JuJ/XivWftlNmIhiTQWZHfJjjnSIJg2gLpOUaD4yBBPJTFZE+lhiok1PWVOCs/jlZVI/KzqlYunGtFGGGdJwBMdQAAfOoQJXUIUaELiDR3iGF2toPVmv1ttsNGXNdw7gD6z3H5enlPY=</latexit>I(r)
+Figure 2: A detection plane captures the atten-
+uation of X-rays emitted from different angles.A projection I∈RH×Wmeasures ray attenuation
+through the material as shown in Fig. 2. For an X-
+rayr(t) =o+td∈R3with initial intensity I0and
+path bounds tnandtf, the corresponding raw pixel
+value I′(r)is given with the Beer-Lambert Law [ 20]
+by:I′(r) =I0exp(−Rtf
+tnσ(r(t))dt). Here, σ(x)
+is the isotropic density (or attenuation coefficient in
+physics) at position x∈R3. Tomography typically
+transforms raw data to the logarithmic space for
+computational simplicity, i.e.,
+I(r) = log I0−logI′(r) =Ztf
+tnσ(r(t))dt, (1)
+where each pixel value I(r)represents the density
+integral along the ray path. Except otherwise spec-
+ified, we use the logarithmic projections as inputs.
+The goal of tomographic reconstruction is to esti-
+mate the 3D distribution of σ(x), output as a discrete volume, with X-ray projections {Ii}i=1,···,N
+captured from Ndifferent angles. Note that real-world projections contain minor anisotropic physical
+effects such as Compton scattering. Following previous works [ 13,2,55,67], we do not explicitly
+model them but treat them as noise during the reconstruction.
+3.2 3D Gaussian splatting
+3D Gaussian splatting [ 23] models the scene with a set of 3D Gaussian kernels G3={G3
+i}i=1,···,M,
+each parameterized by position, covariance, color, and opacity. A rasterizer Rrenders an RGB image
+3Radiative Gaussian
+<latexit sha1_base64="HUt7aIuQBwxdyEC3yOpvl6I+4fI=">AAACcXicfVHLahsxFNVM0tZ1X+5jE0qLsCk4BJsZtzjZBAxZpMuE1g/w2EYja2wRzWiQ7oQYMft+X3b5iWzyA9H4AaldekFwOA90dRSmgmvwvDvH3dt/9vxF6WX51es3b99V3n/oaZkpyrpUCqkGIdFM8IR1gYNgg1QxEoeC9cOrs0LvXzOluUx+wyJlo5jMEh5xSsBSk8qf8/H3ieF5PYgJzMPI3OSHp4Gay4LEAZ1KwGxscCOIFKHGz03rqbexgWleBA7HAcgUb8jgF5/FZKmMTcP/XzCfVGpe01sO3gX+GtTQei4mldtgKmkWswSoIFoPfS+FkSEKOBUsLweZZimhV2TGhhYmJGZ6ZJaN5fibZaY4ksqeBPCSfZowJNZ6EYfWWeypt7WC/Jc2zCA6GRmepBmwhK4uijKBQeKifjzlilEQCwsIVdzuiumc2GrBflLZluBvP3kX9FpNv91sX/6odVrrOkroM6qiOvLRMeqgn+gCdRFF984n54vz1XlwD1zsVldW11lnPqK/xj16BK2Nv3c=</latexit>G3i(x)=⇢i·e 12(x pi)>⌃ 1i(x pi)
+<latexit sha1_base64="2nEUPTw/XyKHTAW2A+0bZl7jfkw=">AAAB73icbVBNSwMxEJ3Ur1q/qh69BIvgqewWqR4LXjxWsB/QLiWbZtvQbLImWaEs/RNePCji1b/jzX9j2u5BWx8MPN6bYWZemAhurOd9o8LG5tb2TnG3tLd/cHhUPj5pG5VqylpUCaW7ITFMcMlallvBuolmJA4F64ST27nfeWLacCUf7DRhQUxGkkecEuukbl+P1SDjs0G54lW9BfA68XNSgRzNQfmrP1Q0jZm0VBBjer6X2CAj2nIq2KzUTw1LCJ2QEes5KknMTJAt7p3hC6cMcaS0K2nxQv09kZHYmGkcus6Y2LFZ9ebif14vtdFNkHGZpJZJulwUpQJbhefP4yHXjFoxdYRQzd2tmI6JJtS6iEouBH/15XXSrlX9erV+f1Vp1PI4inAG53AJPlxDA+6gCS2gIOAZXuENPaIX9I4+lq0FlM+cwh+gzx9iX5Aq</latexit>⇢i
+<latexit sha1_base64="4zm5/uPAvHap/vFISj5mN300p5s=">AAAB9XicbVBNSwMxFHxbv2r9qnr0EiyCp7JbpHosePFYwbZCu5Zsmm1Ds9mQZJWy7P/w4kERr/4Xb/4bs+0etHUgMMy8x5tMIDnTxnW/ndLa+sbmVnm7srO7t39QPTzq6jhRhHZIzGN1H2BNORO0Y5jh9F4qiqOA014wvc793iNVmsXizswk9SM8FixkBBsrPQwibCZBmMpsmLJsWK25dXcOtEq8gtSgQHtY/RqMYpJEVBjCsdZ9z5XGT7EyjHCaVQaJphKTKR7TvqUCR1T76Tx1hs6sMkJhrOwTBs3V3xspjrSeRYGdzFPqZS8X//P6iQmv/JQJmRgqyOJQmHBkYpRXgEZMUWL4zBJMFLNZEZlghYmxRVVsCd7yl1dJt1H3mvXm7UWt1SjqKMMJnMI5eHAJLbiBNnSAgIJneIU358l5cd6dj8VoySl2juEPnM8fPkeS9w==</latexit>pi
+<latexit sha1_base64="fJmJvLq6fSSzAXd7LxCwbA/z7dI=">AAAB/HicbVDLSsNAFJ3UV62vaJduBovgqiRFqsuCG5cV7QOaECbTSTt0ZhJmJkII9VfcuFDErR/izr9x0mahrQcGDufcyz1zwoRRpR3n26psbG5t71R3a3v7B4dH9vFJX8WpxKSHYxbLYYgUYVSQnqaakWEiCeIhI4NwdlP4g0ciFY3Fg84S4nM0ETSiGGkjBXbd40hPwyj37umEo3mQ03lgN5ymswBcJ25JGqBEN7C/vHGMU06ExgwpNXKdRPs5kppiRuY1L1UkQXiGJmRkqECcKD9fhJ/Dc6OMYRRL84SGC/X3Ro64UhkPzWQRVa16hfifN0p1dO3nVCSpJgIvD0UpgzqGRRNwTCXBmmWGICypyQrxFEmEtemrZkpwV7+8Tvqtpttutu8uG51WWUcVnIIzcAFccAU64BZ0QQ9gkIFn8ArerCfrxXq3PpajFavcqYM/sD5/AGH+lTc=</latexit>⌃i-Central Density-Position-Covariance
+<latexit sha1_base64="j8U+PaPgiyVE7+VdQHdxBUxZUPM=">AAACG3icdVBLSwMxGMz6rPW16tFLsAgeZNltS623ggc9VrAPaNclm6ZtaDa7JFmhLPs/vPhXvHhQxJPgwX9jum19oQOBYWa+5Mv4EaNS2fa7sbC4tLyymlvLr29sbm2bO7tNGcYCkwYOWSjaPpKEUU4aiipG2pEgKPAZafmjs4nfuiFC0pBfqXFE3AANOO1TjJSWPLOYdLNLOmLgu4ltVaun5XLpeEaKnyQ99xInvU5KaeqZhXkOzu0v4lh2hgKYoe6Zr91eiOOAcIUZkrLj2JFyEyQUxYyk+W4sSYTwCA1IR1OOAiLdJFsrhYda6cF+KPThCmbq94kEBVKOA18nA6SG8rc3Ef/yOrHqV92E8ihWhOPpQ/2YQRXCSVGwRwXBio01QVhQvSvEQyQQVrrOvC5h/lP4P2kWLadiVS7LhVpxVkcO7IMDcAQccAJq4ALUQQNgcAvuwSN4Mu6MB+PZeJlGF4zZzB74AePtA34ZnfY=</latexit>G31
+<latexit sha1_base64="WPyf3EMAo/fqK7SOD54HHqM68/k=">AAACG3icdVBLSwMxGMz6rPW16tFLsAgeZNluS623ggc9VrAPaNeSTbNtaDa7JFmhLPs/vPhXvHhQxJPgwX9jum19oQOBYWa+5Mt4EaNS2fa7sbC4tLyymlvLr29sbm2bO7tNGcYCkwYOWSjaHpKEUU4aiipG2pEgKPAYaXmjs4nfuiFC0pBfqXFE3AANOPUpRkpLPdNJutklHTHw3MS2qtXTcrl0PCPOJ0nPe4mTXielNO2ZhXkOzu0vUrTsDAUwQ71nvnb7IY4DwhVmSMpO0Y6UmyChKGYkzXdjSSKER2hAOppyFBDpJtlaKTzUSh/6odCHK5ip3ycSFEg5DjydDJAayt/eRPzL68TKr7oJ5VGsCMfTh/yYQRXCSVGwTwXBio01QVhQvSvEQyQQVrrOvC5h/lP4P2k6VrFiVS7LhZozqyMH9sEBOAJFcAJq4ALUQQNgcAvuwSN4Mu6MB+PZeJlGF4zZzB74AePtA3+jnfc=</latexit>G32<latexit sha1_base64="xRtNU9sVdKXtQt4RlqVDeN3aVzk=">AAACH3icbZDLSsNAFIYnXmu9RV26CRahbkpSpbopFFzoRqhgL9DEMJlO2qEzSZiZiCXkTdz4Km5cKCLu+jZO2ixq6w8DH/85hznn9yJKhDTNibayura+sVnYKm7v7O7t6weHbRHGHOEWCmnIux4UmJIAtySRFHcjjiHzKO54o+us3nnCXJAweJDjCDsMDgLiEwSlsly9ZgsyYLBsMyiHnp88p2d1W8TMTUjdSh+Tu/RGoYLzdL7H1UtmxZzKWAYrhxLI1XT1H7sfopjhQCIKhehZZiSdBHJJEMVp0Y4FjiAawQHuKQwgw8JJpvelxqly+oYfcvUCaUzd+YkEMiHGzFOd2YpisZaZ/9V6sfSvnIQEUSxxgGYf+TE1ZGhkYRl9wjGSdKwAIk7UrgYaQg6RVJEWVQjW4snL0K5WrFqldn9RalTzOArgGJyAMrDAJWiAW9AELYDAC3gDH+BTe9XetS/te9a6ouUzR+CPtMkvHh6jnA==</latexit> (x)=MXi=1G3i(x)Density Field Modelling
+TrainingReal Projection
+DimensionVoxelizationInitial GaussiansOptimized GaussiansFinal Density VolumeFigure 3: We represent the scanned object as a set of radiative Gaussians. We optimize them using
+real X-ray projections and finally retrieve the density volume with voxelization.
+Irgb∈RH×W×3from these Gaussians, formulated as
+Irgb=R(G3) =C ◦ P ◦ T (G3), (2)
+where T,P, andCare the transformation, projection, and composition modules, respectively. First,
+Ttransforms the 3D Gaussians into the ray space, aligning viewing rays with the coordinate axis
+to enhance computational efficiency. The transformed 3D Gaussians are then projected onto the
+image plane: G2=P(G3). The projected 2D Gaussian retains the same opacity and color as its
+3D counterpart but omits the third row and column of position and covariance. An RGB image is
+then rendered by compositing these 2D Gaussians using alpha-blending [ 45]:Irgb=C(G2). The
+rasterizer is differentiable, allowing for the optimization of kernel parameters using photometric losses.
+3DGS initializes sparse Gaussians with structure-from-motion (SfM) points [ 53]. During training, an
+adaptive control strategy dynamically densifies Gaussians to improve scene representation.
+4 Method
+In this section, we first introduce radiative Gaussian as a novel object representation in Sec. 4.1. Next,
+we adapt 3DGS to tomography in Sec. 4.2. Specifically, we derive new rasterization functions and
+analyze the integration bias of standard 3DGS in Sec. 4.2.1. We further develop a differentiable
+voxelizer for volume retrieval in Sec. 4.2.2. The optimization strategy is elaborated in Sec. 4.2.3.
+4.1 Representing objects with radiative Gaussians
+As shown in Fig. 3, we represent the target object with a group of learnable 3D kernels G3=
+{G3
+i}i=1,···,Mthat we term as radiative Gaussians. Each kernel G3
+idefines a local Gaussian-shaped
+density field, i.e.,
+G3
+i(x|ρi,pi,Σi) =ρi·exp
+−1
+2(x−pi)⊤Σ−1
+i(x−pi)
+, (3)
+where ρi,pi∈R3andΣi∈R3×3are learnable parameters representing central density, position
+and covariance, respectively. For optimization purposes, we follow [ 23] to further decompose the
+covariance matrix Σiinto the rotation matrix Riand scale matrix Si:Σi=RiSiS⊤
+iR⊤
+i. The
+overall density at position x∈R3is then computed by summing the density contribution of kernels:
+σ(x) =MX
+i=1G3
+i(x|ρi,pi,Σi). (4)
+Compared with standard 3DGS, our kernel formulation removes view-dependent color because
+X-ray attenuation depends only on isotropic density, as shown in Eq. (1). More importantly, we
+define the density query function (Eq. (4)) for radiative Gaussians, making them useful for both 2D
+image rendering and 3D volume reconstruction. In contrast, the opacity in 3DGS is empirically
+designed for RGB rendering, leading to challenges when extracting 3D models such as meshes from
+Gaussians [ 16,8,65]. Concurrent work [ 29] also explores kernel-based representation but uses
+simplified isotropic Gaussians. Our work employs a general Gaussian distribution, offering more
+flexibility and precision in modeling complex structures.
+4(a) Training Pipeline
+FDK VolumeInitializationOperation FlowGradient Flow
+ScannerDimensionL1DSSIM
+RealX-ray Rasterizer
+Tiny VolumeRegularizationTV(                                    )Radiative Gaussians
+Adaptive ControlDensity VoxelizerRendered
+(c) Density Voxelizer(§4.2.2)
+3D TileVoxelRadiative GaussiansDensity Volume(d) Adaptive Control (§4.2.3)(b) X-ray Rasterizer (§4.2.1)
+TransformationWorld Space
+<latexit sha1_base64="P5hflZ0813oQ5RmMtPi14aK8uyc=">AAAB7nicbVBNSwMxEJ2tX7V+VT16CRbBU9ktUj0WvHisYD+gXUo2zbah2SQkWbEs/RFePCji1d/jzX9j2u5BWx8MPN6bYWZepDgz1ve/vcLG5tb2TnG3tLd/cHhUPj5pG5lqQltEcqm7ETaUM0FblllOu0pTnEScdqLJ7dzvPFJtmBQPdqpomOCRYDEj2Dqp08dKafk0KFf8qr8AWidBTiqQozkof/WHkqQJFZZwbEwv8JUNM6wtI5zOSv3UUIXJBI9oz1GBE2rCbHHuDF04ZYhiqV0Jixbq74kMJ8ZMk8h1JtiOzao3F//zeqmNb8KMCZVaKshyUZxyZCWa/46GTFNi+dQRTDRztyIyxhoT6xIquRCC1ZfXSbtWDerV+v1VpVHL4yjCGZzDJQRwDQ24gya0gMAEnuEV3jzlvXjv3seyteDlM6fwB97nD5Ikj7E=</latexit>⇡
+Ray Space<latexit sha1_base64="Z/0a0O61Ma0iEUa++nMMuqrhQ8o=">AAAB6nicbVBNS8NAEJ34WetX1aOXxSJ4KkmR6rHgxWNF+wFtKJvtpl262YTdiVhCf4IXD4p49Rd589+4bXPQ1gcDj/dmmJkXJFIYdN1vZ219Y3Nru7BT3N3bPzgsHR23TJxqxpsslrHuBNRwKRRvokDJO4nmNAokbwfjm5nffuTaiFg94CThfkSHSoSCUbTS/VO/2i+V3Yo7B1klXk7KkKPRL331BjFLI66QSWpM13MT9DOqUTDJp8VeanhC2ZgOeddSRSNu/Gx+6pScW2VAwljbUkjm6u+JjEbGTKLAdkYUR2bZm4n/ed0Uw2s/EypJkSu2WBSmkmBMZn+TgdCcoZxYQpkW9lbCRlRThjadog3BW355lbSqFa9Wqd1dluvVPI4CnMIZXIAHV1CHW2hAExgM4Rle4c2Rzovz7nwsWtecfOYE/sD5/AEL9o2c</latexit>x2
+<latexit sha1_base64="rPuivfj9UMRFavEWx0hmGshZtqA=">AAAB6nicbVBNS8NAEJ34WetX1aOXxSJ4KkmR6rHgxWNF+wFtKJvtpl262YTdiVhCf4IXD4p49Rd589+4bXPQ1gcDj/dmmJkXJFIYdN1vZ219Y3Nru7BT3N3bPzgsHR23TJxqxpsslrHuBNRwKRRvokDJO4nmNAokbwfjm5nffuTaiFg94CThfkSHSoSCUbTS/VPf7ZfKbsWdg6wSLydlyNHol756g5ilEVfIJDWm67kJ+hnVKJjk02IvNTyhbEyHvGupohE3fjY/dUrOrTIgYaxtKSRz9fdERiNjJlFgOyOKI7PszcT/vG6K4bWfCZWkyBVbLApTSTAms7/JQGjOUE4soUwLeythI6opQ5tO0YbgLb+8SlrViler1O4uy/VqHkcBTuEMLsCDK6jDLTSgCQyG8Ayv8OZI58V5dz4WrWtOPnMCf+B8/gAI7o2a</latexit>x0<latexit sha1_base64="9EHLTd2MuDXpXc7DTa0j6SmkeQI=">AAAB6nicbVBNS8NAEJ34WetX1aOXxSJ4KkmR6rHgxWNF+wFtKJvtpF262YTdjVhCf4IXD4p49Rd589+4bXPQ1gcDj/dmmJkXJIJr47rfztr6xubWdmGnuLu3f3BYOjpu6ThVDJssFrHqBFSj4BKbhhuBnUQhjQKB7WB8M/Pbj6g0j+WDmSToR3QoecgZNVa6f+p7/VLZrbhzkFXi5aQMORr90ldvELM0QmmYoFp3PTcxfkaV4UzgtNhLNSaUjekQu5ZKGqH2s/mpU3JulQEJY2VLGjJXf09kNNJ6EgW2M6JmpJe9mfif101NeO1nXCapQckWi8JUEBOT2d9kwBUyIyaWUKa4vZWwEVWUGZtO0YbgLb+8SlrViler1O4uy/VqHkcBTuEMLsCDK6jDLTSgCQyG8Ayv8OYI58V5dz4WrWtOPnMCf+B8/gAKco2b</latexit>x1<latexit sha1_base64="z4qhrpLzXb0AEvx2U/LKJT8QSp4=">AAAB63icbVBNS8NAEJ34WetX1aOXYBE8laRI9Vjw4rGC/YA2lM120y7d3YTdiVBC/4IXD4p49Q9589+4aXPQ1gcDj/dmmJkXJoIb9LxvZ2Nza3tnt7RX3j84PDqunJx2TJxqyto0FrHuhcQwwRVrI0fBeolmRIaCdcPpXe53n5g2PFaPOEtYIMlY8YhTgrk04AqHlapX8xZw14lfkCoUaA0rX4NRTFPJFFJBjOn7XoJBRjRyKti8PEgNSwidkjHrW6qIZCbIFrfO3UurjNwo1rYUugv190RGpDEzGdpOSXBiVr1c/M/rpxjdBhlXSYpM0eWiKBUuxm7+uDvimlEUM0sI1dze6tIJ0YSijadsQ/BXX14nnXrNb9QaD9fVZr2IowTncAFX4MMNNOEeWtAGChN4hld4c6Tz4rw7H8vWDaeYOYM/cD5/ACFqjkQ=</latexit>Z
+<latexit sha1_base64="Q4Ge730mROuknNW84JseDonCCJ0=">AAAB63icbVBNS8NAEJ3Ur1q/qh69LBbBU0mKVI8FLx4r2A9oQ9lsNu3S3U3Y3Ygl9C948aCIV/+QN/+NmzYHbX0w8Hhvhpl5QcKZNq777ZQ2Nre2d8q7lb39g8Oj6vFJV8epIrRDYh6rfoA15UzSjmGG036iKBYBp71gepv7vUeqNIvlg5kl1Bd4LFnECDa5FD6NGqNqza27C6B14hWkBgXao+rXMIxJKqg0hGOtB56bGD/DyjDC6bwyTDVNMJniMR1YKrGg2s8Wt87RhVVCFMXKljRoof6eyLDQeiYC2ymwmehVLxf/8wapiW78jMkkNVSS5aIo5cjEKH8chUxRYvjMEkwUs7ciMsEKE2PjqdgQvNWX10m3Ufea9eb9Va3VKOIowxmcwyV4cA0tuIM2dIDABJ7hFd4c4bw4787HsrXkFDOn8AfO5w/Jmo4K</latexit>dx2<latexit sha1_base64="O7SxXdgkCTci6jrXTwbH9jv1mSQ=">AAAB8nicbVBNS8NAEJ34WetX1aOXxSJ4KkmR6rHgxWMV+wFtKJvtpl26yYbdiVJCf4YXD4p49dd489+4bXPQ1gcDj/dmmJkXJFIYdN1vZ219Y3Nru7BT3N3bPzgsHR23jEo1402mpNKdgBouRcybKFDyTqI5jQLJ28H4Zua3H7k2QsUPOEm4H9FhLELBKFqp27sXwxFSrdVTv1R2K+4cZJV4OSlDjka/9NUbKJZGPEYmqTFdz03Qz6hGwSSfFnup4QllYzrkXUtjGnHjZ/OTp+TcKgMSKm0rRjJXf09kNDJmEgW2M6I4MsveTPzP66YYXvuZiJMUecwWi8JUElRk9j8ZCM0ZyokllGlhbyVsRDVlaFMq2hC85ZdXSata8WqV2t1luV7N4yjAKZzBBXhwBXW4hQY0gYGCZ3iFNwedF+fd+Vi0rjn5zAn8gfP5A4/dkWg=</latexit>)Projection
+Composition
+<latexit sha1_base64="P3KK3V1zeYhCQ/g+F1uPmfnvzns=">AAAB7HicbVBNS8NAEJ3Ur1q/qh69LBahp5IUqR4LXjxWMG2hDWWz3bRLdzdhdyOU0N/gxYMiXv1B3vw3btMctPXBwOO9GWbmhQln2rjut1Pa2t7Z3SvvVw4Oj45PqqdnXR2nilCfxDxW/RBrypmkvmGG036iKBYhp71wdrf0e09UaRbLRzNPaCDwRLKIEWys5A91Kuqjas1tuDnQJvEKUoMCnVH1aziOSSqoNIRjrQeem5ggw8owwumiMkw1TTCZ4QkdWCqxoDrI8mMX6MoqYxTFypY0KFd/T2RYaD0Xoe0U2Ez1urcU//MGqYlug4zJJDVUktWiKOXIxGj5ORozRYnhc0swUczeisgUK0yMzadiQ/DWX94k3WbDazVaD9e1drOIowwXcAl18OAG2nAPHfCBAINneIU3RzovzrvzsWotOcXMOfyB8/kDk+iOgA==</latexit>X(<latexit sha1_base64="14tv9X4u+kLnJq2/j9w9I8pZU3k=">AAAB6HicbVDLSgNBEOyNrxhfUY9eBoOgl7AbJHoMePGYgHlAsoTZSW8yZnZ2mZkVQsgXePGgiFc/yZt/4yTZgyYWNBRV3XR3BYng2rjut5Pb2Nza3snvFvb2Dw6PiscnLR2nimGTxSJWnYBqFFxi03AjsJMopFEgsB2M7+Z++wmV5rF8MJME/YgOJQ85o8ZKjat+seSW3QXIOvEyUoIM9X7xqzeIWRqhNExQrbuemxh/SpXhTOCs0Es1JpSN6RC7lkoaofani0Nn5MIqAxLGypY0ZKH+npjSSOtJFNjOiJqRXvXm4n9eNzXhrT/lMkkNSrZcFKaCmJjMvyYDrpAZMbGEMsXtrYSNqKLM2GwKNgRv9eV10qqUvWq52rgu1SpZHHk4g3O4BA9uoAb3UIcmMEB4hld4cx6dF+fd+Vi25pxs5hT+wPn8AW0/jKg=</latexit>)
+2D GaussiansRendered
+<latexit sha1_base64="9O8nCkRTWkwE1CY3Z55DC/DUm9I=">AAACRnicbVC7TsMwFL0pr1JepYwsFhVSWUrSobAgVWJhBEELUh0qx3VaC+ch20Gq0nwD/wQLMxufwMIAqlhxWgZeR7J0dM65tu/xYsGVtu1nqzA3v7C4VFwurayurW+UNysdFSWSsjaNRCSvPKKY4CFra64Fu4olI4En2KV3c5z7l7dMKh6FF3oUMzcgg5D7nBJtpF7ZxXIY9VKeoVoDx3yML7josxQHRA89P8XnfBCQLMsT4/0xHhL9v7d3nTr7jexoljB3TuVeuWrX7SnQX+J8kWqrgmuT+zt82is/4X5Ek4CFmgqiVNexY+2mRGpOBctKOFEsJvSGDFjX0JAETLnptIYM7Rqlj/xImhNqNFW/T6QkUGoUeCaZr6B+e7n4n9dNtH/opjyME81COnvITwTSEco7RX0uGdViZAihkpu/IjokklBtmi+ZEpzfK/8lnUbdadabZ0611YAZirANO1ADBw6gBSdwCm2g8AAv8Abv1qP1ak2sj1m0YH3NbMEPFOATVjG3sg==</latexit>⇢i(2⇡|˜⌃i|/|ˆ⌃i|)1/2=ˆ⇢i
+CloneSplit
+PruneFigure 4: Training pipeline of R2-Gaussian. (a) Overall training pipeline. (b) X-ray rasterization for
+projection rendering. (c) Density voxelization for volume retrieval. (d) Modified adaptive control.
+Initialization 3DGS initializes Gaussians with SfM points, which is not applicable to volumetric
+tomography. Instead, we initialize our radiative Gaussians using preliminary results obtained from
+the analytical method. Specifically, we use FDK [ 13] to reconstruct a low-quality volume in less than
+1 second. We then exclude empty spaces with a density threshold τand randomly sample Mpoints
+as kernel positions. Following [ 23], we set the scales of Gaussians as the nearest neighbor distances
+and assume no rotation. The central densities are queried from the FDK volume. We empirically
+scale down the queried densities with kto compensate for the overlay between kernels.
+4.2 Training radiative Gaussians
+Our training pipeline is shown in Fig. 4. Radiative Gaussians are first initialized from an FDK
+volume. We then rasterize projections for photometric losses and voxelize tiny density volumes for
+3D regularization. Adaptive control is used to densify Gaussians for better representation. After
+training, we voxelize density volumes of the target size for evaluation.
+4.2.1 X-ray rasterization
+This section focuses on the theoretical derivation of X-ray rasterization R. As discussed in Sec. 3.1,
+the pixel value of a projection is the integral of density along the corresponding ray path. We
+substitute Eq. (4) into Eq. (1), yielding
+Ir(r) =ZMX
+i=1G3
+i(r(t)|ρi,pi,Σi)dt=MX
+i=1Z
+G3
+i(r(t)|ρi,pi,Σi)dt, (5)
+where Ir(r)is the rendered pixel value. This implies that we can individually integrate each 3D
+Gaussian to rasterize an X-ray projection. Note that tnandtfin Eq. (1) are neglected because we
+assume all Gaussians are bounded inside the target space.
+Transformation Since a cone-beam X-ray scanner can be modeled similarly to a pinhole camera,
+we follow [ 69] to transfer Gaussians from the world space to the ray space. In ray space, the
+5viewing rays are parallel to the third coordinate axis, facilitating analytical integration. Due to the
+non-Cartesian nature of ray space, we employ the local affine transformation to Eq. (5), yielding
+Ir(r)≈MX
+i=1Z
+G3
+i(˜x|ρi, ϕ(p)|{z}
+˜pi,JiWΣ iW⊤J⊤
+i|{z }
+˜Σi)dx2, (6)
+where ˜x= [x0, x1, x2]⊤is a point in ray space, ˜pi∈R3is the new Gaussian position obtained
+through projective mapping ϕ, and ˜Σi∈R3×3is the new Gaussian covariance controlled by local
+approximation matrix Jiand viewing transformation matrix W. Refer to Appendix A for determining
+ϕ,Ji, andWfrom scanner parameters.
+Projection and composition A good property of normalized 3D Gaussian distribution is that its
+integral along one coordinate axis yields a normalized 2D Gaussian distribution. Substitute Eq. (3)
+into Eq. (6) and we have
+Ir(r)≈MX
+i=1ρi(2π)3
+2|˜Σi|1
+2Z1
+(2π)3
+2|˜Σi|1
+2exp
+−1
+2(˜x−˜pi)⊤˜Σ−1
+i(˜x−˜pi)
+| {z }
+Normalized 3D Gaussian distributiondx2
+=MX
+i=1ρi(2π)3
+2|˜Σi|1
+21
+2π|ˆΣi|1
+2exp
+−1
+2(ˆx−ˆpi)⊤ˆΣ−1
+i(ˆx−ˆpi)
+| {z }
+Normalized 2D Gaussian distribution
+=MX
+i=1G2
+i(ˆx|s
+2π|˜Σi|
+|ˆΣi|ρi
+|{z}
+ˆρi,ˆpi,ˆΣi),(7)
+where ˆx∈R2,ˆp∈R2,ˆΣ∈R2×2are obtained by dropping the third rows and columns of their
+counterparts ˜x,˜p, and ˜Σ, respectively. Eq. (7) shows that an X-ray projection can be rendered by
+simply summing 2D Gaussians instead of alpha-compositing them in natural light imaging.
+<latexit sha1_base64="2wF74RhIFPMd/LVljq24H62MBzk=">AAACf3icfZFNb9MwGMed8DbKy8o4crE2ISYxBTuj6XJATOLCcUh0m1RHleM6rTUnjmwHUVn+DNz4QHwEbnwQbhxw2h5gQzynn56X//NWtlIYi9CPKL51+87dezv3Bw8ePnq8O3yyd25UpxmfMCWVviyp4VI0fGKFlfyy1ZzWpeQX5dW7Pn7xiWsjVPPRrlpe1HTRiEowaoNrNvxK9FK9IUtqXU/+lSNr0alelIVDyWiU5q/HRyhBWTbGPYzQcYpPPKm7mcPeQ2L5Z+ug0jDw/8VSlKMs7zVGx2nei2EUVLONWOr9Vuutnw0PQsu1wZuAt3BwukcOf377Qs5mw+9krlhX88YySY2ZYtTawlFtBZPcD0hneEvZFV3wacCG1twUbj2dh8+DZw6rsEKlGgvX3j8rHK2NWdVlyKypXZrrsd75r9i0s9VJ4UTTdpY3bNOo6iS0CvbPgHOhObNyFYAyLcKskC2ppsyGlw3CEfD1lW/CeZrgLMk+hGukYGM74BnYB4cAgzE4Be/BGZgABn5F+9HL6CiO4hdxEqNNahxta56CvyzOfwPytL8H</latexit>⇢=ˆ⇢/µ1or⇢=ˆ⇢/µ2?
+<latexit sha1_base64="Kpwzye7H9KMY0xTV2grNPbH44Jw=">AAACGXicbZDLSsNAFIYnXmu91bp0EyxCFxKSai/uCm5cVrAXSEKYTCft0MmFmYlQQp7BnRtfxY2CIi515YO4d5J2oa0HBj7+/5yZM78bUcKFrn8pK6tr6xubha3i9s7u3n7poNzjYcwQ7qKQhmzgQo4pCXBXEEHxIGIY+i7FfXdymfn9W8w4CYMbMY2w7cNRQDyCoJCSU9ITK7/EZCPXTnStXq9dnDdPdU1vNJpGBnX9rGa0UsuPncRIU6dUkWZe6jIYc6i0y1b1+/nO6jilD2sYotjHgUAUcm4aeiTsBDJBEMVp0Yo5jiCawBE2JQbQx9xO8qVS9UQqQ9ULmTyBUHP190QCfc6nvis7fSjGfNHLxP88MxZey05IEMUCB2j2kBdTVYRqFpM6JAwjQacSIGJE7qqiMWQQCRlmUYZgLH55GXo1zWhojWuZRg3MqgCOwDGoAgM0QRtcgQ7oAgTuwSN4Aa/Kg/KkvCnvs9YVZT5zCP6U8vkDG7ygPg==</latexit>µ1<latexit sha1_base64="hUqyfm91bCiq+AUuCn8bb8UFRAY=">AAACF3icbZDLSgMxFIYz9Vbrrdalm8EidCFDZqRTuyu4cVnBXmBmKJk0bUMzF5KMUIY+gxs3voobQUXc6s4HcW867UJbDwQ+/v+c5OT3Y0aFhPBLy62tb2xu5bcLO7t7+wfFw1JbRAnHpIUjFvGujwRhNCQtSSUj3ZgTFPiMdPzx5czv3BIuaBTeyElMvAANQzqgGEkl9YqGm93h8KHvpdCwYB3a9TNoVKvnVr2mwIR2zbSnbpD0UmvaK5ahAbPSV8FcQLlRcivfz3dus1f8dPsRTgISSsyQEI4JY+mliEuKGZkW3ESQGOExGhJHYYgCIrw022mqnyqlrw8irk4o9Uz9PZGiQIhJ4KvOAMmRWPZm4n+ek8jBhZfSME4kCfH8oUHCdBnps5D0PuUESzZRgDCnalcdjxBHWKooCyoEc/nLq9C2DNM27GuVhgXmlQfH4ARUgAlqoAGuQBO0AAb34BG8gFftQXvS3rT3eWtOW8wcgT+lffwANkmfMw==</latexit>µ2
+<latexit sha1_base64="1b92NV03oiW5jz5AaeVafWZPu90=">AAAB63icbVC7SgNBFL3rM8aoUUtBFoNgFXZTRMuAjWUC5gHJEmYns9kh81hmZoWwpLS1sVDE1n/Id9j5Df6Ek0ehiQcuHM65l3vvCRNGtfG8L2djc2t7Zze3l98vHBweFY9PWlqmCpMmlkyqTog0YVSQpqGGkU6iCOIhI+1wdDvz2w9EaSrFvRknJOBoKGhEMTIzqadi2S+WvLI3h7tO/CUp1QrTxvfj+bTeL372BhKnnAiDGdK663uJCTKkDMWMTPK9VJME4REakq6lAnGig2x+68S9tMrAjaSyJYw7V39PZIhrPeah7eTIxHrVm4n/ed3URDdBRkWSGiLwYlGUMtdId/a4O6CKYMPGliCsqL3VxTFSCBsbT96G4K++vE5albJfLVcbNo0KLJCDM7iAK/DhGmpwB3VoAoYYnuAFXh3uPDtvzvuidcNZzpzCHzgfP/Wukdk=</latexit>⇢<latexit sha1_base64="caP9VOM3ycDkngz8cc9w1PUH6Rw=">AAAB8XicbVDLSsNAFJ3UV61Vqy4FCRbBVUm6qC4Lbly2YB/YhDKZTpqhk5kwcyOU0KV/4MaFIm79gX6HO7/Bn3D6WGjrgQuHc+7l3nuChDMNjvNl5TY2t7Z38ruFveL+wWHp6LitZaoIbRHJpeoGWFPOBG0BA067iaI4DjjtBKObmd95oEozKe5gnFA/xkPBQkYwGOneizBknorkpF8qOxVnDnuduEtSrhenze/Hs2mjX/r0BpKkMRVAONa65zoJ+BlWwAink4KXappgMsJD2jNU4JhqP5tfPLEvjDKwQ6lMCbDn6u+JDMdaj+PAdMYYIr3qzcT/vF4K4bWfMZGkQAVZLApTboO0Z+/bA6YoAT42BBPFzK02ibDCBExIBROCu/ryOmlXK26tUmuaNKpogTw6RefoErnoCtXRLWqgFiJIoCf0gl4tbT1bb9b7ojVnLWdO0B9YHz/HPpSm</latexit>ˆ⇢<latexit sha1_base64="caP9VOM3ycDkngz8cc9w1PUH6Rw=">AAAB8XicbVDLSsNAFJ3UV61Vqy4FCRbBVUm6qC4Lbly2YB/YhDKZTpqhk5kwcyOU0KV/4MaFIm79gX6HO7/Bn3D6WGjrgQuHc+7l3nuChDMNjvNl5TY2t7Z38ruFveL+wWHp6LitZaoIbRHJpeoGWFPOBG0BA067iaI4DjjtBKObmd95oEozKe5gnFA/xkPBQkYwGOneizBknorkpF8qOxVnDnuduEtSrhenze/Hs2mjX/r0BpKkMRVAONa65zoJ+BlWwAink4KXappgMsJD2jNU4JhqP5tfPLEvjDKwQ6lMCbDn6u+JDMdaj+PAdMYYIr3qzcT/vF4K4bWfMZGkQAVZLApTboO0Z+/bA6YoAT42BBPFzK02ibDCBExIBROCu/ryOmlXK26tUmuaNKpogTw6RefoErnoCtXRLWqgFiJIoCf0gl4tbT1bb9b7ojVnLWdO0B9YHz/HPpSm</latexit>ˆ⇢
+Figure 5: Density incon-
+sistency in 3DGS.Integration bias During the projection, a key difference between our
+2D Gaussian and the original one in 3DGS is the central density (opacity)
+ˆρi. As shown in Eq. (7), we scale the density with a covariance-related
+factor µi= (2π|˜Σi|/|ˆΣi|)1/2:ˆρi=µiρi, while 3DGS does not. This
+implies that 3DGS, in fact, learns an integrated density in the 2D image
+plane rather than the actual one in 3D space. This integration bias, though
+having a negligible impact on imaging rendering, leads to significant
+inconsistency in density retrieval. We demonstrate the inconsistency with
+a simplified 2D-to-1D projection in Fig. 5. When attempting to recover the
+central density ρin 3D space with ρi= ˆρi/µj, we find different views
+(µj) lead to different results. This violates the isotropic nature of ρi,
+preventing us from determining the correct value. In contrast, our method
+assigns the actual 3D density to the kernel and forwardly computes the
+2D projection, thus fundamentally solving the issue. While conceptually
+simple, implementing our idea requires substantial engineering efforts,
+including reprogramming all backpropagation routines in CUDA.
+4.2.2 Density voxelization
+We develop a voxelizer Vto efficiently query a density volume V∈RX×Y×Zfrom radiative
+Gaussians: V=V(G3). Inspired by voxelizers used in RGB tasks [ 57], our voxelizer first partitions
+the target space into multiple 8×8×83D tiles. It then culls Gaussians, retaining those with a 99%
+confidence of intersecting the tile. In each 3D tile, voxel values are parallelly computed by summing
+the contributions of nearby kernels with Eq. (4). We implement the voxelizer and its backpropagation
+in CUDA, making it differentiable for optimization. This design not only accelerates the query
+process ( >100FPS) but also allows us to regularize radiative Gaussians with 3D priors.
+6Table 1: Quantitative results on sparse-view tomography. We colorize the best ,second-best , and
+third-best numbers.
+75-view 50-view 25-view
+MethodsPSNR↑SSIM↑ Time↓ PSNR↑SSIM↑ Time↓ PSNR↑SSIM↑ Time↓
+Synthetic dataset
+FDK [13] 28.63 0.497 - 26.50 0.422 - 22.99 0.317 -
+SART [2] 36.06 0.897 4m41s 34.37 0.875 3m36s 31.14 0.825 1m47s
+ASD-POCS [55] 36.64 0.940 2m25s 34.34 0.914 1m52s 30.48 0.847 56s
+IntraTomo [66] 35.42 0.924 2h7m 35.25 0.923 2h9m 34.68 0.914 2h19m
+NAF [67] 37.84 0.945 30m43s 36.65 0.932 32m4s 33.91 0.893 31m1s
+SAX-NeRF [6] 38.07 0.950 13h5m 36.86 0.938 13h5m 34.33 0.905 13h3m
+Ours (iter=10k) 38.29 0.954 2m38s 37.63 0.949 2m35s 35.08 0.922 2m35s
+Ours (iter=30k) 38.88 0.959 8m21s 37.98 0.952 8m14s 35.19 0.923 8m28s
+Real-world dataset
+FDK [13] 30.03 0.535 - 27.38 0.449 - 23.30 0.335 -
+SART [2] 34.42 0.845 5m11s 33.61 0.827 3m28s 31.52 0.790 1m47s
+ASD-POCS [55] 36.33 0.868 2m43s 34.58 0.861 1m49s 31.32 0.810 56s
+IntraTomo [66] 36.79 0.858 2h25m 36.99 0.854 2h19m 35.85 0.835 2h18m
+NAF [67] 38.58 0.848 51m28s 36.44 0.818 51m31s 32.92 0.772 51m24s
+SAX-NeRF [6] 34.93 0.854 13h21m 34.89 0.840 13h23m 33.49 0.793 13h25m
+Ours (iter=10k) 38.10 0.872 3m39s 37.52 0.866 3m37s 35.10 0.840 3m23s
+Ours (iter=30k) 39.40 0.875 14m16s 38.24 0.864 13m52s 34.83 0.833 12m56s
+4.2.3 Optimization
+We optimize radiative Gaussians using stochastic gradient descent. Besides photometric L1 loss L1
+and D-SSIM loss Lssim [59], we further incorporate a 3D total variation (TV) regularization [ 49]
+Ltvas a homogeneity prior for tomography. At each training iteration, we randomly query a tiny
+density volume Vtv∈RD×D×D(same spacing as the target output) and minimize its total variation.
+The overall training loss is defined as:
+Ltotal=L1(Ir,Im) +λssimLssim(Ir,Im) +λtvLtv(Vtv), (8)
+where Ir,Im,λssim andλtvare rendered projection, measured projection, D-SSIM weight, and TV
+weight, respectively. Adaptive control is employed during training to enhance object representation.
+We remove empty Gaussians and densify (clone or split) those with large loss gradients. Considering
+objects such as human organs have extensive homogeneous areas, we do not prune large Gaussians.
+As for densification, we halve the densities of both original and replicated Gaussians. This strategy
+mitigates the sudden performance drop caused by new Gaussians and hence stabilizes training.
+5 Experiments
+5.1 Experimental settings
+Dataset We conduct experiments on both synthetic and real-world datasets. For the synthetic
+dataset, we collect 15 real CT volumes, ranging from organisms to artificial objects. We then use the
+tomography toolbox TIGRE [ 5] to synthesize X-ray projections and add Compton scatter and electric
+noise. For real-world experiments, we use three cases from the FIPS dataset [ 56], each with 721 real
+projections. Since ground truth volumes are unavailable, we use FDK [ 13] to create pseudo-ground
+truth using all views and then subsample views for sparse-view experiments. We set 75, 50, and 25
+views for both synthetic and real-world data as three sparse-view scenarios. Refer to Appendix B for
+more details of datasets.
+Implementation details Our R2-Gaussian is implemented in PyTorch [ 44] and CUDA [ 50], and
+trained with the Adam optimizer [ 25] for 30k iterations. Learning rates for position, density, scale,
+and rotation are initially set as 0.0002, 0.01, 0.005, and 0.001, respectively, and exponentially to
+0.1 of their initial values. Loss weights are λssim = 0.25andλtv= 0.05. We initialize M= 50 k
+Gaussians with a density threshold τ= 0.05and scaling term k= 0.15. The TV volume size is
+7Ground TruthOursSAX-NeRFNAFIntraTomoASD-POCSSARTFDK
+Figure 6: Colorized slice examples of different methods with PSNR (dB) shown at the bottom right of
+each image. The first three rows are from the synthetic dataset and the last row is from the real-world
+dataset. Our method recovers more details and suppresses artifacts.
+D= 32 . Adaptive control runs from 500 to 15k iterations with a gradient threshold of 0.00005.
+All methods run on a single RTX3090 GPU. We evaluate reconstruction quality using PSNR and
+SSIM [ 59], with PSNR calculated in 3D volume and SSIM averaged over 2D slices in axial, coronal,
+and sagittal directions. We also report the running time as a reflection of efficiency.
+5.2 Results and evaluation
+For fairness, we do not compare methods that require external training data but focus on those that
+solely use 2D projections of arbitrary objects. We compare R2-Gaussian with three traditional methods
+(FDK [ 13], SART [ 2], ASD-POCS [ 55]) and three SOTA NeRF-based methods (IntraTomo [ 66],
+NAF [ 67], SAX-NeRF [ 6]). Tab. 1 reports the quantitative results on sparse-view tomography. Note
+that we do not report the running time for FDK as it is instant. R2-Gaussian achieves the best
+performance across all synthetic and most real-world experiments. Specifically, our method delivers
+a 0.93 dB higher PSNR than SAX-NeRF, on the synthetic dataset, and a 0.95 dB improvement over
+IntraTomo on the real-world dataset. It is also worth noting that our 50-view results are already
+on par with the 75-view results of other methods. Regarding efficiency, our method converges to
+optimal results in 15 minutes, which is 3.7 ×faster than the most efficient NeRF-based method, NAF.
+Surprisingly, it takes less than 4 minutes to surpass other methods, which is even faster than the
+traditional algorithm SART. Fig. 6 shows the visual comparisons of different methods. FDK and
+SART introduce streak artifacts, while ASD-POCS and IntraTomo blur structural details. NAF and
+SAX-NeRF are better than other baseline methods but have salt-and-pepper noise. In comparison, our
+method successfully recovers sharp details, e.g., ovules of pepper, and maintains good smoothness
+for homogeneous areas, e.g., muscles in the chest.
+8Table 2: Quantitative results of X-3DGS and our method on the synthetic dataset.
+75-view 50-view 25-view
+X-3DGS Ours X-3DGS Ours X-3DGS Ours
+2D PSNR ↑ 49.97 50.54 47.26 49.70 39.84 46.28
+2D SSIM ↑ 0.987 0.986 0.984 0.986 0.967 0.982
+3D PSNR ↑ 23.40 38.86 21.24 37.98 14.07 35.17
+3D SSIM ↑ 0.660 0.959 0.562 0.952 0.408 0.923
+5.3 Ablation study
+Integration bias To demonstrate the impact of integration bias discussed in Sec. 4.2.1, we develop
+an X-ray version of 3DGS (X-3DGS) that uses X-ray rendering while retaining the biased 3D-to-2D
+Gaussian projection. We use the same voxelizer in Sec. 4.2.2 to extract volumes. Before voxelization,
+we divide the learned density of each Gaussian by the mean scaling factor µof all training views.
+Tab. 2 shows that rectifying integration bias benefits both 2D rendering (+3.15 dB PSNR) and 3D
+reconstruction (+17.77 dB PSNR). Fig. 7 visualize rendering and reconstruction results. While
+X-3DGS renders reasonable 2D projections, its reconstruction quality is significantly worse than ours.
+Besides, there are notable discrepancies in slices queried from different views. The conflicting 2D
+and 3D performances indicate that X-3DGS, despite fitting images well, does not accurately model
+the density field. In contrast, our method learns the actual view-independent density, eliminating
+inconsistencies and ensuring unbiased object representation.
+Component analysis We conduct ablation experiments to assess the effect of FDK initialization
+(Init.), modified adaptive control (AC), and total variation regularization (Reg.) on performance. The
+baseline model excludes these components and uses randomly generated Gaussians for initialization.
+Experiments are performed under the 50-view condition, evaluating PSNR, SSIM, training time,
+and Gaussian count (Gau.). Results are listed in Tab. 3. FDK initialization boosts PSNR by 0.9dB.
+Adaptive control improves quality but prolongs training due to more Gaussians. TV regularization
+increases SSIM by reducing artifacts and promoting smoothness. Overall, our full model outperforms
+the baseline, improving PSNR by 1.51 dB and SSIM by 0.018, with training time under 9 minutes.
+Parameter analysis We perform parameter analysis on the number of initialized Gaussians M,
+TV loss weight λtv, and TV volume size D. The results are shown in the last three blocks of Tab. 3.
+R2-Gaussian achieves good quality-efficiency balance at 50k initialized Gaussians. A TV loss weight
+ofλtv= 0.05improves reconstruction, but larger values can lead to degradation. The training time
+increases with TV volume size while the performance peaks at D= 32 .
+Convergence analysis Fig. 8 compares the results of NeRF-based methods and our R2-Gaussian
+method at different iterations. Our method, both with and without FDK initialization, converges
+significantly faster, displaying sharp details by the 500th iteration when other methods still exhibit
+artifacts and blurriness. Notably, the FDK initialization offers a rough structure before training, which
+30°90°150°
+Ground TruthOursX-3DGS (150°)X-3DGS (90°)X-3DGS (30°)OursX-3DGSBeetle (50-view)Reconstructed VolumesRendered Projections (30°)
+Figure 7: Results of X-3DGS and our method with PSNR (dB) indicated on each image. We show
+slices of X-3DGS queried from three viewing angles. Although X-3DGS can produce plausible X-ray
+projections, its reconstructed volume lacks view consistency and exhibits poor quality.
+9Table 3: Ablation results with our choices in bold.
+Synthetic PSNR ↑SSIM ↑ Time ↓ Gau.
+Baseline (B) 36.47 0.934 4m57s 50k
+B+Init. 37.37 0.944 5m29s 50k
+B+AC 37.33 0.942 7m33s 70k
+B+Reg. 36.79 0.943 6m30s 50k
+Full model 37.98 0.952 8m37s 68k
+M=5k 37.44 0.946 9m18s 32k
+M=10k 37.56 0.948 8m59s 35k
+M=50k 37.98 0.952 8m14s 68k
+M=100k 38.03 0.953 9m4s 112k
+M=200k 37.82 0.949 9m54s 206k
+λtv=0 37.66 0.948 7m9s 68k
+λtv=0.01 37.88 0.950 8m21s 68k
+λtv=0.05 37.98 0.952 8m14s 68k
+λtv=0.1 37.73 0.951 8m11s 68k
+λtv=0.15 37.40 0.949 8m27s 69k
+D=8 37.74 0.949 7m56s 68k
+D=16 37.94 0.950 8m18s 68k
+D=32 37.98 0.952 8m14s 68k
+D=48 37.90 0.951 9m34s 67k
+D=64 37.82 0.949 11m35s 67k
+Engine (50-view)1stiter250thiter500thiter750thiter1000thiterFinalOurs38.90 dB,9 minOurs w/o Init.38.63 dB,10 minSAX-NeRF36.90 dB, 793 minNAF37.12 dB, 32 minIntraTomo35.04 dB, 126min⋮⋮⋮⋮⋮Figure 8: Results of NeRF-based methods and
+our R2-Gaussian at different iterations.
+further accelerates convergence and enhances reconstruction quality. Finally, our method outperforms
+others in both performance and efficiency, achieving the highest PSNR of 38.90 dB in 9 minutes.
+6 Discussion and conclusion
+Discussion R2-Gaussian inherits some limitations from 3DGS, such as varying training time across
+modalities, needle-like artifacts under extremely sparse-view conditions, and suboptimal extrapolation
+for other tomography tasks. Besides, we have not considered calibration errors regarding the scanned
+geometry and anisotropic physical effects such as Compton scattering. More details are discussed
+in Appendix E. Despite these limitations, our method’s superior performance and fast speed make it
+valuable for real-world applications for medical diagnosis and industrial inspection.
+Conclusion This paper presents R2-Gaussian, a novel 3DGS-based framework for sparse-view
+tomographic reconstruction. We identify and rectify a previously overlooked integration bias of
+standard 3DGS, which hinders accurate density retrieval. Furthermore, we enhance 3DGS for
+tomography by introducing new kernels, devising X-ray rasterization functions, and developing a
+differentiable voxelizer. Our R2-Gaussian surpasses state-of-the-art methods in both reconstruction
+quality and training speed, demonstrating its potential for real-world applications. Crucially, we
+speculate that the newly found integration bias may be pervasive across all 3DGS-related research.
+Consequently, our rectification technique could benefit more tasks beyond computed tomography.
+Acknowledgments
+The research is funded in part by ARC Discovery Grant (grant ID: DP220100800) of the Australia
+Research Council.
+References
+[1]Jonas Adler and Ozan Öktem. Learned primal-dual reconstruction. IEEE transactions on
+medical imaging , 37(6):1322–1332, 2018.
+10[2]Anders H Andersen and Avinash C Kak. Simultaneous algebraic reconstruction technique (sart):
+a superior implementation of the art algorithm. Ultrasonic imaging , 6(1):81–94, 1984.
+[3]Rushil Anirudh, Hyojin Kim, Jayaraman J Thiagarajan, K Aditya Mohan, Kyle Champley, and
+Timo Bremer. Lose the views: Limited angle ct reconstruction via implicit sinogram completion.
+InProceedings of the IEEE Conference on Computer Vision and Pattern Recognition , pages
+6343–6352, 2018.
+[4]Samuel G Armato III, Geoffrey McLennan, Luc Bidaut, Michael F McNitt-Gray, Charles R
+Meyer, Anthony P Reeves, Binsheng Zhao, Denise R Aberle, Claudia I Henschke, Eric A
+Hoffman, et al. The lung image database consortium (lidc) and image database resource
+initiative (idri): a completed reference database of lung nodules on ct scans. Medical physics ,
+38(2):915–931, 2011.
+[5]Ander Biguri, Manjit Dosanjh, Steven Hancock, and Manuchehr Soleimani. Tigre: a matlab-gpu
+toolbox for cbct image reconstruction. Biomedical Physics & Engineering Express , 2(5):055010,
+2016.
+[6]Yuanhao Cai, Jiahao Wang, Alan Yuille, Zongwei Zhou, and Angtian Wang. Structure-aware
+sparse-view x-ray 3d reconstruction. In Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition , 2024.
+[7]Yuanhao Cai, Yixun Liang, Jiahao Wang, Angtian Wang, Yulun Zhang, Xiaokang Yang, Zong-
+wei Zhou, and Alan Yuille. Radiative gaussian splatting for efficient x-ray novel view synthesis.
+InEuropean Conference on Computer Vision , pages 283–299. Springer, 2025.
+[8]Hanlin Chen, Chen Li, and Gim Hee Lee. Neusg: Neural implicit surface reconstruction with
+3d gaussian splatting guidance. arXiv preprint arXiv:2312.00846 , 2023.
+[9]Zilong Chen, Feng Wang, and Huaping Liu. Text-to-3d using gaussian splatting. In Proceedings
+of the IEEE/CVF Conference on Computer Vision and Pattern Recognition , 2024.
+[10] Hyungjin Chung, Dohoon Ryu, Michael T McCann, Marc L Klasky, and Jong Chul Ye. Solving
+3d inverse problems using pre-trained 2d diffusion models. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition , pages 22542–22551, 2023.
+[11] Leonardo De Chiffre, Simone Carmignato, J-P Kruth, Robert Schmitt, and Albert Weckenmann.
+Industrial applications of computed tomography. CIRP annals , 63(2):655–677, 2014.
+[12] Philip CJ Donoghue, Stefan Bengtson, Xi-ping Dong, Neil J Gostling, Therese Huldtgren,
+John A Cunningham, Chongyu Yin, Zhao Yue, Fan Peng, and Marco Stampanoni. Synchrotron
+x-ray tomographic microscopy of fossil embryos. Nature , 442(7103):680–683, 2006.
+[13] Lee A Feldkamp, Lloyd C Davis, and James W Kress. Practical cone-beam algorithm. Josa a , 1
+(6):612–619, 1984.
+[14] Zhongpai Gao, Benjamin Planche, Meng Zheng, Xiao Chen, Terrence Chen, and Ziyan Wu.
+Ddgs-ct: Direction-disentangled gaussian splatting for realistic volume rendering. arXiv preprint
+arXiv:2406.02518 , 2024.
+[15] Muhammad Usman Ghani and W Clem Karl. Deep learning-based sinogram completion
+for low-dose ct. In 2018 IEEE 13th Image, Video, and Multidimensional Signal Processing
+Workshop (IVMSP) , pages 1–5. IEEE, 2018.
+[16] Antoine Guédon and Vincent Lepetit. Sugar: Surface-aligned gaussian splatting for efficient
+3d mesh reconstruction and high-quality mesh rendering. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition , 2024.
+[17] Godfrey N Hounsfield. Computed medical imaging. Science , 210(4465):22–28, 1980.
+[18] Binbin Huang, Zehao Yu, Anpei Chen, Andreas Geiger, and Shenghua Gao. 2d gaussian
+splatting for geometrically accurate radiance fields. In SIGGRAPH 2024 Conference Papers .
+Association for Computing Machinery, 2024. doi: 10.1145/3641519.3657428.
+11[19] Kyong Hwan Jin, Michael T McCann, Emmanuel Froustey, and Michael Unser. Deep convolu-
+tional neural network for inverse problems in imaging. IEEE transactions on image processing ,
+26(9):4509–4522, 2017.
+[20] Avinash C Kak and Malcolm Slaney. Principles of computerized tomographic imaging . SIAM,
+2001.
+[21] Emma Kamutta, Sofia Mäkinen, and Alexander Meaney. Cone-Beam Computed Tomography
+Dataset of a Seashell, August 2022. URL https://doi.org/10.5281/zenodo.6983008 .
+[22] Shigehiko Katsuragawa and Kunio Doi. Computer-aided diagnosis in chest radiography. Com-
+puterized Medical Imaging and Graphics , 31(4-5):212–223, 2007.
+[23] Bernhard Kerbl, Georgios Kopanas, Thomas Leimkühler, and George Drettakis. 3d gaussian
+splatting for real-time radiance field rendering. ACM Transactions on Graphics , 42(4):1–14,
+2023.
+[24] Timo Kiljunen, Touko Kaasalainen, Anni Suomalainen, and Mika Kortesniemi. Dental cone
+beam ct: A review. Physica Medica , 31(8):844–860, 2015.
+[25] Diederik Kingma and Jimmy Ba. Adam: A method for stochastic optimization. In International
+Conference on Learning Representations (ICLR) , San Diega, CA, USA, 2015.
+[26] Pavol Klacansky. Open scivis datasets, December 2017. URL https://klacansky.com/
+open-scivis-datasets/ .https://klacansky.com/open-scivis-datasets/ .
+[27] Muhammed Kocabas, Jen-Hao Rick Chang, James Gabriel, Oncel Tuzel, and Anurag Ranjan. HUGS:
+Human gaussian splatting. In 2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition
+(CVPR) , 2024. URL https://arxiv.org/abs/2311.17910 .
+[28] Suhyeon Lee, Hyungjin Chung, Minyoung Park, Jonghyuk Park, Wi-Sun Ryu, and Jong Chul Ye. Im-
+proving 3d imaging with pre-trained perpendicular 2d diffusion models. In Proceedings of the IEEE/CVF
+International Conference on Computer Vision , pages 10710–10720, 2023.
+[29] Yingtai Li, Xueming Fu, Shang Zhao, Ruiyang Jin, and S Kevin Zhou. Sparse-view ct reconstruction with
+3d gaussian volumetric representation. arXiv preprint arXiv:2312.15676 , 2023.
+[30] Zhe Li, Zerong Zheng, Lizhen Wang, and Yebin Liu. Animatable gaussians: Learning pose-dependent
+gaussian maps for high-fidelity human avatar modeling. In Proceedings of the IEEE/CVF Conference on
+Computer Vision and Pattern Recognition (CVPR) , 2024.
+[31] Zhihao Liang, Qi Zhang, Ying Feng, Ying Shan, and Kui Jia. Gs-ir: 3d gaussian splatting for inverse
+rendering. Conference on Computer Vision and Pattern Recognition (CVPR) , 2024.
+[32] Yiqun Lin, Zhongjin Luo, Wei Zhao, and Xiaomeng Li. Learning deep intensity field for extremely
+sparse-view cbct reconstruction. In International Conference on Medical Image Computing and Computer-
+Assisted Intervention , pages 13–23. Springer, 2023.
+[33] Yiqun Lin, Jiewen Yang, Hualiang Wang, Xinpeng Ding, Wei Zhao, and Xiaomeng Li. Cˆ 2rv: Cross-
+regional and cross-view learning for sparse-view cbct reconstruction. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition , pages 11205–11214, 2024.
+[34] Youtian Lin, Zuozhuo Dai, Siyu Zhu, and Yao Yao. Gaussian-flow: 4d reconstruction with dynamic
+3d gaussian particle. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition , 2024.
+[35] Jiaming Liu, Rushil Anirudh, Jayaraman J Thiagarajan, Stewart He, K Aditya Mohan, Ulugbek S Kamilov,
+and Hyojin Kim. Dolce: A model-based probabilistic diffusion framework for limited-angle ct reconstruc-
+tion. In Proceedings of the IEEE/CVF International Conference on Computer Vision , pages 10498–10508,
+2023.
+[36] Xian Liu, Xiaohang Zhan, Jiaxiang Tang, Ying Shan, Gang Zeng, Dahua Lin, Xihui Liu, and Ziwei
+Liu. Humangaussian: Text-driven 3d human generation with gaussian splatting. In Proceedings of the
+IEEE/CVF Conference on Computer Vision and Pattern Recognition , 2024.
+[37] Zhengchun Liu, Tekin Bicer, Rajkumar Kettimuthu, Doga Gursoy, Francesco De Carlo, and Ian Foster.
+Tomogan: low-dose synchrotron x-ray tomography with generative adversarial networks: discussion.
+JOSA A , 37(3):422–434, 2020.
+12[38] Tao Lu, Mulin Yu, Linning Xu, Yuanbo Xiangli, Limin Wang, Dahua Lin, and Bo Dai. Scaffold-gs:
+Structured 3d gaussians for view-adaptive rendering. Conference on Computer Vision and Pattern
+Recognition (CVPR) , 2024.
+[39] Vladan Lu ˇci´c, Friedrich Förster, and Wolfgang Baumeister. Structural studies by electron tomography:
+from cells to molecules. Annu. Rev. Biochem. , 74:833–865, 2005.
+[40] Stephen H Manglos, George M Gagne, Andrzej Krol, F Deaver Thomas, and Rammohan Narayanaswamy.
+Transmission maximum-likelihood reconstruction with ordered subsets for cone beam ct. Physics in
+Medicine & Biology , 40(7):1225, 1995.
+[41] Alexander Meaney. Cone-Beam Computed Tomography Dataset of a Pine Cone, August 2022. URL
+https://doi.org/10.5281/zenodo.6985407 .
+[42] Alexander Meaney. Cone-beam computed tomography dataset of a walnut, August 2022. URL https:
+//doi.org/10.5281/zenodo.6986012 .
+[43] Ben Mildenhall, Pratul P. Srinivasan, Matthew Tancik, Jonathan T. Barron, Ravi Ramamoorthi, and Ren
+Ng. Nerf: Representing scenes as neural radiance fields for view synthesis. In ECCV , 2020.
+[44] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-
+performance deep learning library. Advances in neural information processing systems , 32, 2019.
+[45] Thomas Porter and Tom Duff. Compositing digital images. In Proceedings of the 11th annual conference
+on Computer graphics and interactive techniques , pages 253–259, 1984.
+[46] Johann Radon. On the determination of functions from their integral values along certain manifolds. IEEE
+transactions on medical imaging , 5(4):170–176, 1986.
+[47] Holger Roth, Amal Farag, Evrim B. Turkbey, Le Lu, Jiamin Liu, and Ronald M. Summers. Data from
+pancreas-ct, 2016. URL https://www.cancerimagingarchive.net/collection/pancreas-ct/ .
+[48] Darius Rückert, Yuanhao Wang, Rui Li, Ramzi Idoughi, and Wolfgang Heidrich. Neat: Neural adaptive
+tomography. ACM Transactions on Graphics (TOG) , 41(4):1–13, 2022.
+[49] Leonid I Rudin, Stanley Osher, and Emad Fatemi. Nonlinear total variation based noise removal algorithms.
+Physica D: nonlinear phenomena , 60(1-4):259–268, 1992.
+[50] Jason Sanders and Edward Kandrot. CUDA by example: an introduction to general-purpose GPU
+programming . Addison-Wesley Professional, 2010.
+[51] Ken Sauer and Charles Bouman. A local update strategy for iterative reconstruction from projections.
+IEEE Transactions on Signal Processing , 41(2):534–548, 1993.
+[52] William C Scarfe, Allan G Farman, Predag Sukovic, et al. Clinical applications of cone-beam computed
+tomography in dental practice. Journal-Canadian Dental Association , 72(1):75, 2006.
+[53] Johannes L Schonberger and Jan-Michael Frahm. Structure-from-motion revisited. In Proceedings of the
+IEEE conference on computer vision and pattern recognition , pages 4104–4113, 2016.
+[54] Liyue Shen, John Pauly, and Lei Xing. Nerp: implicit neural representation learning with prior embedding
+for sparsely sampled image reconstruction. IEEE Transactions on Neural Networks and Learning Systems ,
+2022.
+[55] Emil Y Sidky and Xiaochuan Pan. Image reconstruction in circular cone-beam computed tomography by
+constrained, total-variation minimization. Physics in Medicine & Biology , 53(17):4777, 2008.
+[56] The Finnish Inverse Problems Society. X-ray tomographic datasets, 2024. URL https://fips.fi/
+category/open-datasets/x-ray-tomographic-datasets/ .
+[57] Jiaxiang Tang, Jiawei Ren, Hang Zhou, Ziwei Liu, and Gang Zeng. Dreamgaussian: Generative gaus-
+sian splatting for efficient 3d content creation. In The Twelfth International Conference on Learning
+Representations , 2024. URL https://openreview.net/forum?id=UyNXMqnN3c .
+[58] Pieter Verboven, Bart Dequeker, Jiaqi He, Michiel Pieters, Leroi Pols, Astrid Tempelaere, Leen Van Doorse-
+laer, Hans Van Cauteren, Ujjwal Verma, Hui Xiao, et al. www. x-plant. org-the ct database of plant organs.
+In6th Symposium on X-ray Computed Tomography: Inauguration of the KU Leuven XCT Core Facility,
+Location: Leuven, Belgium , 2022.
+13[59] Zhou Wang, Alan C Bovik, Hamid R Sheikh, and Eero P Simoncelli. Image quality assessment: from
+error visibility to structural similarity. IEEE transactions on image processing , 13(4):600–612, 2004.
+[60] Guanjun Wu, Taoran Yi, Jiemin Fang, Lingxi Xie, Xiaopeng Zhang, Wei Wei, Wenyu Liu, Qi Tian, and
+Xinggang Wang. 4d gaussian splatting for real-time dynamic scene rendering. In Proceedings of the
+IEEE/CVF Conference on Computer Vision and Pattern Recognition , 2024.
+[61] Ziyi Yang, Xinyu Gao, Wen Zhou, Shaohui Jiao, Yuqing Zhang, and Xiaogang Jin. Deformable 3d
+gaussians for high-fidelity monocular dynamic scene reconstruction. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition , 2024.
+[62] Taoran Yi, Jiemin Fang, Junjie Wang, Guanjun Wu, Lingxi Xie, Xiaopeng Zhang, Wenyu Liu, Qi Tian,
+and Xinggang Wang. Gaussiandreamer: Fast generation from text to 3d gaussians by bridging 2d and
+3d diffusion models. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition , 2024.
+[63] Xingde Ying, Heng Guo, Kai Ma, Jian Wu, Zhengxin Weng, and Yefeng Zheng. X2ct-gan: reconstructing
+ct from biplanar x-rays with generative adversarial networks. In Proceedings of the IEEE/CVF conference
+on computer vision and pattern recognition , pages 10619–10628, 2019.
+[64] Zehao Yu, Anpei Chen, Binbin Huang, Torsten Sattler, and Andreas Geiger. Mip-splatting: Alias-free 3d
+gaussian splatting. Conference on Computer Vision and Pattern Recognition (CVPR) , 2024.
+[65] Zehao Yu, Torsten Sattler, and Andreas Geiger. Gaussian opacity fields: Efficient high-quality compact
+surface reconstruction in unbounded scenes. arXiv preprint arXiv:2404.10772 , 2024.
+[66] Guangming Zang, Ramzi Idoughi, Rui Li, Peter Wonka, and Wolfgang Heidrich. Intratomo: self-supervised
+learning-based tomography via sinogram synthesis and prediction. In Proceedings of the IEEE/CVF
+International Conference on Computer Vision , pages 1960–1970, 2021.
+[67] Ruyi Zha, Yanhao Zhang, and Hongdong Li. Naf: Neural attenuation fields for sparse-view cbct recon-
+struction. In International Conference on Medical Image Computing and Computer-Assisted Intervention ,
+pages 442–452. Springer, 2022.
+[68] Zheng Zhang, Wenbo Hu, Yixing Lao, Tong He, and Hengshuang Zhao. Pixel-gs: Density control with
+pixel-aware gradient for 3d gaussian splatting. arXiv preprint arXiv:2403.15530 , 2024.
+[69] Matthias Zwicker, Hanspeter Pfister, Jeroen Van Baar, and Markus Gross. Ewa splatting. IEEE Transac-
+tions on Visualization and Computer Graphics , 8(3):223–238, 2002.
+14A Transformation module in X-ray rasterization
+The configuration of a cone beam CT scanner is shown in Fig. 9. The X-ray source and detector
+plane rotate around the z-axis, resembling a pinhole camera model. Therefore, we can formulate the
+field-of-view (FOV) of a scanner as
+FOV x= 2·arctan(Dx
+2LSD), FOY y= 2·arctan(Dy
+2LSD). (9)
+Here, (Dx, Dy)is the physical size of the detector plane, and LSDis the distance between the source
+and the detector. Following [23], we then use FOVs to determine the projection mapping ϕ.
+To get Gaussians in the ray space, we first transfer them from the world space to the scanner space.
+The scanner space is defined such that its origin is the X-ray source, and its z-axis points to the
+projection center. The transformation matrix Tfrom the world space to the scanner space is
+T=
+W t
+0 1
+,W="−sinθcosθ 0
+0 0 −1
+−cosθ−sinθ0#
+,t="0
+0
+LSO#
+. (10)
+Here, ϕis the rotation angle, and LSOis the distance between the source and the object. Next, we
+apply local approximation on each Gaussian. The Jacobian of the affine approximation Jiis the
+same as Eq. (29) in [ 69]. Finally, we have the Gaussian in the ray space with new position ˜pand
+covariance ˜Σias
+˜pi=ϕ(p),˜Σi=JiWΣ iW⊤J⊤
+i. (11)
+Source Trajectory Detector Trajectory 
+<latexit sha1_base64="txYD5OZAGnEdle8SBBFbxYidKNE=">AAAB7XicbVDLSgNBEOyNr7gajXr0MhgCnsKuB80xIIgHwYjmAckSZieTZMzszDIzK4Ql/+DFgyIe9T/8BG/+jZPHQRMLGoqqbrq7wpgzbTzv28msrK6tb2Q33a3t3M5ufm+/rmWiCK0RyaVqhlhTzgStGWY4bcaK4ijktBEOzyd+44EqzaS4M6OYBhHuC9ZjBBsr1a866e31uJMveCVvCrRM/DkpVHKfSfHCfa928l/triRJRIUhHGvd8r3YBClWhhFOx2470TTGZIj7tGWpwBHVQTq9doyKVuminlS2hEFT9fdEiiOtR1FoOyNsBnrRm4j/ea3E9MpBykScGCrIbFEv4chINHkddZmixPCRJZgoZm9FZIAVJsYG5NoQ/MWXl0n9pOSflk5vbBplmCELh3AEx+DDGVTgEqpQAwL38AjP8OJI58l5dd5mrRlnPnMAf+B8/ADlCJGX</latexit>LSO
+<latexit sha1_base64="ZXTxajlg0JQWH59ggu062DiJ/1g=">AAAB7XicbZC7SgNBFIZn4y3GW9RSkMEgWIVdi5jOgI1lAuYCyRJmJ7PJmNmZZeasEJaU9jYWitj6Cql8CDufwZdwcik0+sPAx/+fw5xzglhwA6776WRWVtfWN7Kbua3tnd29/P5Bw6hEU1anSijdCohhgktWBw6CtWLNSBQI1gyGV9O8ece04UrewChmfkT6koecErBWowMDBqSbL7hFdyb8F7wFFC7fJ7Wv++NJtZv/6PQUTSImgQpiTNtzY/BTooFTwca5TmJYTOiQ9FnboiQRM346m3aMT63Tw6HS9knAM/dnR0oiY0ZRYCsjAgOznE3N/7J2AmHZT7mME2CSzj8KE4FB4enquMc1oyBGFgjV3M6K6YBoQsEeKGeP4C2v/Bca50WvVCzV3EKljObKoiN0gs6Qhy5QBV2jKqojim7RA3pCz45yHp0X53VemnEWPYfol5y3b2vPk3E=</latexit>✓
+<latexit sha1_base64="BOwF2nCBRHhHxig2KsvpAx1StZk=">AAAB7HicbVBNS8NAEJ3UrxqtVj16WSwFTyXx0PZYUMRjBdMW2lA22027dLMJuxuxhP4GLx4U8dof4k/w5r9x+3HQ1gcDj/dmmJkXJJwp7TjfVm5re2d3L79vHxwWjo6LJ6ctFaeSUI/EPJadACvKmaCeZprTTiIpjgJO28H4eu63H6lULBYPepJQP8JDwUJGsDaSd9PPnqb9YsmpOAugTeKuSKlR+EzLt/as2S9+9QYxSSMqNOFYqa7rJNrPsNSMcDq1e6miCSZjPKRdQwWOqPKzxbFTVDbKAIWxNCU0Wqi/JzIcKTWJAtMZYT1S695c/M/rpjqs+xkTSaqpIMtFYcqRjtH8czRgkhLNJ4ZgIpm5FZERlphok49tQnDXX94krauKW61U700adVgiD+dwAZfgQg0acAdN8IAAg2d4hTdLWC/Wu/WxbM1Zq5kz+ANr9gNykZFb</latexit>Dx
+<latexit sha1_base64="PAv1zc//oY14mJkIYkjHpsDAsSY=">AAAB7HicbVA9SwNBEJ2LH4mJH1HLNItBsAp3FjFlUAvLCF4SSI6wt9lLluztHbt7wnHkHwg2ForY+oPs/BvWFm4+Ck18MPB4b4aZeX7MmdK2/WnlNja3tvOFnWJpd2//oHx41FZRIgl1ScQj2fWxopwJ6mqmOe3GkuLQ57TjT65mfueeSsUicafTmHohHgkWMIK1kdzrQZZOB+WqXbPnQOvEWZJqs/J1mS89fLcG5Y/+MCJJSIUmHCvVc+xYexmWmhFOp8V+omiMyQSPaM9QgUOqvGx+7BSdGmWIgkiaEhrN1d8TGQ6VSkPfdIZYj9WqNxP/83qJDhpexkScaCrIYlGQcKQjNPscDZmkRPPUEEwkM7ciMsYSE23yKZoQnNWX10n7vObUa/Vbk0YDFihABU7gDBy4gCbcQAtcIMDgEZ7hxRLWk/VqvS1ac9Zy5hj+wHr/ASwhkeY=</latexit>Dy
+<latexit sha1_base64="Lc1x8sNliZjozSiWMAJb822mAqY=">AAAB6HicbZC7SgNBFIbPxluMt6ilIItBsAq7FjGdARvLBMwFkhBmJ2eTMbOzy8ysGJaUVjYWitj6FKl8CDufwZdwcik08YeBj/8/hznneBFnSjvOl5VaWV1b30hvZra2d3b3svsHNRXGkmKVhjyUDY8o5ExgVTPNsRFJJIHHse4NriZ5/Q6lYqG40cMI2wHpCeYzSrSxKvedbM7JO1PZy+DOIXf5Ma58PxyPy53sZ6sb0jhAoSknSjVdJ9LthEjNKMdRphUrjAgdkB42DQoSoGon00FH9qlxurYfSvOEtqfu746EBEoNA89UBkT31WI2Mf/LmrH2i+2EiSjWKOjsIz/mtg7tydZ2l0mkmg8NECqZmdWmfSIJ1eY2GXMEd3HlZaid591CvlBxcqUizJSGIziBM3DhAkpwDWWoAgWER3iGF+vWerJerbdZacqa9xzCH1nvP64RkUU=</latexit>x<latexit sha1_base64="Zl6viye2enpu/Kq3/cHkhuouu6s=">AAAB6HicbVC7SgNBFL0bXzG+oiltBkPAKuxaxJQBG8sEzAOSJcxObpIxsw9mZoVlSWdnY6GIrR/jB9jpB/gFfoCTR6HRAxcO59zLvfd4keBK2/a7lVlb39jcym7ndnb39g/yh0ctFcaSYZOFIpQdjyoUPMCm5lpgJ5JIfU9g25tczPz2DUrFw+BKJxG6Ph0FfMgZ1UZqJP180S7bc5C/xFmSYq1Quv16/fyo9/NvvUHIYh8DzQRVquvYkXZTKjVnAqe5XqwwomxCR9g1NKA+KjedHzolJaMMyDCUpgJN5urPiZT6SiW+Zzp9qsdq1ZuJ/3ndWA+rbsqDKNYYsMWiYSyIDsnsazLgEpkWiSGUSW5uJWxMJWXaZJMzITirL/8lrbOyUylXGiaNKiyQhWM4gVNw4BxqcAl1aAIDhDt4gEfr2rq3nqznRWvGWs4U4Besl2/i3pFw</latexit>y
+<latexit sha1_base64="ZeJXXDIEfV7SuDoge6EJJgxhVi4=">AAAB6HicbZC7SgNBFIbPxluMt6ilIItBsAq7FjGdARvLBMwFkhBmJ2eTMbOzy8ysEJeUVjYWitj6FKl8CDufwZdwcik08YeBj/8/hznneBFnSjvOl5VaWV1b30hvZra2d3b3svsHNRXGkmKVhjyUDY8o5ExgVTPNsRFJJIHHse4NriZ5/Q6lYqG40cMI2wHpCeYzSrSxKvedbM7JO1PZy+DOIXf5Ma58PxyPy53sZ6sb0jhAoSknSjVdJ9LthEjNKMdRphUrjAgdkB42DQoSoGon00FH9qlxurYfSvOEtqfu746EBEoNA89UBkT31WI2Mf/LmrH2i+2EiSjWKOjsIz/mtg7tydZ2l0mkmg8NECqZmdWmfSIJ1eY2GXMEd3HlZaid591CvlBxcqUizJSGIziBM3DhAkpwDWWoAgWER3iGF+vWerJerbdZacqa9xzCH1nvP7EZkUc=</latexit>zDetectorSource
+Figure 9: Configuration of a cone-beam CT scanner.
+B Details of dataset
+Synthetic data We evaluate methods with various modalities, covering major CT applications
+such as medical diagnosis, biological research, and industrial inspection. The synthetic dataset
+consists of 15 cases across three categories: human organs (chest, foot, head, jaw, and pancreas),
+animals and plants (beetle, bonsai, broccoli, kingsnake, and pepper), and artificial objects (backpack,
+engine, present, teapot, and mount). The chest and pancreas scans are from LIDC-IDRI [ 4] and
+Pancreas-CT [ 47], respectively. Broccoli and pepper are obtained from X-Plant [ 58], and the rest are
+from SciVis [ 26]. Following [ 67,6], we preprocess raw data by normalizing densities to [0,1]and
+resizing volumes to 256×256×256. We then use the tomography toolbox TIGRE [ 5] to capture
+512×512projections in the range of 0◦∼360◦. We add two types of noise: Gaussian (mean
+0, standard deviation 10) as electronic noise of the detector and Poisson (lambda 1e5) as photon
+scattering noise. All volumes and their projection examples are shown in Fig. 10.
+Real-world data We use FIPS [ 56], a public dataset providing real 2D X-ray projections. FIPS
+includes three objects (pine [ 41], seashell [ 21], and walnut [ 42]). Each case has 721 projections in
+the range of 0◦-360◦. We preprocess 2D projections by resizing them to 560x560and normalizing
+them to [0,1]. Since ground truth volumes are unavailable, we use FDK to create pseudo-ground
+truth with all views and then subsample 75/50/25 views for sparse-view experiments. The size of the
+target volume is 256×256×256.
+15Synthetic dataArtificial ObjectsAnimals and PlantsHuman Organs
+BackpackBeetleChest
+EngineBonsaiFoot
+MountBroccoliHead
+PresentKingsnakeJaw
+TeapotPepperPancreasReal-world data
+WalnutSeashellPineProjection (90°)Projection (45°)Projection (0°)VolumeProjection (90°)Projection (45°)Projection (0°)VolumeProjection (90°)Projection (45°)Projection (0°)VolumeFigure 10: Datasets used for experiments. We show half volume and projection examples for each
+case.
+C Implementation details of baseline methods
+For fairness, we do not compare methods that require external training data but focus on those that
+solely use 2D projections of arbitrary objects. We run traditional algorithms FDK, SART, and ASD-
+POCS with GPU-accelerated tomographic toolbox TIGRE [ 5], and select three SOTA NeRF-based
+tomography methods. IntraTomo models the density field with a large MLP. NAF accelerates the
+training process by hash encoding. SAX-NeRF achieves plausible results with a line segment-based
+transformer. We use the official code of NAF and SAX-NeRF and conduct experiments with default
+hyperparameters. The IntraTomo implementation is sourced from the NAF repository. The training
+iterations of NeRF-based methods are set to 150k (default of NAF and SAX-NeRF). All methods are
+run on a single RTX 3090 GPU.
+D More qualitative results
+Main results We visualize more reconstruction results in Fig. 11 and Fig. 12. FDK and SART in-
+troduce notable streak artifacts, while ASD-POCS and IntraTomo blur structural details. NeRF-based
+solutions perform better than traditional methods but exhibit salt-and-pepper noise. In comparison,
+our method successfully recovers sharp details and maintains smoothness in homogeneous areas.
+Integration bias We show more qualitative comparisons of X-3DGS and ours in Fig. 13. Our
+method outperforms X-3DGS in both 2D rendering and 3D reconstruction.
+Components and parameters We visually compare different components and parameters in Fig. 14.
+Our newly introduced components improve the reconstruction quality. Our parameter setting also
+yields the best performance.
+Convergence analysis We show the PSNR and SSIM plots in Fig. 15. Our method converges
+significantly faster than NeRF-based methods and outperforms them in only 3000 iterations.
+E More discussion of limitation
+Varying time We present the training times for all cases in Fig. 16. The training time varies across
+cases, primarily due to the different numbers of kernels used. Our method takes more time on objects
+16OursSAX-NeRFNAFIntraTomoOursSAX-NeRFNAFIntraTomo75-view50-view25-view
+GTOursSAX-NeRFNAFIntraTomoFigure 11: Reconstruction results of NeRF-based methods and our method on the synthetic dataset.
+with large homogeneous areas, such as the chest, pancreas, and mount, and less time on those with
+sparse structures, such as the beetle, backpack, and present.
+Needle-like artifacts While our method achieves the highest reconstruction quality, it introduces
+needle-like artifacts, especially under the 25-view condition (Fig. 17). This suggests that some
+Gaussians may overfit specific X-rays. Similar artifacts are also observed in 3DGS [68].
+Extrapolation ability While this paper focuses on sparse-view CT (SVCT), we also test R2-
+Gaussian on limited-angle CT (LACT), where the scanning range is constrained to less than 180◦.
+Unlike SVCT, which highlights the interpolation ability of methods, LACT challenges their extrapo-
+lation ability, i.e., estimating unseen areas outside the scanning range. We generate 100 projections
+within ranges of 0◦∼150◦,0◦∼120◦, and 0◦∼90◦. The quantitative results in Tab. 4 show that
+17Ground TruthOursSAX-NeRFNAFIntraTomoASD-POCSSARTFDK
+Figure 12: Reconstruction results on the real-world dataset.
+our method has slightly lower PSNR but higher SSIM than the NeRF-based method NAF. Visualiza-
+tion results in Fig. 18 indicate that our method recovers more details in scanned areas but exhibits
+blurred artifacts in unseen areas. We attribute this performance drop to the nature of the networks
+and kernels. Given the gradient of a ray, NeRF updates the entire network while 3DGS individually
+optimizes intersected kernels. Thus, NeRF has better global awareness and consistency, while 3DGS
+is more local-oriented and has suboptimal extrapolation ability.
+Calibration error In real-world applications, calibration errors can affect reconstruction quality.
+For example, tomography requires a reference image I0in Eq. (1) to represent the illumination pattern
+without the object. This reference image may have artifacts, such as intensity dropoff towards the
+image boundaries and other non-uniformities in illumination. Additionally, scanner extrinsics and
+intrinsics may vary during scanning due to heat expansion and mechanical vibrations. Addressing
+these practical challenges will be the focus of future work.
+Anisotropic effects Following existing CT reconstruction methods, we work under the isotropic
+assumption of X-ray imaging. However, in the real world, some X-ray transport effects, such as
+Compton scattering, are anisotropic. We do not explicitly model them but treat them as noises on
+X-ray projections. This is a necessary simplification for CT reconstruction but may induce inaccuracy
+for novel-view X-ray synthesis. Readers may refer to [ 7,14] for using 3DGS for X-ray view synthesis.
+Table 4: Quantitative evaluation on limited-angle tomography. We colorize the best ,second-best ,
+and third-best numbers.
+0◦∼150◦0◦∼120◦0◦∼90◦
+MethodsPSNR↑SSIM↑ Time↓ PSNR↑SSIM↑Time↓PSNR↑SSIM↑ Time↓
+FDK [13] 26.83 0.570 - 24.00 0.566 - 21.22 0.547 -
+SART [2] 33.34 0.883 7m9s 30.21 0.847 7m8s 26.71 0.795 7m59s
+ASD-POCS [55] 33.16 0.913 3m41s 29.76 0.875 3m39s 26.34 0.812 4m8s
+NAF [67] 36.29 0.940 27m18s 33.35 0.922 27m6s 29.89 0.884 27m25s
+Ours 36.12 0.948 9m3s 32.68 0.923 8m36s 29.21 0.886 8m28s
+18Reconstructed SlicesRendered Projections (0°)
+Ground TruthOursX-3DGSGround TruthOursX-3DGSFigure 13: Qualitative comparison of X-3DGS and our method.
+F Broader impacts
+Impacts on real-world applications Computed tomography is an essential imaging technique that
+is widely used in fields including medicine, biology, industry, etc. Our R2-Gaussian enjoys superior
+reconstruction performance and fast convergence speed, making it promising to be implemented in
+real-world applications such as medical diagnosis and industrial inspection.
+Impacts on research community We discover a previously unknown integration bias problem in
+currently popular 3DGS. we speculate that this problem could be universal across all 3DGS-related
+works. Therefore, our rectification technique may apply to wider practical domains, not limited
+to tomography but also other tasks such as magnetic resonance imaging (MRI) reconstruction and
+volumetric-based surface reconstruction.
+19Ground TruthFull ModelB+TVB+ACB+FDKBaseline (B)
+Ground Truth𝑀=200𝑘𝑀=100𝑘𝑴=𝟓𝟎𝒌𝑀=10𝑘𝑀=5𝑘
+Ground Truth𝜆!"=0.15𝜆!"=0.1𝝀𝒕𝒗=𝟎.𝟎𝟓𝜆!"=0.01𝜆!"=0
+Ground Truth𝐷=64𝐷=48𝑫=𝟑𝟐𝐷=16𝐷=8Figure 14: Quantitative comparison of different components and parameters.
+Figure 15: PSNR-iteration and SSIM-iteration plots of case engine, 50-view .
+20Time (min)
+051015
+ChestFootHeadJaw
+PancreasBeetle Bonsai Broccoli
+KingsnakePepperBackpackEngine Present Teapot Mount75-view 50-view 25-viewFigure 16: Training time on the synthetic dataset.
+25-view50-view75-view25-view50-view75-view
+Figure 17: 3DGS-based methods tend to introduce needle-like artifacts when there are insufficient
+amounts of images. PNSR (dB) is shown at the bottom right of each image.
+Ground TruthOursNAFASD-POCSSARTFDK
+Figure 18: Visualization of reconstruction results under limited-angle scenarios. PNSR (dB) is shown
+at the bottom right of each image.
+21NeurIPS Paper Checklist
+1.Claims
+Question: Do the main claims made in the abstract and introduction accurately reflect the
+paper’s contributions and scope?
+Answer: [Yes]
+Justification: In the abstract and introduction, we clearly highlight our contribution and scope
+as a discovery of integration bias problem in 3DGS and a novel 3DGS-based framework
+for tomographic reconstruction. We discuss details of our claim in Sec. 4 and validate it
+in Sec. 5.
+Guidelines:
+•The answer NA means that the abstract and introduction do not include the claims
+made in the paper.
+•The abstract and/or introduction should clearly state the claims made, including the
+contributions made in the paper and important assumptions and limitations. A No or
+NA answer to this question will not be perceived well by the reviewers.
+•The claims made should match theoretical and experimental results, and reflect how
+much the results can be expected to generalize to other settings.
+•It is fine to include aspirational goals as motivation as long as it is clear that these goals
+are not attained by the paper.
+2.Limitations
+Question: Does the paper discuss the limitations of the work performed by the authors?
+Answer: [Yes]
+Justification: We discuss limitation in Sec. 6. We further show more quantitative and
+qualitative analysis of limitations in Appendix E.
+Guidelines:
+•The answer NA means that the paper has no limitation while the answer No means that
+the paper has limitations, but those are not discussed in the paper.
+• The authors are encouraged to create a separate "Limitations" section in their paper.
+•The paper should point out any strong assumptions and how robust the results are to
+violations of these assumptions (e.g., independence assumptions, noiseless settings,
+model well-specification, asymptotic approximations only holding locally). The authors
+should reflect on how these assumptions might be violated in practice and what the
+implications would be.
+•The authors should reflect on the scope of the claims made, e.g., if the approach was
+only tested on a few datasets or with a few runs. In general, empirical results often
+depend on implicit assumptions, which should be articulated.
+•The authors should reflect on the factors that influence the performance of the approach.
+For example, a facial recognition algorithm may perform poorly when image resolution
+is low or images are taken in low lighting. Or a speech-to-text system might not be
+used reliably to provide closed captions for online lectures because it fails to handle
+technical jargon.
+•The authors should discuss the computational efficiency of the proposed algorithms
+and how they scale with dataset size.
+•If applicable, the authors should discuss possible limitations of their approach to
+address problems of privacy and fairness.
+•While the authors might fear that complete honesty about limitations might be used by
+reviewers as grounds for rejection, a worse outcome might be that reviewers discover
+limitations that aren’t acknowledged in the paper. The authors should use their best
+judgment and recognize that individual actions in favor of transparency play an impor-
+tant role in developing norms that preserve the integrity of the community. Reviewers
+will be specifically instructed to not penalize honesty concerning limitations.
+3.Theory Assumptions and Proofs
+22Question: For each theoretical result, does the paper provide the full set of assumptions and
+a complete (and correct) proof?
+Answer: [Yes]
+Justification: We carefully derive the X-ray rasterization functions with clear assumptions
+and numbered formulas as shown in Sec. 4.2.1 and Appendix A.
+Guidelines:
+• The answer NA means that the paper does not include theoretical results.
+•All the theorems, formulas, and proofs in the paper should be numbered and cross-
+referenced.
+•All assumptions should be clearly stated or referenced in the statement of any theorems.
+•The proofs can either appear in the main paper or the supplemental material, but if
+they appear in the supplemental material, the authors are encouraged to provide a short
+proof sketch to provide intuition.
+•Inversely, any informal proof provided in the core of the paper should be complemented
+by formal proofs provided in appendix or supplemental material.
+• Theorems and Lemmas that the proof relies upon should be properly referenced.
+4.Experimental Result Reproducibility
+Question: Does the paper fully disclose all the information needed to reproduce the main ex-
+perimental results of the paper to the extent that it affects the main claims and/or conclusions
+of the paper (regardless of whether the code and data are provided or not)?
+Answer: [Yes]
+Justification: Our work is based on the 3DGS framework with crucial modifications clearly
+described in Sec. 4. We provide implementation details, including all hyperparameters and
+training strategies in Sec. 5.1. We also attach our code in the supplementary material for
+reproducibility.
+Guidelines:
+• The answer NA means that the paper does not include experiments.
+•If the paper includes experiments, a No answer to this question will not be perceived
+well by the reviewers: Making the paper reproducible is important, regardless of
+whether the code and data are provided or not.
+•If the contribution is a dataset and/or model, the authors should describe the steps taken
+to make their results reproducible or verifiable.
+•Depending on the contribution, reproducibility can be accomplished in various ways.
+For example, if the contribution is a novel architecture, describing the architecture fully
+might suffice, or if the contribution is a specific model and empirical evaluation, it may
+be necessary to either make it possible for others to replicate the model with the same
+dataset, or provide access to the model. In general. releasing code and data is often
+one good way to accomplish this, but reproducibility can also be provided via detailed
+instructions for how to replicate the results, access to a hosted model (e.g., in the case
+of a large language model), releasing of a model checkpoint, or other means that are
+appropriate to the research performed.
+•While NeurIPS does not require releasing code, the conference does require all submis-
+sions to provide some reasonable avenue for reproducibility, which may depend on the
+nature of the contribution. For example
+(a)If the contribution is primarily a new algorithm, the paper should make it clear how
+to reproduce that algorithm.
+(b)If the contribution is primarily a new model architecture, the paper should describe
+the architecture clearly and fully.
+(c)If the contribution is a new model (e.g., a large language model), then there should
+either be a way to access this model for reproducing the results or a way to reproduce
+the model (e.g., with an open-source dataset or instructions for how to construct
+the dataset).
+23(d)We recognize that reproducibility may be tricky in some cases, in which case
+authors are welcome to describe the particular way they provide for reproducibility.
+In the case of closed-source models, it may be that access to the model is limited in
+some way (e.g., to registered users), but it should be possible for other researchers
+to have some path to reproducing or verifying the results.
+5.Open access to data and code
+Question: Does the paper provide open access to the data and code, with sufficient instruc-
+tions to faithfully reproduce the main experimental results, as described in supplemental
+material?
+Answer: [Yes]
+Justification: We will release the data and code upon acceptance. We attach the code in the
+supplementary material to reproduce experimental results.
+Guidelines:
+• The answer NA means that paper does not include experiments requiring code.
+•Please see the NeurIPS code and data submission guidelines ( https://nips.cc/
+public/guides/CodeSubmissionPolicy ) for more details.
+•While we encourage the release of code and data, we understand that this might not be
+possible, so “No” is an acceptable answer. Papers cannot be rejected simply for not
+including code, unless this is central to the contribution (e.g., for a new open-source
+benchmark).
+•The instructions should contain the exact command and environment needed to run to
+reproduce the results. See the NeurIPS code and data submission guidelines ( https:
+//nips.cc/public/guides/CodeSubmissionPolicy ) for more details.
+•The authors should provide instructions on data access and preparation, including how
+to access the raw data, preprocessed data, intermediate data, and generated data, etc.
+•The authors should provide scripts to reproduce all experimental results for the new
+proposed method and baselines. If only a subset of experiments are reproducible, they
+should state which ones are omitted from the script and why.
+•At submission time, to preserve anonymity, the authors should release anonymized
+versions (if applicable).
+•Providing as much information as possible in supplemental material (appended to the
+paper) is recommended, but including URLs to data and code is permitted.
+6.Experimental Setting/Details
+Question: Does the paper specify all the training and test details (e.g., data splits, hyper-
+parameters, how they were chosen, type of optimizer, etc.) necessary to understand the
+results?
+Answer: [Yes]
+Justification: We specify all training and testing details, including dataset setting, hyperpa-
+rameters, and type of optimizer in Sec. 5.1. We discuss hyperparameter analysis in Sec. 5.3.
+Guidelines:
+• The answer NA means that the paper does not include experiments.
+•The experimental setting should be presented in the core of the paper to a level of detail
+that is necessary to appreciate the results and make sense of them.
+•The full details can be provided either with the code, in appendix, or as supplemental
+material.
+7.Experiment Statistical Significance
+Question: Does the paper report error bars suitably and correctly defined or other appropriate
+information about the statistical significance of the experiments?
+Answer: [No]
+Justification: While our work and baseline methods involve some random operations, their
+influence on final results is very limited, so we do not include the error bars. Besides,
+baseline methods do not provide error bars in their papers for reference.
+24Guidelines:
+• The answer NA means that the paper does not include experiments.
+•The authors should answer "Yes" if the results are accompanied by error bars, confi-
+dence intervals, or statistical significance tests, at least for the experiments that support
+the main claims of the paper.
+•The factors of variability that the error bars are capturing should be clearly stated (for
+example, train/test split, initialization, random drawing of some parameter, or overall
+run with given experimental conditions).
+•The method for calculating the error bars should be explained (closed form formula,
+call to a library function, bootstrap, etc.)
+• The assumptions made should be given (e.g., Normally distributed errors).
+•It should be clear whether the error bar is the standard deviation or the standard error
+of the mean.
+•It is OK to report 1-sigma error bars, but one should state it. The authors should
+preferably report a 2-sigma error bar than state that they have a 96% CI, if the hypothesis
+of Normality of errors is not verified.
+•For asymmetric distributions, the authors should be careful not to show in tables or
+figures symmetric error bars that would yield results that are out of range (e.g. negative
+error rates).
+•If error bars are reported in tables or plots, The authors should explain in the text how
+they were calculated and reference the corresponding figures or tables in the text.
+8.Experiments Compute Resources
+Question: For each experiment, does the paper provide sufficient information on the com-
+puter resources (type of compute workers, memory, time of execution) needed to reproduce
+the experiments?
+Answer: [Yes]
+Justification: We clearly provide details of computer resources for our method and baseline
+methods in Sec. 5.1 and Appendix C.
+Guidelines:
+• The answer NA means that the paper does not include experiments.
+•The paper should indicate the type of compute workers CPU or GPU, internal cluster,
+or cloud provider, including relevant memory and storage.
+•The paper should provide the amount of compute required for each of the individual
+experimental runs as well as estimate the total compute.
+•The paper should disclose whether the full research project required more compute
+than the experiments reported in the paper (e.g., preliminary or failed experiments that
+didn’t make it into the paper).
+9.Code Of Ethics
+Question: Does the research conducted in the paper conform, in every respect, with the
+NeurIPS Code of Ethics https://neurips.cc/public/EthicsGuidelines ?
+Answer: [Yes]
+Justification: Our research strictly follows the NeurIPS Code of Ethics. We ensure anonymity
+for the submission.
+Guidelines:
+•The answer NA means that the authors have not reviewed the NeurIPS Code of Ethics.
+•If the authors answer No, they should explain the special circumstances that require a
+deviation from the Code of Ethics.
+•The authors should make sure to preserve anonymity (e.g., if there is a special consid-
+eration due to laws or regulations in their jurisdiction).
+10.Broader Impacts
+Question: Does the paper discuss both potential positive societal impacts and negative
+societal impacts of the work performed?
+25Answer: [Yes]
+Justification: We briefly introduce the potential societal impacts in Sec. 6 and discuss them
+in detail in Appendix F.
+Guidelines:
+• The answer NA means that there is no societal impact of the work performed.
+•If the authors answer NA or No, they should explain why their work has no societal
+impact or why the paper does not address societal impact.
+•Examples of negative societal impacts include potential malicious or unintended uses
+(e.g., disinformation, generating fake profiles, surveillance), fairness considerations
+(e.g., deployment of technologies that could make decisions that unfairly impact specific
+groups), privacy considerations, and security considerations.
+•The conference expects that many papers will be foundational research and not tied
+to particular applications, let alone deployments. However, if there is a direct path to
+any negative applications, the authors should point it out. For example, it is legitimate
+to point out that an improvement in the quality of generative models could be used to
+generate deepfakes for disinformation. On the other hand, it is not needed to point out
+that a generic algorithm for optimizing neural networks could enable people to train
+models that generate Deepfakes faster.
+•The authors should consider possible harms that could arise when the technology is
+being used as intended and functioning correctly, harms that could arise when the
+technology is being used as intended but gives incorrect results, and harms following
+from (intentional or unintentional) misuse of the technology.
+•If there are negative societal impacts, the authors could also discuss possible mitigation
+strategies (e.g., gated release of models, providing defenses in addition to attacks,
+mechanisms for monitoring misuse, mechanisms to monitor how a system learns from
+feedback over time, improving the efficiency and accessibility of ML).
+11.Safeguards
+Question: Does the paper describe safeguards that have been put in place for responsible
+release of data or models that have a high risk for misuse (e.g., pretrained language models,
+image generators, or scraped datasets)?
+Answer: [NA]
+Justification: Our paper poses no such risks.
+Guidelines:
+• The answer NA means that the paper poses no such risks.
+•Released models that have a high risk for misuse or dual-use should be released with
+necessary safeguards to allow for controlled use of the model, for example by requiring
+that users adhere to usage guidelines or restrictions to access the model or implementing
+safety filters.
+•Datasets that have been scraped from the Internet could pose safety risks. The authors
+should describe how they avoided releasing unsafe images.
+•We recognize that providing effective safeguards is challenging, and many papers do
+not require this, but we encourage authors to take this into account and make a best
+faith effort.
+12.Licenses for existing assets
+Question: Are the creators or original owners of assets (e.g., code, data, models), used in
+the paper, properly credited and are the license and terms of use explicitly mentioned and
+properly respected?
+Answer: [Yes]
+Justification: We properly credit the original codes and datasets in our paper and code. The
+license and terms of use are mentioned along with the code in the supplementary material.
+Guidelines:
+• The answer NA means that the paper does not use existing assets.
+26• The authors should cite the original paper that produced the code package or dataset.
+•The authors should state which version of the asset is used and, if possible, include a
+URL.
+• The name of the license (e.g., CC-BY 4.0) should be included for each asset.
+•For scraped data from a particular source (e.g., website), the copyright and terms of
+service of that source should be provided.
+•If assets are released, the license, copyright information, and terms of use in the
+package should be provided. For popular datasets, paperswithcode.com/datasets
+has curated licenses for some datasets. Their licensing guide can help determine the
+license of a dataset.
+•For existing datasets that are re-packaged, both the original license and the license of
+the derived asset (if it has changed) should be provided.
+•If this information is not available online, the authors are encouraged to reach out to
+the asset’s creators.
+13.New Assets
+Question: Are new assets introduced in the paper well documented and is the documentation
+provided alongside the assets?
+Answer: [Yes]
+Justification: We provide a detailed readme file along with the code in the supplementary
+material, which shows details about training, license, etc.
+Guidelines:
+• The answer NA means that the paper does not release new assets.
+•Researchers should communicate the details of the dataset/code/model as part of their
+submissions via structured templates. This includes details about training, license,
+limitations, etc.
+•The paper should discuss whether and how consent was obtained from people whose
+asset is used.
+•At submission time, remember to anonymize your assets (if applicable). You can either
+create an anonymized URL or include an anonymized zip file.
+14.Crowdsourcing and Research with Human Subjects
+Question: For crowdsourcing experiments and research with human subjects, does the paper
+include the full text of instructions given to participants and screenshots, if applicable, as
+well as details about compensation (if any)?
+Answer: [NA]
+Justification: Our work does not involve crowdsourcing nor research with human subjects
+Guidelines:
+•The answer NA means that the paper does not involve crowdsourcing nor research with
+human subjects.
+•Including this information in the supplemental material is fine, but if the main contribu-
+tion of the paper involves human subjects, then as much detail as possible should be
+included in the main paper.
+•According to the NeurIPS Code of Ethics, workers involved in data collection, curation,
+or other labor should be paid at least the minimum wage in the country of the data
+collector.
+15.Institutional Review Board (IRB) Approvals or Equivalent for Research with Human
+Subjects
+Question: Does the paper describe potential risks incurred by study participants, whether
+such risks were disclosed to the subjects, and whether Institutional Review Board (IRB)
+approvals (or an equivalent approval/review based on the requirements of your country or
+institution) were obtained?
+Answer:[NA]
+Justification: Our work does not involve crowdsourcing nor research with human subjects.
+27Guidelines:
+•The answer NA means that the paper does not involve crowdsourcing nor research with
+human subjects.
+•Depending on the country in which research is conducted, IRB approval (or equivalent)
+may be required for any human subjects research. If you obtained IRB approval, you
+should clearly state this in the paper.
+•We recognize that the procedures for this may vary significantly between institutions
+and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the
+guidelines for their institution.
+•For initial submissions, do not include any information that would break anonymity (if
+applicable), such as the institution conducting the review.
+28

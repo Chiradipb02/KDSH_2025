@@ -1,0 +1,1261 @@
+High-Dimensional Distributed Sparse Classification with Scalable
+Communication-Efficient Global Updates
+Fred Lu
+Booz Allen Hamilton
+McLean, USA
+University of Maryland, Baltimore
+County
+Baltimore, USA
+lu_fred@bah.comRyan R. Curtin
+Booz Allen Hamilton
+McLean, USA
+curtin_ryan@bah.comEdward Raff
+Booz Allen Hamilton
+McLean, USA
+University of Maryland, Baltimore
+County
+Baltimore, USA
+raff_edward@bah.com
+Francis Ferraro
+University of Maryland, Baltimore
+County
+Baltimore, USA
+ferraro@umbc.eduJames Holt
+Laboratory for Physical Sciences
+College Park, USA
+holt@lps.umd.edu
+Abstract
+As the size of datasets used in statistical learning continues to grow,
+distributed training of models has attracted increasing attention.
+These methods partition the data and exploit parallelism to reduce
+memory and runtime, but suffer increasingly from communication
+costs as the data size or the number of iterations grows. Recent
+work on linear models has shown that a surrogate likelihood can
+be optimized locally to iteratively improve on an initial solution in
+a communication-efficient manner. However, existing versions of
+these methods experience multiple shortcomings as the data size
+becomes massive, including diverging updates and efficiently han-
+dling sparsity. In this work we develop solutions to these problems
+which enable us to learn a communication-efficient distributed lo-
+gistic regression model even beyond millions of features. In our
+experiments we demonstrate a large improvement in accuracy over
+distributed algorithms with only a few distributed update steps
+needed, and similar or faster runtimes. Our code is available at
+https://github.com/FutureComputing4AI/ProxCSL.
+CCS Concepts
+•Computing methodologies →Distributed algorithms; Learn-
+ing linear models; •Mathematics of computing →Multivariate
+statistics .
+Keywords
+distributed algorithms; communication-efficient surrogate likeli-
+hood; sparse models
+ACM Reference Format:
+Fred Lu, Ryan R. Curtin, Edward Raff, Francis Ferraro, and James Holt.
+2024. High-Dimensional Distributed Sparse Classification with Scalable
+Publication rights licensed to ACM. ACM acknowledges that this contribution was
+authored or co-authored by an employee, contractor or affiliate of the United States
+government. As such, the Government retains a nonexclusive, royalty-free right to
+publish or reproduce this article, or to allow others to do so, for Government purposes
+only. Request permissions from owner/author(s).
+KDD ’24, August 25–29, 2024, Barcelona, Spain
+©2024 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 979-8-4007-0490-1/24/08
+https://doi.org/10.1145/3637528.3672038Communication-Efficient Global Updates. In Proceedings of the 30th ACM
+SIGKDD Conference on Knowledge Discovery and Data Mining (KDD ’24),
+August 25–29, 2024, Barcelona, Spain. ACM, New York, NY, USA, 11 pages.
+https://doi.org/10.1145/3637528.3672038
+1 Introduction
+Over the past decade, the size of datasets used in statistical and
+machine learning has increased dramatically. When the number
+of samples and covariates in a dataset becomes sufficiently large,
+even the training of linear models over the entire dataset becomes
+computationally challenging. This has sparked a flurry of interest
+in distributed training and inference methods. By splitting the data
+over multiple machines, local training processes can be run in
+parallel to save memory and runtime. Multiple works have studied
+the distributed training of logistic regression models [ 12,21,47],
+partitioning the dataset along samples or features and iteratively
+communicating gradients or gradient surrogates.
+However, when many iterations are needed for convergence,
+the communication cost of iterative distributed algorithms start
+to dominate. For example, when the number of features 𝑑of the
+dataset is massive, second-order optimization methods which need
+to communicateO(𝑑2)information become impractical. Yet first-
+order methods, while communicating only O(𝑑)information at a
+time, have slower convergence guarantees so may be even more
+inefficient due to the extra rounds of communication needed.
+To alleviate this bottleneck, recent works have proposed methods
+to train distributed linear models with relatively little communica-
+tion. Such methods are first initialized with a distributed one-shot
+estimator across a dataset which is partitioned across multiple
+nodes. To do this, the linear model objective is solved locally on
+each machine, and the results are transmitted to a central processor
+which merges the local solutions [5].
+From this initial estimate, such methods then obtain gradient
+information from all the partitions. The local machine can then
+solve a modified objective which takes into account the global gra-
+dient. This process can be iterated leading to convergence to the
+full data solution. Such an approach can be interpreted as an update
+step which only communicates first-order, but uses local second-
+ 
+2037
+KDD ’24, August 25–29, 2024, Barcelona, Spain Fred Lu, Ryan R. Curtin, Edward Raff, Francis Ferraro, & James Holt
+(or higher-) order information to achieve better convergence rates.
+Many recent papers have studied variants of this underlying ap-
+proach, including [ 8,15,38,41]. These all share the underlying
+update objective, referred to as the communication-efficient surro-
+gate likelihood (CSL).
+Theory has been progressively developed for these methods
+showing a favorable rate of convergence under certain conditions.
+These can include, for example, nearness of the local estimated
+gradient to the global gradient, and sufficient strong convexity of
+the Hessian. In practice, as the number of features or partitions
+of the dataset grows, these conditions often fail to hold, leading
+to diverging solutions. For high-dimensional data, having sparse
+and interpretable model weights is also of interest. Yet introducing
+sparsity further complicates the problem, as few standard solvers
+can solve the CSL objective with 𝐿1regularization in an efficient
+manner. These are important limitations for the practical use of
+such methods for training large-scale academic or industry mod-
+els. In these real-world scenarios, the data dimensionality can be
+exceedingly large, while also being sparse, leading to high cor-
+relations among features and poor conditioning of the objective.
+Existing experimental results from these prior works have not as-
+sessed their methods on data of this size, as they have only tested
+on moderately-sized data with low dimensionality 𝑑relative to the
+partition sample size 𝑛.
+In our work, we first show that a standard implementation of
+CSL methods fails to effectively learn sparse logistic regression
+models on these high-dimensional datasets. We next develop an
+effective solver for the 𝐿1-regularized CSL objective which scales
+efficiently beyond millions of features, and prove that it converges
+to the correct solution. Experimentally this approach attains higher
+accuracies than other methods when the solution is highly sparse.
+However, at low regularizations when the solution is only moder-
+ately sparse, the solution to the CSL objective often diverges sharply,
+leading to poor update performance. To address this, we develop an
+adaptive damping method to stabilize the CSL objective for high-
+dimensional solutions. Using this technique, we demonstrate across
+multiple single-node and multi-node distributed experiments that
+our method successfully performs communication-efficient updates
+to improve accuracy across a wide range of sparsity settings.
+2 Background and Related Work
+2.1 Sparse logistic regression
+We assume a dataset D=(X,Y)whereX={𝑥1,...,𝑥𝑁}consists
+of𝑁samples in𝑑dimensions (that is, each 𝑥𝑖∈R𝑑). The samples
+are labeled byY={𝑦1,...,𝑦𝑁}, where each 𝑦𝑖∈{0,1}.
+The standard approach to obtaining a sparse logistic regression
+solution is to use L1 regularization (also known as the LASSO
+penalty) [13]. The objective of this problem is
+𝑤∗Barg min
+𝑤∈R𝑑1
+𝑁𝑁∑︁
+𝑖=1ℓ(𝑦𝑖,𝑥⊤
+𝑖𝑤)+𝜆∥𝑤∥1, (1)
+whereℓ(𝑦,𝑧)=log(1+𝑒𝑧)−𝑦𝑧. By setting 𝜆appropriately, the
+solution ˆ𝑤can show good performance while having few nonzeros
+compared to the dimensionality of the data: ∥𝑤∥0≪𝑑.
+While many algorithms exist to solve the problem [ 3,11,20],
+iterated proximal Newton steps using coordinate descent to solve aquadratic approximation of the objective are known to be especially
+efficient, seeing wide use in popular machine and statistical learning
+software [ 9,10]. In particular, the newGLMNET algorithm in the
+LIBLINEAR library is perhaps the most commonly used solver [ 43].
+2.2 Distributed estimation
+As datasets grow in size, the memory and computational limit of a
+single machine leads practitioners to seek distributed methods. One
+approach uses exact iterative methods starting from scratch, which
+are usually based on adding parallelism to standard single-core
+algorithms. For example, LIBLINEAR-MP is a modified version of
+newGLMNET which uses multiple cores for certain inner linear
+algebra operations [ 48]. Alternatively, stochastic gradient methods
+allow data to be partitioned across machines or to be sampled at
+each iteration, reducing the memory requirement [49].
+For even larger datasets, partitioning data across multiple nodes
+becomes necessary. Distributed methods which handle splitting by
+samples include distributed Newton methods [38, 47] and ADMM
+[3], while splitting over features has been proposed in block coor-
+dinate descent implementations such as [35, 39].
+An important limitation to all these approaches is the communi-
+cation overhead involved in transmitting information (e.g. gradi-
+ents) across nodes. Because of this, when data becomes especially
+large or many iterations are needed for convergence, communica-
+tion costs start to dominate. As the size of data further increases,
+one-shot or few-shot methods become increasingly attractive by
+eliminating most of the communication overhead to obtain an ap-
+proximate solution.
+2.3 One-shot estimation
+Suppose the 𝑁samples ofDare partitioned across 𝑝nodes or
+machines, and let{D1,...,D𝑝}denote the samples on each parti-
+tion, with eachD𝑖=(X𝑖,Y𝑖). For simplicity we assume each node
+has𝑛samples, but this is not required. We define global and local
+objective functions respectively as
+L(𝑤)B1
+𝑁𝑁∑︁
+𝑖=1ℓ(𝑦𝑖,𝑥⊤
+𝑖𝑤)+𝜆∥𝑤∥1 (2)
+and
+L𝑘(𝑤)B1
+𝑛∑︁
+(𝑥𝑖,𝑦𝑖)∈D𝑘ℓ(𝑦𝑖,𝑥⊤
+𝑖𝑤)+𝜆∥𝑤∥1 (3)
+Each machine first locally solves (3) to obtain weight vector ˆ𝑤(𝑘).
+Then the weights are communicated to a central merge node, where
+they need to be efficiently merged. In the naive average, a uniform
+average is taken:
+ˆ𝑤naB1
+𝑝𝑝∑︁
+𝑘=1ˆ𝑤(𝑘). (4)
+While naive averaging is asymptomptically optimal for nearly
+unbiased linear models [ 45], in high-dimensional models higher-
+order loss terms cause increasing approximation error [36]. Other
+merge strategies such as improved weightings or debiasing steps
+have been explored, as in [ 5,19,22,45]. Many of these do not scale
+well to high-dimensional data, as discussed in [14].
+ 
+2038High-Dimensional Distributed Sparse Classification with Scalable Communication-Efficient Global Updates KDD ’24, August 25–29, 2024, Barcelona, Spain
+A more recent work proposed computing the merge weights by
+performing a second-stage empirical risk minimization over a sub-
+sample of the original data [ 14]. LetDsubrepresent the subsampled
+data, which is usually just the local data D1stored on the merge
+node. The local solutions are combined column-wise into a matrix
+ˆ𝑊∈R𝑑×𝑝. Then the merge weighting 𝑣∈R𝑝is estimated as
+ˆ𝑣Barg min
+𝑣∈R𝑝1
+|Dsub|∑︁
+(𝑥𝑖,𝑦𝑖)∈D subℓ(𝑦𝑖,𝑥⊤
+𝑖ˆ𝑊𝑣)+𝜆cv∥𝑣∥2.(5)
+where𝜆cvis chosen using cross-validation. Then the final solution
+isˆ𝑤owaBˆ𝑊ˆ𝑣.
+This method is fast and scalable to the largest datasets, while
+generally improving over prior one-shot estimators [14].
+2.4 Communication-efficient updates
+Non-interactive estimators are approximate and degrade in perfor-
+mance as the local sample size 𝑛decreases, which happens when
+the number of partitions 𝑝grows. As a result, our interest is in
+update procedures which can be iterated to improve the initial
+estimator, ideally approaching the full data solution.
+Similar frameworks for iterative global updates have been pro-
+posed in algorithms, such as DANE [ 38], ILEA [ 15], and EDSL [ 41].
+For simplicity, we will adopt the term communication-efficient sur-
+rogate likelihood (CSL) from [ 15] and refer to works using this
+framework as CSL-type methods.
+Broadly, they propose solving locally the objective
+˜L𝑘(𝑤)BL𝑘(𝑤)+
+∇L( ˆ𝑤)−∇L𝑘(ˆ𝑤)⊤
+𝑤 (6)
+This is motivated as optimizing a Taylor expansion of the local
+objective (3), where the local gradient ∇L𝑘(ˆ𝑤)is replaced with the
+global gradient∇L( ˆ𝑤). The affine term can be viewed as a first-
+order correction for the gradient direction. To give further intuition,
+the higher-order derivatives beyond the Hessian are disregarded if
+we take a quadratic approximation of the local objective
+𝑞L𝑘(𝑤)=∇L𝑘(ˆ𝑤)⊤𝛿+1
+2𝛿⊤𝐻(𝑘)(ˆ𝑤)𝛿 (7)
+where𝛿B𝑤−ˆ𝑤and ignoring constant terms. If so, then optimizing
+CSL simplifies to finding
+arg min
+𝛿∇L( ˆ𝑤)⊤𝛿+1
+2𝛿⊤𝐻(𝑘)(ˆ𝑤)𝛿 (8)
+which is equivalent to a quasi-Newton step using global gradients
+and local Hessian.
+Depending on the method, the local objective can either be up-
+dated only on the main node (CSL) or on all nodes simultaneously
+(DANE). The latter requires another round of communication and
+averaging per iteration. The result of the update ˆ𝑤(1)then becomes
+the starting point for the next update iteration.
+Other strategies for communication-efficient updates have been
+proposed. The ACOWA approach [ 23] also seeks to reduce the
+impact of many processors 𝑝, by performing two rounds of com-
+putation and attempting to adjust the loss/increase information
+sharing in those two rounds over its predecessor OWA [ 14]. Single-
+machine-only algorithms based on lock-free parallelism as a similar
+issue, where the Hogwild algorithm [ 34] would regularly diverge,and a lock-free approach SAUS [ 27,32] attempted to reduce diver-
+gences with careful design. In contrast, our approach is iterative but
+does not need many rounds of iteration in practice and supports
+both distributed and single-machine parallelism.
+2.5 Challenges for scaling CSL-like methods
+Our work aims to solve practical and theoretical concerns when
+applying the CSL framework to update models on massive datasets
+and highly distributed systems. We first identify challenges in the
+existing methods.
+Sparsity. When the dimensionality of the data is enormous,
+model sparsity is a desirable property. For the case of 𝐿1-regularized
+linear models, the local loss term L𝑘(𝑤)includes a𝜆∥𝑤∥1term. To
+efficiently optimize this objective requires techniques specialized
+for handling the non-differentiable 1-norm. While this setting has
+been discussed or studied in [ 8,15,41], none of the prior works
+proposed or specified what solver to use.
+Thus a practitioner must apply an out-of-the-box solver or im-
+plement their own. Due to the size of data involved, first-order or
+dual solvers such as proximal gradient descent or ADMM would
+likely converge slowly. In our experiments we instead use OWL-
+QN, a sparse variant of L-BFGS [ 2], which we believe to be the
+fastest standard solver. Because it uses approximate second-order
+information, it has faster convergence than the alternatives while
+still scaling up to high-dimensional data. We find that this baseline
+implementation is adequate on smaller datasets, where relatively
+few features are impactful, but often fails to converge or return
+sparse solutions on larger data.
+We note that this may not have been an issue for prior work
+because (1) their experiments were limited to lower-dimensional or
+synthetic datasets, and (2) they did not measure the actual sparsity
+of their models at any 𝜆.
+To address this issue, we develop an efficient and scalable solver
+based on iterative proximal quasi-Newton steps, which we detail
+in Section 3. Using this solver, our method proxCSL successfully
+converges to the true objective as well as the right sparsity (Fig. 1).
+Divergence of the CSL objective. As the data size increases, so
+often will the number of distributed partitions to facilitate the use
+of larger computing systems. If 𝑑or𝑝grow faster than 𝑁, this often
+results in a local sample size 𝑛which is comparable to 𝑑or smaller.
+This causes the curvature of the local objective L𝑘to decrease. In
+particular the local Hessian may become poorly conditioned or
+not positive definite at all. Furthermore, the affine term of the CSL
+objective grows with ∥∇L( ˆ𝑤)−∇L𝑘(ˆ𝑤)∥, which may also increase
+when𝑁and𝑛diverge. In fact, much of the existing convergence
+theory relies on upper bounds of the above term.
+Under such conditions, the optimum of the CSL objective ˆ𝑤(1)
+may be enormous, leading to a diverging update
+∥ˆ𝑤(1)−𝑤∗∥≫∥ ˆ𝑤−𝑤∗∥ (9)
+To lessen this effect, we apply damping to the local second-order
+information, which increases convexity and improves conditioning.
+This is equivalent to adding an additional proximal regularization
+term𝛼
+2∥𝑤−ˆ𝑤∥2
+2. We note that this term has also been proposed
+in [8,38]. However, using our solver, we are able to propose an
+adaptive criterion for increasing 𝛼when divergence occurs. Thus
+ 
+2039KDD ’24, August 25–29, 2024, Barcelona, Spain Fred Lu, Ryan R. Curtin, Edward Raff, Francis Ferraro, & James Holt
+0 5 1000.20.4
+IterationsObje
+ctive error (%)sCSL
+pr
+oxCSL
+0 5 10200400600
+IterationsNumb
+erofnon-zer osFull
+data
+sCSL
+pr
+oxCSL
+(
+a)amazon7, 128partitions,𝜆=0.001.
+0 5 10012
+IterationsObje
+ctiveerror(%)
+0 5 1002,0004,000
+IterationsNumb
+erofnon-zer os
+(
+b)ember-100k, 128partitions,𝜆=0.0001.
+Figur e1:Iterate dCSL updates using astandar dsolver(sSCL) and
+ourmetho d(proxCSL) quickly conv erge totheoptimal objective
+value (asdefine dbyfitting onthefulldata) when thesolution
+issparse .However,sCSL often fails toreach thecorrectlevelof
+sparsity ofafulldata fit.Meanwhile ,ourspecialize dsolverusedin
+proxCSL attains theoptimal sparsity .
+2426280100200300
+PartitionsCSL
+Divergencepr
+oxCSL,𝛼=0
+𝛼=0.001
+10210310410502,0004,000
+Numb
+erofnon-zer osCSL
+Divergence
+Figur e2:Divergence betweenCSL andtrue objectivevalues after
+oneproxCSL update step,asafunction ofnumb erofpartitions
+(left) andinterme diate solution sparsity (right). Thedivergence in-
+creases with decreasing sample sizeandincreasing dimensionality ,
+asexpected.Setting theproximal parameter𝛼>0fixes theissue .
+𝛼isusedand adjuste donly when necessar y.Incontrast, prior
+metho dsneedtotune𝛼foreach optimization, anexpensiv etask
+forlarge datasets. Altogether thefullobjectiveforfinding ˆ𝑤(𝑡+1)is
+˜L(𝑡)(𝑤)BL𝑘(𝑤)+
+∇L( ˆ𝑤(𝑡))−∇L𝑘(ˆ𝑤(𝑡))⊤
+𝑤+𝛼
+2∥𝑤−ˆ𝑤(𝑡)∥2
+2
+(10)
+Refer toFig2fordemonstrativ eexamples oftheCSL objective
+diverging andtheeffectof𝛼infixing it.
+Baselines. Fortheremainder ofourworkwerefertotwomain
+CSL-typ ebaselines fordistribute dupdates: sCSL andsDANE. These
+aresparse modifications ofCSL andDANE with proximal regular-
+ization (Eq.10)which weimplemente dinOWL-QN. These metho ds
+werepresente dandname dCEASE inrecent work[8],butweusetheabovenames tomoreclearly differ entiatethem andrelate them
+totheir predecessors.
+While other global update metho dshavebeenrecently proposed
+such asDiSCO [46]andGIAN T[42],which solveappr oximate
+Newton problems with conjugate gradient, theydonotproduce
+sparse modelssowedonotcompar eagainst them.
+3Aproximal solverforsparse CSL
+Inthissection wewilldescrib eouralgorithm proxCSL, which solves
+thefullCSL objective(10)using iterativ eproximal Newton steps.
+proxCSL conv erges totheglobal objectiveandtrue sparsity and
+automatically strengthens regularization when theCSL objective
+diverges. Ouralgorithms aresummarize dinAlgo .1andAlgo .2.
+Proximal Newton. Proximal Newton algorithms combine second-
+orderupdates with aproximal operator tohandle the𝐿1penalty .For
+comp osite objectivesoftheform min𝑤𝑓(𝑤)B𝑔(𝑤)+∥𝑤∥1wher e
+𝑔isconv exandsmooth,thealgorithm approximates𝑔(𝑤)with a
+quadratic model𝑞𝑔(𝑤)anditerativ elyminimizes𝑞𝑔(𝑤)+∥𝑤∥1.
+This minimization isassociate dwith aproximal operator, namely
+prox𝐻(𝑤)=argmin𝑧1
+2∥𝑤−𝑧∥2
+𝐻+
+∥𝑤∥1,andhasaclose dform
+solution. Forexample ,if𝑞𝑔could besolvedwith aquasi-Ne wton
+step thisgivestheresult
+𝑤(𝑡+1)=prox𝐻
+𝑤(𝑡)−𝐻−1∇𝑔(𝑤(𝑡))
+. (11)
+Because oflarge𝑑,explicitly computing 𝐻,letalone inverting
+it,istoocostly .Instead wesolvetheproximal minimization using
+coordinate descent, optimizing overoneelement of𝑤atatime.This
+strategy hasbeenshowntobehighly efficient forlarge problems in
+[10,43]andisusedinLIBLINEAR [9].See[20]fordetaile dcoverage
+andtheoryonproximal Newton algorithms.
+Forclarity ,each step oftheresulting algorithm first forms a
+quadratic approximation𝑞𝑔which werefertoasanouter step. This
+specificapproximation isthen solvedusing inner steps ofcoordinate
+descent, with each inner step involving asingle pass overallthe
+featur es.These steps areiterate duntil conv ergence oruntil an
+iteration limit isreache d.Follo wing thetechniques usedin[43],
+ourimplementation avoids everexplicitly forming𝐻andachie ves
+aninner step comple xityofO(𝑛𝑑).
+Outer andinner steps. Intheconte xtofCSL, theaboveproce-
+duresolvesasingle update𝑡ofCSL, which itself canbeiterate d.
+Starting with initial estimate ˆ𝑤(𝑡),each outer step𝑠then forms the
+CSL quadratic approximation
+𝑞˜L(𝑤)=
+∇L𝑘(ˆ𝑤(𝑡,𝑠))+∇L(ˆ𝑤(𝑡))−∇L𝑘(ˆ𝑤(𝑡))⊤
+𝛿
++1
+2𝛿⊤𝐻(𝑘)(ˆ𝑤(𝑡))𝛿+𝛼
+2∥𝑤−ˆ𝑤(𝑡)∥2
+2(12)
+with𝛿B𝑤−ˆ𝑤(𝑡
+,𝑠).
+This minimization isover𝑑featur es.Theinner step then com-
+mences byminimizing 𝑞˜Loveronefeatur eatatime.This isaone-
+variable quadratic minimization soiscompute dexactly .Because𝐿1
+penalty isseparable ,theproximal step isapplie dsimultane ously to
+each variable update viathefollowing rule[43].
+Lemma 1.Givenquadratic lossLandcurrentiterate𝑤𝑗−1which
+hasbeenupdatedtothe(𝑗−1)-thcoordinate ,supposethe𝑗-thpartial
+first andsecond derivativ esare𝐺𝑗and𝐻𝑗𝑗respectively.Then the
+ 
+2040High-Dimensional Distributed Sparse Classification with Scalable Communication-Efficient Global Updates KDD ’24, August 25–29, 2024, Barcelona, Spain
+Algorithm 1 proxCSL updates
+1:Input: Partitioned data {D𝑖}𝑝
+𝑖=1, regularization 𝜆,𝑝processors,
+𝑘update iterations
+2:// Initial distributed estimator (e.g. OWA).
+3:for𝑖∈[𝑝]in parallel do
+4: Solve Eq. (3) onD𝑖to get ˆ𝑤𝑖using local optimizer
+5:collect𝑊←[ ˆ𝑤1,..., ˆ𝑤𝑝]on main node
+6:solve Eq. (4) or (5) on main node to get ˆ𝑤
+7:// proxCSL steps starting from ˆ𝑤.
+8:initialize ˆ𝑤(0)←ˆ𝑤
+9:for𝑡∈[𝑘]do
+10: for𝑖∈[𝑝]in parallel do
+11: compute∇L𝑖(ˆ𝑤(𝑡−1))// local gradient
+12: collect∇L( ˆ𝑤(𝑡−1))← 1/𝑝(Í
+𝑖∈[𝑝]∇L𝑖(ˆ𝑤(𝑡−1)))on main
+node
+13: obtain ˆ𝑤(𝑡)using Algorithm 2
+14:return ˆ𝑤(𝑘)
+problem
+min𝑧𝐺𝑗𝑧+1
+2𝐻𝑗𝑗𝑧2+|𝑤𝑗−1
+𝑗+𝑧|
+has solution
+𝑧= 
+−𝐺𝑗+1
+𝐻𝑗𝑗if𝐺𝑗+1≤𝐻𝑗𝑗𝑤𝑗−1
+𝑗
+−𝐺𝑗−1
+𝐻𝑗𝑗if𝐺𝑗−1≥𝐻𝑗𝑗𝑤𝑗−1
+𝑗
+−𝑤𝑗−1
+𝑗otherwise
+We point out that the CSL gradient and Hessian are computed
+once at the start of each outer step. However, after each coordi-
+nate is updated, the local gradient for the next coordinate is af-
+fected by the previous update via a cross-term with the Hessian:
+𝐺𝑗=∇𝑗L(ˆ𝑤(𝑡))+(𝐻(𝑘)(ˆ𝑤(𝑡))𝛿(𝑐𝑢𝑟))𝑗where𝛿(𝑐𝑢𝑟)is the current
+accumulated change to ˆ𝑤(𝑡,𝑠). This can be seen by expanding (12).
+In our experiments we set 𝑆=10and𝑀=50max outer and
+inner steps, respectively (see Algo. 2).
+Hessian caching . As the only vector that needs to be updated
+during inner steps is 𝐻(𝑘)(𝑤)𝛿, we note that this can be done
+without forming the Hessian. The Hessian for logistic regression
+is𝐻(𝑤)=1
+𝑛𝑋⊤𝐷(𝑤)𝑋where𝐷(𝑤)is diagonal with entries 𝑑𝑖𝑖=
+𝜋𝑖(1−𝜋𝑖),𝜋𝑖being the predicted probability of sample 𝑥𝑖. The main
+node stores 𝐷as a length-𝑛vector.
+Then the Hessian is implicitly updated by simply updating the
+vector𝑋𝛿∈R𝑛after each coordinate step. Each coordinate step 𝑗
+adds𝑧to entry𝑗of𝛿; therefore, we add the 𝑗-th column of 𝐻(𝑘)
+times𝑧to the𝑋𝛿vector.
+The diagonal of the Hessian is also cached as a length- 𝑑vector
+for efficiency.
+Linesearch. Each iteration of coordinate descent executes a pass
+over all𝑑features, updating the candidate update vector 𝛿in place.
+We run𝑀=50iterations, unless convergence is reached earlier.
+This is followed by a linesearch [ 20]. We replace the linesearch
+over the local objective with the full CSL objective (10) which in-
+cludes the step-size regularization. This helps prevent the diverging
+updates when using the unregularized CSL objective (6). We scaleAlgorithm 2 Solving a single CSL update on main node
+1:Input: Local partition D1, regularization 𝜆,∇L( ˆ𝑤(𝑡))(global),
+∇L𝑘(ˆ𝑤(𝑡))(local), max outer steps 𝑆, max inner steps 𝑀
+2:for𝑠∈[𝑆]// or until convergence do
+3: compute local gradient ∇L𝑘(ˆ𝑤(𝑡,𝑠))
+4: compute (implicitly) 𝐻(𝑘)(ˆ𝑤(𝑡,𝑠))
+5:𝛼←0.0001
+6: while divergence check fails do
+7:𝛼←10𝛼
+8:𝛿←0
+9: for𝑚∈[𝑀]// or until convergence do
+10: for𝑗∈[𝑑]// one coordinate descent pass do
+11: update𝛿𝑗with Eq. (12) and Lemma 1
+12: scale𝛿with linesearch with 𝛼
+13:return ˆ𝑤(𝑡)+𝛿
+𝛿by{1,𝛽,𝛽2,...,𝛽𝑘𝑚𝑎𝑥}. For each𝛽𝑘𝛿, we evaluate the objective
+at point ˆ𝑤+𝛽𝑘𝛿, and we select 𝑘and corresponding update vector
+which gives the lowest loss. We fix 𝛽=0.5and𝑘𝑚𝑎𝑥=20.
+Adaptive tuning of 𝛼.Divergence of the CSL objective can
+be detected by sharp decrease (e.g. 20%) in the CSL objective (10)
+but little change or even increase in the local objective (3). This is
+due to the affine term dominating the objective. For our method
+we start𝛼=0.0001 and proceed. If after 5 iterations of coordinate
+descent the above conditions are met, we scale 𝛼by 10 and restart.
+This helps identify the minimal 𝛼at a relatively minor runtime cost.
+Because𝛼affects the objective itself, this check is only performed
+during the first outer step.
+4 Theoretical Results
+In order to establish the global convergence of proxCSL, we first
+start by establishing properties of the initial solution ˆ𝑤owa.
+Theorem 1 (Thm. 4, [ 14]).Given a dataset{X,Y}, parameters
+𝜆and𝑝, the OWA (Optimal Weighted Average) technique of Izbicki
+and Shelton [14] produces a solution ˆ𝑤owasuch that
+∥ˆ𝑤owa−𝑤∗∥2≤O √︄
+𝛼hi
+𝛼lo·𝑑𝑡
+𝑁!
+(13)
+with probability 1−𝑒−𝑡for some𝑡>0, where𝑤∗is the population
+risk minimizer.
+Here,𝛼hiand𝛼loare the maximum and minimum eigenvalues
+of the Hessian of the loss at 𝑤∗.
+Thus, once we have the initial solution ˆ𝑤owa, we know that it is
+in the neighborhood of the true solution 𝑤∗with high probability.
+Once we have ˆ𝑤owa, the next step of proxCSL is to find the proximal
+surrogate loss minimizer ˜𝑤of Eq. 10.
+In our setting, we choose to use newGLMNET [43], although
+other optimization algorithms could also suffice so long as they are
+guaranteed to converge to the exact solution of Eq. 10.
+We already know that newGLMNET converges to the exact solu-
+tion of the logistic regression objective function (Eq. 1, Appendix
+A [43]). Using similar reasoning, we can establish that newGLM-
+NET also converges for the proximal surrogate loss minimizer. Let
+ 
+2041KDD ’24, August 25–29, 2024, Barcelona, Spain Fred Lu, Ryan R. Curtin, Edward Raff, Francis Ferraro, & James Holt
+˜L(𝑡)(𝑤)be the proximal surrogate loss at iteration 𝑡(Eq. 10), with
+minimizer ˜𝑤.
+Theorem 2. The newGLMNET optimizer, on the proximal surro-
+gate loss ˜L(𝑡)(𝑤)instead of the regular logistic loss (Eqn. 1), produces
+an exact solution ˜𝑤.
+Proof. newGLMNET is an optimizer that fits in the framework
+of Tseng and Yun [40], and as with the regular logistic regression
+convergence proof for newGLMNET (Appendix A, [ 43]), it suffices
+to ensure the conditions required by the framework are satisfied.
+Firstly, convergence requires that the Hessian (or its estimate)
+𝐻𝑘is positive definite. When used to solve the (standard) logistic
+regression objective, newGLMNET uses𝐻𝑘=∇2L(𝑤)+𝜈Ifor some
+small𝜈, and the positive-definiteness of 𝐻𝑘is known. However, in
+our case, the addition of 𝜈Iis not necessary. As we are optimizing
+the proximal surrogate loss (Eq. 10), we instead take
+𝐻𝑘=∇2˜L(𝑡)(𝑤) (14)
+=∇2L1(𝑤)−∇2(𝑤𝑇(∇L 1(𝑤(𝑡−1))−∇L(𝑤(𝑡−1))))+
+∇2𝛼
+2∥𝑤−𝑤(𝑡−1)∥2
+2
+(15)
+=∇2L1(𝑤)+𝛼I (16)
+which is positive definite as long as 𝛼>0.
+Secondly, the descent direction subproblem when using the prox-
+imal surrogate loss must be exactly solved:
+𝑞𝑘(𝛿)B∇˜L(𝑡)(𝑤𝑘)𝑇𝛿+1
+2𝛿𝑇𝐻𝑘𝛿+∥𝑤𝑘+𝛿∥1−∥𝑤𝑘∥1,(17)
+where𝑤𝑘is the solution that the optimizer has found after outer
+step𝑘, and𝐻𝑘is either the Hessian ∇2L(𝑤𝑘)or an approximation
+thereof. Our goal at this step is to find arg min𝛿𝑞𝑘(𝛿). For the
+original formulation, see Eq. (13), [43].
+As specified in the paper [ 43],newGLMNET uses a constant step
+size cyclic coordinate descent to solve Eqn. 17. But, this will give an
+inexact solution, as noted by Friedman et al . [10] . This issue can be
+resolved either by pairing the coordinate descent with a line search,
+or by replacing the stopping condition for the inner coordinate
+descent solver with the adaptive condition proposed by Lee et al .
+[20] (Eq. (2.23), adapted here to our notation):
+∥∇˜L(𝑡)(𝑤𝑘)𝑇+(𝐻𝑘+(𝐻𝑘)𝑇)𝛿𝑗∥≤𝜂𝑗∥∇˜L(𝑡)(𝑤𝑘)𝑇∥ (18)
+where𝑗is the iteration number of the inner coordinate descent
+solver.
+When using that adaptive stopping condition, so long as the
+step size𝜂is under some threshold, using Theorem 3.1 of Lee et al .
+[20] and the fact that the proximal surrogate loss is smooth, we
+obtain that the inner coordinate descent will converge to the exact
+minimizer of the quadratic approximation 𝑞𝑘(𝛿). In addition, the
+rate of convergence can be shown to be q-linear or q-superlinear if
+𝜂decays to 0 [20].
+The final condition for overall convergence is that the outer line
+search terminates in a finite number of iterations; for this, it is
+sufficient to show that
+∥∇˜L(𝑡)(𝑤1)−∇ ˜L(𝑡)(𝑤2)∥≤Λ∥𝑤1−𝑤2∥ (19)for all𝑤1,𝑤2∈R𝑑. As with the regular logistic regression objective,
+we may also observe that ˜L(𝑡)(𝑤)is twice differentiable, and thus
+∥∇˜L(𝑡)(𝑤1)−∇ ˜L(𝑡)(𝑤2)∥≤∥∇2˜L(𝑡)(𝑤3)∥∥𝑤1−𝑤2∥,(20)
+where𝑤3is anywhere between 𝑤1and𝑤2. Next, note that
+∇2˜L(𝑡)(𝑤3)=∇2L1(𝑤3)+𝛼I (21)
+which is bounded using the reasoning of Yuan et al. [43]:
+∥∇2L1(𝑤3)+𝛼I∥≤∥X𝑇
+1∥∥X 1∥+𝛼2. (22)
+Therefore, taking Λ=∥X𝑇
+1∥∥X 1∥+𝛼2, newGLMNET with the
+adaptive stopping condition for the inner coordinate descent solver
+converges to the exact minimizer of the surrogate loss ˜L(𝑡)(𝑤).□
+Consider now the error of the overall proxCSL algorithm: ∥˜𝑤−
+𝑤∗∥2. Recall that our interest is in the high-dimensional sparse
+regime where 𝑑may be (much) greater than 𝑛, and we also expect
+the solution 𝑤∗to be (potentially highly) sparse. Considering logis-
+tic regression,∇2˜L(𝑡)=X𝑇𝐷Xfor some diagonal matrix 𝐷, and if
+𝑑>𝑛,∇2˜L(𝑡)is not positive definite. This means that strong con-
+vexity is not satisfied, and typical large-sample analysis techniques,
+such as those used for CEASE [8] cannot be used.
+However, although ˜L(𝑡)(·)is not strongly convex, it can be
+strongly convex along certain dimensions andin a certain region.
+Therefore, following Negahban et al . [26] (and [ 15]), we impose
+some common assumptions for analysis of sparse algorithms.
+Definition 1 (Restricted strong convexity [ 15,26]).The
+single-partition loss L1satisfies the restricted strong convexity con-
+dition with parameter 𝜇if
+L1(𝑤∗+𝛿)−L 1(𝑤∗)−𝛿𝑇(∇L 1(𝑤∗))≥𝜇∥𝛿∥2
+2(23)
+where𝑆=supp(𝑤∗),𝛿∈𝐶(𝑆)B{𝑣:∥𝑣𝑆∥1≤3∥𝑣𝑆𝐶∥1}, and
+𝜇>0.
+Here,𝑆represents the set of dimensions that have nonzero values
+in the optimal solution 𝑤∗. Intuitively, under this condition, L1
+is strongly convex in the cone 𝐶(𝑆)centered at 𝑤∗, where𝐶(𝑆)
+contains any vector 𝛿so long as𝛿’s components are concentrated
+enough in directions orthogonal to 𝑤∗.
+Definition 2 (Restricted Lipschitz Hessian). A function𝑓(𝑥)
+hasrestricted Lipschitz Hessian at radius𝑅if for all𝛿∈𝐶(𝑆)such
+that∥𝛿∥2<𝑅,
+∥(∇2𝑓(𝑥+𝛿)−∇2𝑓(𝑥))𝛿∥∞≤𝑀∥𝛿∥2
+2. (24)
+For our analysis, we assume that (1) the data (X,Y)has random
+design (i.i.d. sub-Gaussian), (2) elements of Xare bounded, (3)L1is
+restricted strongly convex, (4) L1has restricted Lipschitz Hessian,
+and (5) ˜L(𝑡)has restricted Lipschitz Hessian.
+Theorem 3. Under the assumptions above, given 𝑠B|supp(𝑤∗)|,
+if
+𝜆≥2∥∇L(𝑤∗)∥∞+2∥∇2L(𝑤∗)−∇2L1(𝑤∗)∥∞∥𝑤(𝑡−1)−𝑤∗∥1
++(4𝑀+𝛼)∥𝑤(𝑡−1)−𝑤∗∥2
+2(25)
+then it follows that
+∥˜𝑤−𝑤∗∥2≤3√𝑠𝜆√︁
+𝑢+𝛼/2. (26)
+ 
+2042High-Dimensional Distributed Sparse Classification with Scalable Communication-Efficient Global Updates KDD ’24, August 25–29, 2024, Barcelona, Spain
+Proof. A similar result is derived as Theorem 3.5 in Jordan et al .
+[15] by using Corollary 1 of Negahban et al . [26] ; however, in our
+situation, we must also consider the proximal penalty (𝛼/2)∥𝑤−
+𝑤(𝑡−1)∥2
+2.
+Corollary 1 of Negahban et al . [26] requires that ˜L(𝑡)(𝑤)be
+restricted strongly convex. Because L1(𝑤)is restricted strongly
+convex, the restricted strong convexity of L(𝑤)is established by the
+proof of Theorem 3.5 in Jordan et al . [15] . By moving the proximal
+penalty terms (and proximal penalty gradient term) to the right
+hand side, we obtain
+˜L(𝑡)(𝑤+𝛿)− ˜L(𝑡)(𝑤)−𝛿𝑇(∇˜L(𝑡)(𝑤))≥𝜇∥𝛿∥2
+2−
+𝛼
+2∥𝑤+𝛿−𝑤(𝑡−1)∥2
+2−𝛼
+2∥𝑤−𝑤(𝑡−1)∥2
+2−𝛼𝛿𝑇(𝑤−𝑤(𝑡−1))
+(27)
+and it can be easily shown via distributivity that
+𝛼
+2∥𝑤+𝛿−𝑤(𝑡−1)∥2
+2−𝛼
+2∥𝑤−𝑤(𝑡−1)∥2
+2−𝛼𝛿𝑇(𝑤−𝑤(𝑡−1))=𝛼
+2∥𝛿∥2
+2.
+(28)
+and therefore ˜L(𝑡)(𝑤)is restricted strongly convex with parameter
+𝜇+𝛼/2. We also must show that ˜L(𝑡)(𝑤)has restricted Lipschitz
+Hessian. Jordan et al . [15] show that ˜L(𝑡)(𝑤)−(𝛼/2)∥𝑤−𝑤(𝑡−1)∥2
+2
+(e.g., the proximal surrogate likelihood without the proximal term—
+or, the surrogate likelihood) has restricted Lipschitz Hessian. The
+proximal penalty only adds a constant term to the Hessian:
+∇2((𝛼/2)∥𝑤−𝑤(𝑡−1)∥2
+2=𝛼 (29)
+which does not change the result: ˜L(𝑡)(𝑤)is restricted Lipschitz
+Hessian with parameter 𝑀. From Corollary 1 of Negahban et al .
+[26], it is therefore true that
+∥˜𝑤−𝑤∗∥2≤3√𝑠𝜆√︁
+𝜇+𝛼/2(30)
+so long as𝜆≥2∥∇˜L(𝑡)(𝑤∗)∥∞. Via the triangle inequality,
+∥˜L(𝑡)(𝑤∗)∥∞≤∥L 1(𝑤∗)−𝑤∗⊤(∇L 1(𝑤(𝑡−1))−∇L(𝑤(𝑡−1)))∥∞
++𝛼
+2∥𝑤∗−𝑤(𝑡−1)∥2
+2(31)
+and using the results from Jordan et al . [15] to handle the left-hand
+side yields
+∥∇˜L(𝑡)(𝑤∗)∥∞≤∥∇2L(𝑤∗)−∇2L1(𝑤∗)∥∞∥𝑤∗−𝑤(𝑡−1)∥1
++∥∇L(𝑤∗)∥∞+
+2𝑀+𝛼
+2
+∥𝑤∗−𝑤(𝑡−1)∥2
+2.(32)
+and therefore the statement holds. □
+Now, using the error bound for OWA (Theorem 1) plus the
+theorem above, we can derive a bound for the error of OWAGS.
+Theorem 4. Under the assumptions above, for some constants
+𝑐1,𝑐2, and𝑡that are independent of 𝑛,𝑘,𝑑, and𝑠, with probability
+(1−𝑡)(1−𝑐1exp(−𝑐2𝑛)),
+∥˜𝑤−𝑤∗∥2≤
+O √︂
+𝑠log𝑑
+𝑛!
++O 
+𝑠√︄
+𝑑log𝑑𝑡
+𝑛𝛼ℎ𝑖
+𝛼𝑙𝑜!
++O 
+√𝑠√︄
+𝑑𝑡
+𝑛𝛼ℎ𝑖
+𝛼𝑙𝑜!
+.(33)dataset 𝑛 𝑑 nnz size
+amazon7 1.3M 262k 133M, 0.04% 1.2GB
+url 2.3M 3.2M 277M, 4e−4
+3.9GB
+criteo 45M 1M 1.78B, 4e−3% 25GB
+emb
+er-100k 600k 100k 8.48B, 10.6% 61GB
+ember-1M 600k 1M 38.0B,4.7% 257GB
+Table 1: Datasets with uncompressed libsvm-format sizes.
+Proof. The result is a straightforward combination of Theo-
+rem 3, Theorem 1, and Theorem 3.7 from Jordan et al. [15].
+Under the conditions of Theorem 3, the exact statement of The-
+orem 3.7 of Jordan et al . [15] applies to the proximal surrogate
+˜L(𝑡)(𝑤): the proximal penalty applies only a constant shift to the
+Hessian∇2˜L(𝑡)(𝑤); this does not affect any results from that result.
+Next, from Theorem 1, we know that with probability (1−𝑡),
+∥ˆ𝑤owa−𝑤∗∥2≤O √︄
+𝛼ℎ𝑖
+𝛼𝑙𝑜𝑑𝑡
+𝑛!
+(34)
+and it is trivial to establish a simple bound on the L1-norm:
+∥ˆ𝑤owa−𝑤∗∥1≤√𝑠∥ˆ𝑤owa−𝑤∗∥2 (35)
+≤O √︄
+𝛼ℎ𝑖
+𝛼𝑙𝑜𝑠𝑑𝑡
+𝑛!
+. (36)
+As we are using 𝑤(0)=ˆ𝑤owaand𝑤(1)=˜𝑤, the statement of the
+theorem follows by substituting these terms into the statement of
+Theorem 3.7 of Jordan et al. [15]. □
+Note that the bound does not depend on the number of partitions
+𝑝. Constants, including 𝜇and𝑀, have been omitted for simplicity;
+but, as the problem(X,Y)gets ‘easier’—e.g., more strongly convex—
+the parameter 𝜇increases and 𝑀decreases, the bound tightens and
+the required 𝜆decreases. This is an intuitive result.
+5 Results
+We run experiments to thoroughly assess the performance of prox-
+CSL relative to baselines: sCSL andsDANE, the sparse variants
+of CSL [ 15] and DANE [ 38] respectively with the CEASE modifica-
+tions discussed in [ 8]; and one-shot distributed estimators Naive
+avg. andOWA [14]. For the smaller datasets we also run the serial
+algorithm newGLMNET from LIBLINEAR [ 9] to show how close
+proxCSL can get to the full data solution. We test our method on
+multiple high-dimensional datasets, with details in Table 1.
+The datasets were obtained from the LIBSVM website [4], with
+the exception of ember-100k andember-1M which we built from
+the malware and benign files in the Ember2018 dataset [ 1] using
+the KiloGrams algorithm [ 28,30,31]. This consists of computing
+8-byte n-grams over the files in the dataset, and subsetting to the
+most frequent 100k or 1M n-grams [33, 44].
+For each dataset, we sample a random 80/20 train-test split. We
+split the training data across varying partitions, depending on the
+experiment, and train the methods. We repeat this process across a
+grid of 80 logarithmically-spaced 𝜆values. For each 𝜆, we replicate
+the distributed estimation 5 times and record the average number of
+nonzeros in each solution and average test set accuracy (along with
+ 
+2043KDD ’24, August 25–29, 2024, Barcelona, Spain Fred Lu, Ryan R. Curtin, Edward Raff, Francis Ferraro, & James Holt
+1011021031040.850.90.95
+Numb
+er of non-zerosA
+ccuracyFull
+Data
+Naiv
+e Avg.
+sD
+ANE
+sCSL
+O
+WA
+pr
+oxCSL
+(
+a)amazon7, multi-cor e,128partitions.
+1001011021031040.60.8
+Numb
+erofnon-zer osA
+ccuracyFull
+Data
+Naiv
+e Avg.
+sD
+ANE
+sCSL
+O
+WA
+pr
+oxCSL
+(
+b)ember-100k, multi-cor e,128partitions.
+1011021030.80.850.90.95
+Numb
+erofnon-zer osA
+ccuracyFull
+Data
+Naiv
+e Avg.
+sD
+ANE
+sCSL
+O
+WA
+pr
+oxCSL
+(
+c)url,multi-cor e,128partitions.
+Figur e3:Numb erofnonzer osvs.testsetaccuracy inthesingle-
+nodemulti-cor esetting overagrid ofregularization values. The
+distribute dmetho ds(sDANE, sCSL, proxCSL) areinitialize dwith
+theOWAsolution andupdatedtwice .proxCSL (blue) cleanly outper-
+forms other distribute dmetho dsacrossthedatasets, often matching
+thefulldata solution compute dwith LIBLINEAR (dashe dgrey).
+sCSL performs nearly aswellasproxCSL onamazon7 butnoton
+other datasets. sDANE andsCSL failtoachie vesparse solutions on
+ember-100k evenafter thegrid resolution wasincreased.
+standar ddeviations). This givesagoodcomparison ofthemetho ds
+acrossvarying sparsity levels.
+Weimplemente dallmetho dsinC++ with theArmadillo linear
+algebra librar y[37]andmlpack machine learning librar y[6],with
+OpenMP andMPI todistribute thecomputations. ForsDANE andsCSL wealsousetheOWL-QN implementation oflibLBFGS1We
+study twodistribute dsettings: (1)single-no demulticor e,and(2)
+fully distribute d.The first setting isrelevant inmodern servers
+with high numb ersofcoresavailable .Inourcase,weusedapow-
+erful serverwith 256coresand4TB ofRAM foroursingle-no de
+experiments. The communication costs arelowerinthissetting
+because netw orklatency isavoided,butthefundamental alorithm
+works thesame way.The second setting isevenlarger inscale ,
+when multiple machines areconne cted.Hereweuseacluster with
+16nodes,using upto32coresand1TB ofRAM oneach node.
+While themetho dscanberunformany updates, duetothegoal
+oflimiting communication, wefindthat2-4iterations aresufficient
+toupdate thesolution with diminishing return after (seeFig.1).
+Unless other wise state dweinitialize proxCSL, sCSL, andsDANE
+with theOWAsolution andcompar ethem after 2updates.
+Foradditional hyperparameter andcomputational detail, refer
+toAppendix B.
+5.1 Testaccuracy acrosssparsity levels
+Experimental results forthesingle-no desetting areshownovera
+range of𝜆inFig.3.Acrossarange ofdatasets andsparsities, prox-
+CSL isable toconv erge tothefulldata solution after twoupdates.
+When thisoccurs, proxCSL often significantly outp erforms the
+baselines sCSL andsDANE, aswellastheinitial estimators OWA
+andthenaiveaverage .Onthesmallest dataset (amazon7 )only we
+seethatthesCSL with OWL-QN solverapproaches proxCSL inper-
+formance .Ontheother hand, DANE generally faressignificantly
+worse.Wefindthatduetoaveraging update modelsacrossallparti-
+tions, sparsity isoften lost. Inaddition, theoptimization sometimes
+fails toconv erge ononeormorepartitions.
+Fig.4showssimilar experiments onthefully distribute dsetting,
+which weapply totwoofourlargest datasets (crite oandember-1M ).
+Asbefore,proxCSL consistently achie vesbetter testaccuracy across
+most sparsity levelsthan theother metho ds.
+Ourmetho dcangeneralize toother lossfunctions providedthe
+theoretical assumptions aremet. Forexample ,wecanusetheelastic
+net-r egularize dlogistic regression instead oftheLasso regulariza-
+tion with comparable performance (Appendix C).
+5.2 Runtime comparison
+Inthenextsetofexperiments wealso compar etheruntimes of
+ourmetho dproxCSL with theother metho ds.Foreach metho dwe
+identify thesetting that results inamodelwith roughly 1000 non-
+zerosforcomparability andrecordtheruntime .Note that update
+metho dssDANE, sCSL, andproxCSL alsoinclude theinitialization
+time inthetotal. Ther eforetheir times willgenerally always be
+higher than OWAorNaiv eAvg.,unless theunderlying setting was
+atasignificantly differ entvalue of𝜆.
+Asexpected,ourmetho disquite fastevenonthelargest datasets.
+Runtimes arecomparable with sCSL since OWL-QN isalsoknown
+tobeafastsolver.Yetourmetho dconv erges tobetter accuracy
+solutions givensimilar runtime .Incomparison sDANE isgene rally
+slowerbecause thesecond optimization must bedone oneach
+partition andre-average d,incurring additional communication and
+computational time.Formoredetails andanalysis seeAppendix A.
+1https://github.com/chokkan/liblbfgs
+ 
+2044High-Dimensional Distributed Sparse Classification with Scalable Communication-Efficient Global Updates KDD ’24, August 25–29, 2024, Barcelona, Spain
+1011021031041050.740.760.78
+Numb
+er of non-zerosA
+ccuracy Naiv
+e Avg.
+sD
+ANE
+sCSL
+O
+WA
+pr
+oxCSL
+(
+a)criteo,distribute d,512partitions.1001011021031040.50.60.70.80.9
+Numb
+erofnon-zer osA
+ccuracy Naiv
+e Avg.
+sD
+ANE
+sCSL
+O
+WA
+pr
+oxCSL
+(b)ember-1M, distribute d,512partitions.
+Figur e4:Numb erofnonzer osvs.testsetaccuracy inthedistribute dmulti-no desetting, after twoupdate steps forthedistribute dmetho ds
+(sDANE, sCSL, proxCSL). Onbothdatasets, proxCSL (blue) outperforms theother metho dsacrossallsparsity levels.Due tothemassiv edata
+size,nofulldata solution iscompute d.Oncriteo,OWAdiverges atlowregularizations, soweinitialize thedistribute dmetho dswith Naiv e
+Avg.instead. sDANE andsCSL failtoachie vesparse solutions onember-1M evenafter thegrid resolution wasincreased.
+dataset Naiv
+eAvg. OWA sCSL sDANE proxCSL
+single-no
+deparallel
+amazon7 2.356s 14.933s 17.678s 27.489s 16.756s
+ember-100k 7.811s 13.245s 48.950s 75.120s 70.921s
+url 17.085s 218.092s 98.635 105.161s 91.425s
+dataset Naiv
+eAvg. OWA sCSL sDANE proxCSL
+fully
+distribute d
+ember-1M 6.176s 5.836s 81.634s 68.975s 43.002s
+criteo 2.349s 25.885s 36.069s 65.618s 22.293s
+Table2:Runtime results fordiffer enttechniques. Although proxCSL
+takes longer toconv erge than naiveaveraging andOWA,itprovides
+significantly better performance (seeFig.3).This also generally
+holds when comparing proxCSL against sCSL and sDANE. For
+moredetaile dtiming including comparison ofvarious steps within
+proxCSL refertoAppendix A.
+0 2 4 633.54
+IterDistance
+totrue model
+0 2 4 60.20.40.60.81
+IterSupp
+ortconsensus
+pr
+oxCSL
+sCSL
+sD
+ANE
+Figur e5:Conv ergence ofCSL metho dstothetrue solution ona
+synthetic dataset with knowngenerating model.proxCSL outp er-
+forms thebaselines interms ofmodel𝐿2distance (left) aswellas
+identifying whether agivenweight should benonzer o(right).5.3 Conv ergence toaknownmodel
+Finally wedemonstrate empirically that ourmetho dconv erges
+tothetrue solution onasparse dataset with knowngenerating
+model.Wesimulate data wher eXhasdimension𝑁=100000,
+𝑑=1000, wher eeach featur eismixtur edistribution of𝑈(0,1)and
+0values. The true solution𝑤∗has100nonzer ocoefficients, and
+Yissample dasBernoulli fromexpit(𝑋𝑤∗).Using 64partitions
+thedata isfull-rank oneach partition inordertosatisfy thestrong
+conv exityassumption.
+Inthisdata generation model,theassumptions ofThm 3aresatis-
+fiedsoweexpectconv ergence inthe𝐿2-norm. Wetrain proxCSL as
+wellasbaselines sSCL andsDANE with𝜆settogiveapproximately
+100nonzer os.Conv ergence in𝐿2-norm andsupp ortrecoveryare
+showninFig.5.HereproxCSL conv erges toaknownsolution vector
+faster andmoreaccurately than thebaselines.
+6Conclusion
+Inthisworkwepresent proxCSL which performs global updates
+onadistribute dsparse logistic regression modelinanefficient and
+scalable manner .Todothis, wedevelop aproximal Newton solver
+which solvesaCSL-typ eproblem effectivelyalong with adaptiv e
+proximal regularization. Weassess ourmetho donmuch larger
+andhigher-dimension datasets than prior work,andconclude that
+proxCSL hasmuch better accuracy than prior works acrossawide
+range ofmodelsparsities.
+While wehaveaccelerate dawidely usedform oflogistic re-
+gression, other bespokeorcustomize dversions stillneedimpr ove-
+ment orcould beintegrate dinthefutur e.Coresets may beaviable
+appr oach toimpr oving information sharing without sending all
+data [7,25]andareaslikediffer entially privacy relyheavily on
+logistic regression buthavefarmoreexpensiv eandchallenging op-
+timization problems duetotherequiredrandomness [16–18,24,29].
+ 
+2045KDD ’24, August 25–29, 2024, Barcelona, Spain Fred Lu, Ryan R. Curtin, Edward Raff, Francis Ferraro, & James Holt
+References
+[1]Hyrum S Anderson and Phil Roth. 2018. Ember: an open dataset for training
+static pe malware machine learning models. arXiv preprint arXiv:1804.04637
+(2018).
+[2]Galen Andrew and Jianfeng Gao. 2007. Scalable training of l 1-regularized log-
+linear models. In Proceedings of the 24th international conference on Machine
+learning. 33–40.
+[3]Stephen Boyd, Neal Parikh, Eric Chu, Borja Peleato, Jonathan Eckstein, et al .2011.
+Distributed optimization and statistical learning via the alternating direction
+method of multipliers. Foundations and Trends® in Machine learning 3, 1 (2011),
+1–122.
+[4]Chih-Chung Chang and Chih-Jen Lin. 2011. LIBSVM: a library for support vector
+machines. ACM transactions on intelligent systems and technology (TIST) 2, 3
+(2011), 1–27.
+[5]Xueying Chen and Min-ge Xie. 2014. A split-and-conquer approach for analysis
+of extraordinarily large data. Statistica Sinica (2014), 1655–1684.
+[6]Ryan R Curtin, Marcus Edel, Omar Shrit, Shubham Agrawal, Suryoday Basak,
+James J Balamuta, Ryan Birmingham, Kartik Dutt, Dirk Eddelbuettel, Rishabh
+Garg, et al .2023. mlpack 4: a fast, header-only C++ machine learning library.
+Journal of Open Source Software 8, 82 (2023).
+[7]Ryan R. Curtin, Sungjin Im, Benjamin Moseley, Kirk Pruhs, and Alireza Samadian.
+2020. Unconditional Coreset for Regularized Loss Minimization. In Proceedings of
+the 23rd International Conference on Artifical Intelligence and Statistics (AISTATS
+2020). 482–492.
+[8]Jianqing Fan, Yongyi Guo, and Kaizheng Wang. 2023. Communication-efficient
+accurate statistical estimation. J. Amer. Statist. Assoc. 118, 542 (2023), 1000–1010.
+[9]Rong-En Fan, Kai-Wei Chang, Cho-Jui Hsieh, Xiang-Rui Wang, and Chih-Jen Lin.
+2008. LIBLINEAR: A library for large linear classification. the Journal of machine
+Learning research 9 (2008), 1871–1874.
+[10] Jerome Friedman, Trevor Hastie, and Rob Tibshirani. 2010. Regularization paths
+for generalized linear models via coordinate descent. Journal of statistical software
+33, 1 (2010), 1.
+[11] Tom Goldstein, Christoph Studer, and Richard Baraniuk. 2014. A field guide
+to forward-backward splitting with a FASTA implementation. arXiv preprint
+arXiv:1411.3406 (2014).
+[12] Siddharth Gopal and Yiming Yang. 2013. Distributed training of large-scale
+logistic models. In International Conference on Machine Learning. PMLR, 289–
+297.
+[13] Trevor Hastie, Robert Tibshirani, and Martin Wainwright. 2015. Statistical learn-
+ing with sparsity: the lasso and generalizations. CRC press.
+[14] Mike Izbicki and Christian R Shelton. 2020. Distributed learning of non-convex
+linear models with one round of communication. In Machine Learning and Knowl-
+edge Discovery in Databases: European Conference, ECML PKDD 2019, Würzburg,
+Germany, September 16–20, 2019, Proceedings, Part II. Springer, 197–212.
+[15] Michael I Jordan, Jason D Lee, and Yun Yang. 2018. Communication-efficient
+distributed statistical inference. J. Amer. Statist. Assoc. (2018).
+[16] Amol Khanna, Fred Lu, and Edward Raff. 2023. The Challenge of Differentially
+Private Screening Rules. In Submitted to SIGIR ’23.
+[17] Amol Khanna, Fred Lu, Edward Raff, and Brian Testa. 2023. Differentially Private
+Logistic Regression with Sparse Solutions. In Proceedings of the 16th ACM Work-
+shop on Artificial Intelligence and Security (AISec ’23). Association for Computing
+Machinery, New York, NY, USA, 1–9. https://doi.org/10.1145/3605764.3623910
+[18] Amol Khanna, Edward Raff, and Nathan Inkawhich. 2024. SoK: A Review of
+Differentially Private Linear Models For High-Dimensional Data. In 2024 IEEE
+Conference on Secure and Trustworthy Machine Learning (SaTML). 57–77. https:
+//doi.org/10.1109/SaTML59370.2024.00012
+[19] Jason D Lee, Qiang Liu, Yuekai Sun, and Jonathan E Taylor. 2017. Communication-
+efficient sparse regression. The Journal of Machine Learning Research 18, 1 (2017),
+115–144.
+[20] Jason D Lee, Yuekai Sun, and Michael A Saunders. 2014. Proximal Newton-type
+methods for minimizing composite functions. SIAM Journal on Optimization 24,
+3 (2014), 1420–1443.
+[21] Chieh-Yen Lin, Cheng-Hao Tsai, Ching-Pei Lee, and Chih-Jen Lin. 2014. Large-
+scale logistic regression and linear support vector machines using spark. In 2014
+IEEE International Conference on Big Data (Big Data). IEEE, 519–528.
+[22] Qiang Liu and Alexander T Ihler. 2014. Distributed estimation, information loss
+and exponential families. Advances in neural information processing systems 27
+(2014).
+[23] Fred Lu, Ryan R. Curtin, Edward Raff, Francis Ferraro, and James Holt. 2024. Opti-
+mizing the Optimal Weighted Average: Efficient Distributed Sparse Classification.
+arXiv:2406.01753 [cs.LG]
+[24] Fred Lu, Joseph Munoz, Maya Fuchs, Tyler LeBlond, Elliott Zaresky-Williams,
+Edward Raff, Francis Ferraro, and Brian Testa. 2022. A General Framework
+for Auditing Differentially Private Machine Learning. In Advances in Neural
+Information Processing Systems, Vol. 35. Curran Associates, Inc., 4165–4176.
+[25] Fred Lu, Edward Raff, and James Holt. 2023. In Proceedings of the Thirty-Seventh
+AAAI Conference on Artificial Intelligence. AAAI Press, Article 1005. https://doi.org/10.1609/aaai.v37i7.26074
+[26] Sahand N Negahban, Pradeep Ravikumar, Martin J Wainwright, and Bin Yu.
+2012. A unified framework for high-dimensional analysis of M-estimators with
+decomposable regularizers. (2012).
+[27] Edward Raff. 2017. JSAT: Java Statistical Analysis Tool, a Library for Machine
+Learning. Journal of Machine Learning Research 18, 23 (2017), 1–5. http://jmlr.
+org/papers/v18/16-131.html
+[28] Edward Raff, William Fleming, Richard Zak, Hyrum Anderson, Bill Finlayson,
+Charles K. Nicholas, Mark Mclean, William Fleming, Charles K. Nicholas, Richard
+Zak, and Mark Mclean. 2019. KiloGrams: Very Large N-Grams for Malware
+Classification. In Proceedings of KDD 2019 Workshop on Learning and Mining for
+Cybersecurity (LEMINCS’19). https://arxiv.org/abs/1908.00200
+[29] Edward Raff, Amol Ashish Khanna, and Fred Lu. 2023. Scaling Up Differentially
+Private LASSO Regularized Logistic Regression via Faster Frank-Wolfe Iterations.
+InThirty-seventh Conference on Neural Information Processing Systems. https:
+//openreview.net/forum?id=SuvDnzrKCo
+[30] Edward Raff and Mark McLean. 2018. Hash-Grams On Many-Cores and Skewed
+Distributions. In 2018 IEEE International Conference on Big Data (Big Data). IEEE,
+158–165. https://doi.org/10.1109/BigData.2018.8622043
+[31] Edward Raff and Charles Nicholas. 2018. Hash-Grams: Faster N-Gram Features
+for Classification and Malware Detection. In Proceedings of the ACM Symposium
+on Document Engineering 2018. ACM, Halifax, NS, Canada. https://doi.org/10.
+1145/3209280.3229085
+[32] Edward Raff and Jared Sylvester. 2018. Linear models with many cores and cpus:
+A stochastic atomic update scheme. In 2018 IEEE International Conference on Big
+Data (Big Data). IEEE, 65–73.
+[33] Edward Raff, Richard Zak, Russell Cox, Jared Sylvester, Paul Yacci, Rebecca Ward,
+Anna Tracy, Mark McLean, and Charles Nicholas. 2016. An investigation of byte
+n-gram features for malware classification. Journal of Computer Virology and
+Hacking Techniques (sep 2016). https://doi.org/10.1007/s11416-016-0283-1
+[34] Benjamin Recht, Christopher Re, Stephen Wright, and Feng Niu. 2011. Hogwild!:
+A lock-free approach to parallelizing stochastic gradient descent. Advances in
+neural information processing systems 24 (2011).
+[35] Peter Richtárik and Martin Takáč. 2016. Distributed coordinate descent method
+for learning with big data. The Journal of Machine Learning Research 17, 1 (2016),
+2657–2681.
+[36] Jonathan D Rosenblatt and Boaz Nadler. 2016. On the optimality of averaging in
+distributed statistical learning. Information and Inference: A Journal of the IMA 5,
+4 (2016), 379–404.
+[37] Conrad Sanderson and Ryan Curtin. 2016. Armadillo: a template-based C++
+library for linear algebra. Journal of Open Source Software 1, 2 (2016), 26.
+[38] Ohad Shamir, Nati Srebro, and Tong Zhang. 2014. Communication-efficient dis-
+tributed optimization using an approximate newton-type method. In International
+conference on machine learning. PMLR, 1000–1008.
+[39] Ilya Trofimov and Alexander Genkin. 2015. Distributed coordinate descent for
+l1-regularized logistic regression. In Analysis of Images, Social Networks and Texts:
+4th International Conference, AIST 2015, Yekaterinburg, Russia, April 9–11, 2015,
+Revised Selected Papers 4. Springer, 243–254.
+[40] Paul Tseng and Sangwoon Yun. 2009. A coordinate gradient descent method
+for nonsmooth separable minimization. Mathematical Programming 117 (2009),
+387–423.
+[41] Jialei Wang, Mladen Kolar, Nathan Srebro, and Tong Zhang. 2017. Efficient
+distributed learning with sparsity. In International conference on machine learning.
+PMLR, 3636–3645.
+[42] Shusen Wang, Fred Roosta, Peng Xu, and Michael W Mahoney. 2018. Giant:
+Globally improved approximate newton method for distributed optimization.
+Advances in Neural Information Processing Systems 31 (2018).
+[43] Guo-Xun Yuan, Chia-Hua Ho, and Chih-Jen Lin. 2011. An improved glmnet
+for l1-regularized logistic regression. In Proceedings of the 17th ACM SIGKDD
+international conference on Knowledge discovery and data mining. 33–41.
+[44] Richard Zak, Edward Raff, and Charles Nicholas. 2017. What can N-grams
+learn for malware detection?. In 2017 12th International Conference on Malicious
+and Unwanted Software (MALWARE). IEEE, 109–118. https://doi.org/10.1109/
+MALWARE.2017.8323963
+[45] Yuchen Zhang, Martin J Wainwright, and John C Duchi. 2012. Communication-
+efficient algorithms for statistical optimization. Advances in neural information
+processing systems 25 (2012).
+[46] Yuchen Zhang and Lin Xiao. 2018. Communication-efficient distributed optimiza-
+tion of self-concordant empirical loss. Large-Scale and Distributed Optimization
+(2018), 289–341.
+[47] Yong Zhuang, Wei-Sheng Chin, Yu-Chin Juan, and Chih-Jen Lin. 2015. Distributed
+newton methods for regularized logistic regression. In Advances in Knowledge
+Discovery and Data Mining: 19th Pacific-Asia Conference, PAKDD 2015, Ho Chi
+Minh City, Vietnam, May 19-22, 2015, Proceedings, Part II 19. Springer, 690–703.
+[48] Yong Zhuang, Yuchin Juan, Guo-Xun Yuan, and Chih-Jen Lin. 2018. Naive
+parallelization of coordinate descent methods and an application on multi-core l1-
+regularized classification. In Proceedings of the 27th ACM International Conference
+on Information and Knowledge Management. 1103–1112.
+ 
+2046High-Dimensional Distributed Sparse Classification with Scalable Communication-Efficient Global Updates KDD ’24, August 25–29, 2024, Barcelona, Spain
+[49] Martin Zinkevich, Markus Weimer, Lihong Li, and Alex Smola. 2010. Parallelized
+stochastic gradient descent. Advances in neural information processing systems
+23 (2010).
+A Additional timing information
+In this section we conduct more detailed timing analysis to break-
+down the proxCSL runtime in terms of inner steps of the algorithm.
+The timing breakdown helps to compare the costs of computation
+vs communication in our algorithms.
+proxCSL ember-1M criteo
+nnz 1k 10k 1k 10k
+Initial estimator 9.47s 7.38s 22.8s 21.0s
+Broadcast𝑤 6.55s 7.14s 0.38s 0.34s
+Collect grads 3.23s 2.24s 1.06s 0.95s
+Compute∇L( ˆ𝑤) 0.39s 0.39s 0.38s 0.39s
+Full CSL update (Algo 2) 25.41s 27.8s 10.2s 8.62s
+Single outer step 2.54s 2.78s 1.02s 0.86s
+Table 3: Detailed timing information for proxCSL on two large
+datasets, at regularization values corresponding to 1k and 10k solu-
+tion nonzeros.
+Furthermore we compare proxCSL with sCSL and sDANE on a
+large dataset to show the relative computation and communication
+times.
+criteo (10k nnz) proxCSL sCSL sDANE
+Initial estimator 21.0s same same
+Broadcast𝑤 0.34s same same
+Collect grads 0.95s same same
+Compute∇L( ˆ𝑤) 0.39s same same
+Full CSL update (1 node) 8.62s 9.26s -
+Full CSL update (all nodes) - - 27.1s
+Collect𝑤’s - - 0.95s
+Average final 𝑤 - - 0.16s
+Table 4: Comparing CSL update timings of proxCSL with baselines
+sCSL and sDANE. Since sDANE runs updates on all nodes, the
+update step is significantly longer.
+B Sensitivity to hyperparameters
+Although our default proxCSL sets relatively low maximum itera-
+tions, these values are generally sufficient to ensure convergence
+of the objective function. In this analysis we increase the itera-
+tion counts to guarantee full convergence and show the impact is
+minimal. See following table.
+We also provide additional parameter and computational details
+next.
+Optimizers. OWLQN: We use default hyperparameters on OWL-
+QN for the baselines with 100 max iterations. We experimented
+with changing hyperparameters and increasing iterations but they
+did not affect the results.
+LIBLINEAR: When using LIBLINEAR to solve the initial dis-
+tributed models, we set 20 max outer iterations and 50 max innerOWA𝑆=10, 𝑆 =10, 𝑆 =100,
+𝑀=50𝑀=1000𝑀=1000
+amazon7 0.1111 0.1057 0.1057 0.1057
+ember100k 0.3091 0.2809 0.2804 0.2804
+url 0.1614 0.1604 0.1604 0.1604
+Table 5: Logistic regression objective values after running a single
+proxCSL update with specified hyperparameters 𝑆and𝑀.
+iterations. This is to obtain faster solutions since the solution is
+approximate anyway. This did not affect accuracy. All other param-
+eters are default. For the Full Data upper bound we use all default
+parameters.
+System details. A single MPI experiment uses 16 machines,
+each of which has two AMD EPYC 7713 64-core processors. We
+limit to using 32 cores per machine so that the amount of inter-
+machine communication is non-trivial. The machines are connected
+via Infiniband HDR and deployed with Slurm.
+Computational complexity. Given𝑆and𝑀, as well as dataset
+sizes𝑛,𝐷, our solver is 𝑂(𝑆𝑀𝑛𝑑)for dense data, and 𝑂(𝑆𝑀𝑧)for
+sparse, which is quite efficient. Note that here 𝑧represents the
+number of non-zero elements in the dataset. This is the same com-
+putational complexity as newGLMNET.
+C Elastic Net
+Our method readily extends to other sparse loss functions, including
+the Elastic Net-regularized logistic regression. The following figure
+demonstrates proxCSL with the Elastic Net penalty. The result is
+very comparable to the Lasso-regularized version.
+1011021031040.850.90.951
+Number of non-zerosA
+ccuracyFull
+Data
+Naiv
+e Avg.
+O
+WA
+pr
+oxCSL
+Figur e6:Numb erofnonzer osvs.testsetaccuracy foramazon7,
+using theElastic Net-r egularize dobjective.
+ 
+2047
